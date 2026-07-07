@@ -1,20 +1,15 @@
-"""Episode driver for SPaRC. One LLM call per move; the env enforces the step
-budget and truncation. This is the loop every memory method plugs into.
-"""
-from __future__ import annotations
-
 from ..agents.base import BaselineAgent
 from ..envs.base import EpisodeResult, Transition
 from ..envs.sparc import SparcEnv, is_success
+from ..prompts import sparc_system_prompt
+
+from datasets import load_dataset
 
 
-def run_sparc_episode(env: SparcEnv, agent: BaselineAgent, puzzle_id,
-                      system_prompt: str) -> EpisodeResult:
-    obs, info = env.reset(puzzle_id)
-    agent.reset(system_prompt)
+def run_sparc_episode_baseline(env, agent, system_prompt, obs, info, i):
 
     reward = 0.0
-    transitions: list[Transition] = []
+    transitions = []
     terminated = truncated = False
 
     while True:
@@ -42,10 +37,33 @@ def run_sparc_episode(env: SparcEnv, agent: BaselineAgent, puzzle_id,
             break
 
     return EpisodeResult(
-        puzzle_id=puzzle_id,
+        puzzle_id=i,
         success=is_success(info),
         terminated=terminated,
         truncated=truncated,
         difficulty=int(info.get("difficulty", -1)),
         transitions=transitions,
     )
+
+
+def run_sparc_suite_baseline():
+    ds = load_dataset("lkaesberg/SPaRC", 'all', split="test")
+    df = ds.to_pandas()
+    
+    env = SparcEnv(split="test")
+    
+    agent = BaselineAgent()
+    
+    results = []
+    for i in range(len(df)):
+        obs, info = env.reset()
+        
+        polyshapes = df['polyshapes'][i]
+        polyshapes = yaml.safe_load(polyshapes)
+        
+        system_prompt = sparc_system_prompt(polyshapes)
+        agent.reset(system_prompt)
+        
+        result = run_sparc_episode_baseline(env, agent, system_prompt, obs, info, i)
+        results.append(result)
+    return results

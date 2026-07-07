@@ -24,39 +24,28 @@ _FINAL_RE = re.compile(r"^(?:Final:\s*)?([0-3])$")
 
 
 class SparcEnv:
-    """Thin, puzzle-id-addressable wrapper over the Spatial-Gym env."""
-
-    def __init__(self, df_name="lkaesberg/SPaRC", df_split="all", df_set="test",
+    def __init__(self, split="test", config="all", df_name="lkaesberg/SPaRC",
                  max_steps=100, traceback=False):
         self.env = gym.make(
             "Spatial-Gym",
             df_name=df_name,
-            df_split=df_split,
-            df_set=df_set,
+            df_split=config,
+            df_set=split,
             render_mode=None,
             observation="SPaRC",
             traceback=traceback,
             max_steps=max_steps,
-            disable_env_checker=True,
         )
 
     # ---- episode control -------------------------------------------------
-    def reset(self, puzzle_id):
-        """Deterministically load a specific puzzle by its dataset id."""
-        return self.env.reset(options={"puzzle_id": puzzle_id})
+    def reset(self):
+        return self.env.reset()
 
     def step(self, action):
         return self.env.step(action)
 
     def close(self):
         self.env.close()
-
-    # ---- puzzle introspection (for splits / scripted tests) --------------
-    def puzzle_ids(self) -> list:
-        return [p["id"] for p in self.env.unwrapped.puzzles]
-
-    def current_solution_paths(self) -> list:
-        return self.env.unwrapped.solution_paths
 
     # ---- prompt / action plumbing ----------------------------------------
     def user_message(self, obs, info, reward) -> str:

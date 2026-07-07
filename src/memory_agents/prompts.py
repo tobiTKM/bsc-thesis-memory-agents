@@ -1,10 +1,3 @@
-"""Prompt templates. The SPaRC system prompt is ported verbatim from
-Spatial-Gym's `llm_testing/llm_host.py` so the memoryless baseline matches the
-established evaluation setup; memory agents prepend their memory block to it.
-"""
-from __future__ import annotations
-
-
 def sparc_system_prompt(polyshapes) -> str:
     return f"""
     You are an autonomous agent controlling a path-finding puzzle solver.
