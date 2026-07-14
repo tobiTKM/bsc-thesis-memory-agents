@@ -1,0 +1,6 @@
+# Installed in-job on the compute node by run_all.sbatch (vLLM + the driver deps
+# are installed there so the wheels match the AMD scc-gpu arch). This file holds
+# only what pip can't get from PyPI directly:
+
+# The SPaRC gym env: module `Spatial_Gym`, registers the "Spatial-Gym" env id.
+git+https://github.com/lkaesberg/Spatial-Gym.git

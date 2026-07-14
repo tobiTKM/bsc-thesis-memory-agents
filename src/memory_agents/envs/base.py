@@ -1,5 +1,4 @@
 """Shared episode types and JSON helpers used across all benchmarks."""
-from __future__ import annotations
 
 import numpy as np
 

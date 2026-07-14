@@ -1,24 +1,10 @@
-"""Adapter around the upstream Spatial-Gym (SPaRC) environment.
-
-The agent interacts one cardinal move per call (Discrete(4): 0=right, 1=up,
-2=left, 3=down), matching Spatial-Gym's `llm_testing/llm_host.py`. This adapter
-only handles the env wiring the agent loop needs: load a puzzle by id, render
-the observation to prompt text, parse the model's `Final: <digit>` reply, and
-report success. All reasoning lives in the agent.
-"""
-from __future__ import annotations
-
 import json
 import re
 
 import gymnasium as gym
-import Spatial_Gym  # noqa: F401  (import registers the "Spatial-Gym" env id)
+import Spatial_Gym
 
 from .base import make_json_safe
-
-# action int -> (dx, dy) on the grid, copied from Spatial_Gym._action_to_direction
-_ACTION_TO_DELTA = {0: (1, 0), 1: (0, -1), 2: (-1, 0), 3: (0, 1)}
-_DELTA_TO_ACTION = {v: k for k, v in _ACTION_TO_DELTA.items()}
 
 _FINAL_RE = re.compile(r"^(?:Final:\s*)?([0-3])$")
 
@@ -38,8 +24,15 @@ class SparcEnv:
         )
 
     # ---- episode control -------------------------------------------------
-    def reset(self):
-        return self.env.reset()
+    def reset(self, puzzle_id=None):
+        """Load a specific puzzle by id, or the next one if id is None.
+
+        Selecting by id is what makes concurrency safe: each episode targets its
+        own puzzle instead of relying on the env's internal sequential counter,
+        which several concurrent episodes would race on.
+        """
+        options = {"puzzle_id": puzzle_id} if puzzle_id is not None else None
+        return self.env.reset(options=options)
 
     def step(self, action):
         return self.env.step(action)
@@ -83,14 +76,3 @@ def parse_action(reply: str):
 def is_success(info) -> bool:
     """Env success = exact match to an enumerated solution path."""
     return info.get("Rewards", {}).get("outcome_reward") == 1
-
-
-def path_to_actions(path) -> list:
-    """Convert a node path [[x,y],...] into the action ints connecting them."""
-    actions = []
-    for (ax, ay), (bx, by) in zip(path, path[1:]):
-        delta = (bx - ax, by - ay)
-        if delta not in _DELTA_TO_ACTION:
-            raise ValueError(f"non-adjacent path nodes: {(ax, ay)} -> {(bx, by)}")
-        actions.append(_DELTA_TO_ACTION[delta])
-    return actions
