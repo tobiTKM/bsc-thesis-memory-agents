@@ -54,29 +54,41 @@ mkdir -p "$HF_HOME"
 unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL CONDA_PYTHON_EXE 2>/dev/null || true
 
 module purge
-module load gcc/13.2.0
-module load python/3.11.9
+module load uv    # uv brings a portable standalone python; the arch-specific
+                  # module python (a zen2 build) crashes with "illegal
+                  # instruction" when creating the venv on some nodes.
 
 # ---- build the venv on this node (first run only, then reused) ----
 if [[ "${REBUILD:-0}" == "1" || ! -x "$VENV/bin/vllm" ]]; then
     echo "[$(date +%T)] building venv at $VENV"
     rm -rf "$VENV"
-    python3 -m venv --without-pip "$VENV"
+    uv venv --managed-python --python 3.11 "$VENV"
     # shellcheck disable=SC1091
     source "$VENV/bin/activate"
-    python -m pip --version >/dev/null 2>&1 || {
-        curl -sSf https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
-        python /tmp/get-pip.py
-    }
-    pip install --upgrade pip
-    pip install vllm                                   # brings a matching torch
-    pip install -e .                                   # memory_agents + driver deps
-    pip install -r requirements.txt                    # Spatial-Gym (the gym env)
+    # Pin CUDA build to cu121: the scc-gpu driver is 12.8, so a newer torch
+    # (cu129+, pulled by the latest vLLM) fails with "driver too old". cu121 is
+    # backward-compatible with a 12.8 driver. torch-then-vLLM matches the proven
+    # recipe; vLLM 0.7.3 needs torch==2.5.1 and supports Qwen2.5.
+    uv pip install "torch==2.5.1" "torchvision==0.20.1" "torchaudio==2.5.1" \
+        --index-url https://download.pytorch.org/whl/cu121
+    uv pip install "vllm==0.7.3"
+    uv pip install -e .                                # memory_agents + driver deps
+    uv pip install -r requirements.txt                # Spatial-Gym (the gym env)
+    # vLLM 0.7.3 only sets transformers>=4.48.2, so uv otherwise grabs the latest
+    # (5.x), whose Qwen2Tokenizer dropped all_special_tokens_extended. Pin a 4.49
+    # last so nothing re-bumps it.
+    uv pip install "transformers==4.49.0"
 else
     echo "[$(date +%T)] reusing venv at $VENV (REBUILD=1 to force)"
     # shellcheck disable=SC1091
     source "$VENV/bin/activate"
 fi
+
+# -C inet sets http_proxy on the node for internet access, but that proxy also
+# hijacks localhost requests -- so the health curl and the Python client must
+# bypass it for 127.0.0.1, or they can't reach our own vLLM server.
+export no_proxy="localhost,127.0.0.1,0.0.0.0,::1"
+export NO_PROXY="$no_proxy"
 
 # ---- start the server in the background ----
 echo "[$(date +%T)] starting vLLM: $MODEL"
@@ -101,7 +113,7 @@ trap cleanup EXIT INT TERM
 # ---- wait until healthy (or give up) ----
 echo "[$(date +%T)] waiting for vLLM (timeout ${SERVE_TIMEOUT}s)..."
 waited=0
-until curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; do
+until curl -sf --noproxy '*' "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; do
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         echo "[run_all] vLLM died before becoming healthy; see the log above." >&2
         exit 1
