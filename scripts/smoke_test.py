@@ -48,11 +48,17 @@ async def main():
     ap.add_argument("--puzzles", type=int, default=0, help="run this many SPaRC puzzles")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--n", type=int, default=4, help="concurrent chats in default mode")
+    ap.add_argument("--max-tokens", type=int, default=256,
+                    help="bump for reasoning models so the think block can finish")
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=None)
     args = ap.parse_args()
 
     base_url, model = resolve_server()
     print(f"server={base_url} model={model}")
-    client = LLMClient(base_url=base_url, model=model, max_tokens=256)
+    client = LLMClient(base_url=base_url, model=model, max_tokens=args.max_tokens,
+                       temperature=args.temperature, top_p=args.top_p, top_k=args.top_k)
 
     t0 = time.time()
     if args.puzzles > 0:

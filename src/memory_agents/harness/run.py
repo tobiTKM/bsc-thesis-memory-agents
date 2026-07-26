@@ -92,7 +92,7 @@ async def run_sparc_suite_baseline(client, split="test", concurrency=32, limit=N
             system_prompt = sparc_system_prompt(polyshapes)
 
             agent = BaselineAgent(client)
-            agent.reset(system_prompt)
+            agent.reset(system_prompt, label=puzzle_id)
 
             return await run_sparc_episode_baseline(env, agent, obs, info, puzzle_id)
         finally:
