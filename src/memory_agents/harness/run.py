@@ -1,7 +1,8 @@
 from ..agents.base import BaselineAgent
+from ..agents.memory_agent import MemoryAgent
 from ..envs.base import EpisodeResult, Transition
-from ..envs.sparc import SparcEnv, is_success
-from ..prompts import sparc_system_prompt
+from ..envs.sparc import SparcEnv, format_obs, is_success
+from ..prompts import format_reflections, sparc_system_prompt
 
 import asyncio
 import yaml
@@ -14,16 +15,34 @@ except ImportError:  # progress bar is optional
         return x
 
 
+def _terminal_reason(success, terminated, format_failed) -> str:
+    """Why the episode ended -- the single most useful line for a Reflector.
+
+    Kept coarse on purpose: the exact env signals are `success` (outcome_reward),
+    `terminated` (a solution was submitted) and truncation. Per this project's
+    established finding, a truncation here is a dead end, not a step-limit cutoff.
+    """
+    if success:
+        return "solved"
+    if format_failed:
+        return "format-failure"      # the model never produced a parseable move
+    if terminated:
+        return "wrong-solution"      # submitted a path, but it broke a rule
+    return "dead-end"                 # painted into a corner: no legal way forward
+
+
 async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
     """Run one puzzle to termination and return its EpisodeResult.
 
     The loop is sequential by nature: each move needs the grid state the env
     returned for the previous move. Concurrency happens *across* episodes (see
-    run_sparc_suite_baseline), not inside one.
+    run_sparc_suite_baseline), not inside one. The same loop drives both the
+    memoryless baseline and a Reflexion trial -- only the `agent` differs.
     """
     reward = 0.0
     transitions = []
-    terminated = truncated = False
+    terminated = truncated = format_failed = False
+    first_obs = format_obs(obs)      # the starting grid, kept for reflection
 
     while True:
         user_msg = env.user_message(obs, info, reward)
@@ -32,7 +51,7 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
         if action is None:
             # Repeated malformed output: abort as a (failed) truncation, matching
             # the established host's behaviour.
-            truncated = True
+            truncated = format_failed = True
             break
 
         obs, reward, terminated, truncated, info = env.step(action)
@@ -42,6 +61,7 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
             reward=reward,
             legal_actions=list(info.get("legal_actions", [])),
             rule_status=info.get("rule_status", {}),
+            agent_location=info.get("agent_location"),
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
         ))
@@ -49,13 +69,17 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
         if terminated or truncated:
             break
 
+    success = is_success(info)
     return EpisodeResult(
         puzzle_id=puzzle_id,
-        success=is_success(info),
+        success=success,
         terminated=terminated,
         truncated=truncated,
         difficulty=int(info.get("difficulty", -1)),
         transitions=transitions,
+        first_obs=first_obs,
+        last_obs=format_obs(obs),     # the final grid = the full path the agent drew
+        terminal_reason=_terminal_reason(success, terminated, format_failed),
     )
 
 
@@ -100,6 +124,55 @@ async def run_sparc_suite_baseline(client, split="test", concurrency=32, limit=N
 
     # Launch every puzzle as a task; the queue caps how many actually run at once.
     tasks = [asyncio.create_task(run_one(i)) for i in range(n)]
+    results = []
+    for finished in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+        results.append(await finished)
+    return results
+
+
+async def run_sparc_suite_memory_pass(client, memory, split="test", concurrency=32,
+                                      block_of=format_reflections):
+    """Memory-augmented pass: re-attempt only the puzzles that have stored memory,
+    each with its items injected into the actor's context.
+
+    This is method-agnostic on purpose (see the Memory ABC). Reflexion is the
+    first caller -- `memory` maps puzzle_id -> its reflections, and `block_of`
+    renders those into a system-prompt block -- but MemoryBank / MemP reuse this
+    same pass by producing `memory` differently and, if needed, passing their own
+    `block_of`. Puzzles solved in the memoryless pass are absent from `memory`:
+    the caller carries their win forward rather than re-running a deterministic
+    success. The env-pool / queue concurrency model is identical to the baseline
+    suite; only which puzzles run and the agent's injected block differ.
+    """
+    ds = load_dataset("lkaesberg/SPaRC", "all", split=split)
+    df = ds.to_pandas()
+    # id -> row index, so we can fetch the polyshapes for exactly the stored set.
+    row_of = {str(df["id"][i]): i for i in range(len(df))}
+    todo = [pid for pid in memory if pid in row_of]
+
+    pool_size = min(concurrency, len(todo)) or 1
+    env_pool: asyncio.Queue = asyncio.Queue()
+    for _ in range(pool_size):
+        await env_pool.put(SparcEnv(split=split))
+
+    async def run_one(puzzle_id):
+        env = await env_pool.get()
+        try:
+            i = row_of[puzzle_id]
+            obs, info = env.reset(puzzle_id=df["id"][i])
+
+            polyshapes = yaml.safe_load(df["polyshapes"][i])
+            system_prompt = sparc_system_prompt(polyshapes)
+
+            agent = MemoryAgent(client)
+            agent.reset(system_prompt, memory_block=block_of(memory[puzzle_id]),
+                        label=df["id"][i])
+
+            return await run_sparc_episode_baseline(env, agent, obs, info, df["id"][i])
+        finally:
+            await env_pool.put(env)
+
+    tasks = [asyncio.create_task(run_one(pid)) for pid in todo]
     results = []
     for finished in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
         results.append(await finished)

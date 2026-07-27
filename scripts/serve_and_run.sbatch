@@ -21,6 +21,10 @@
 #   sbatch -G A100:4 --export=ALL,TP=4,LIMIT=0 scripts/serve_and_run.sbatch
 #   sbatch --export=ALL,MODEL=Qwen/Qwen2.5-3B-Instruct,TP=1 -G A100:1 scripts/serve_and_run.sbatch
 #
+# Reflexion (two jobs, linked by the pass1 file it prints):
+#   sbatch -J reflexion --export=ALL,DRIVER=reflexion,PHASE=pass1,LIMIT=0 scripts/serve_and_run.sbatch
+#   sbatch -J reflexion --export=ALL,DRIVER=reflexion,PHASE=pass2,PASS1=results/json/reflexion_pass1_test_<stamp>.json scripts/serve_and_run.sbatch
+#
 # Some nodes SIGILL the Apptainer launcher (see PREFLIGHT below). The job detects that
 # in ~30 s, appends the node to logs/bad_nodes.txt and resubmits itself excluding every
 # node on that list, up to MAX_ATTEMPTS (8) times. AUTO_RESUBMIT=0 turns that off.
@@ -55,6 +59,15 @@ TEMPERATURE="${TEMPERATURE:-0.6}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
 SMOKE="${SMOKE:-1}"                       # 0 skips the 2-prompt smoke check
+
+# Which driver runs against the served model. `baseline` is the memoryless run;
+# `reflexion` is the two-phase memory method (see scripts/run_reflexion.py). New
+# memory methods slot in here as extra DRIVER cases -- the serve block above is
+# method-agnostic, so nothing else changes.
+DRIVER="${DRIVER:-baseline}"              # baseline | reflexion
+PHASE="${PHASE:-pass1}"                   # reflexion: pass1 (reflect) | pass2 (retry)
+PASS1="${PASS1:-}"                         # reflexion pass2: results/json/reflexion_pass1_*.json
+REFLECT_MAX_TOKENS="${REFLECT_MAX_TOKENS:-$MAX_TOKENS}"   # self-reflection budget (pass1)
 
 # ---- modules: re-resolve Lmod for THIS node's CPU ---------------------------
 # This is what killed six earlier jobs. `sbatch --export=ALL` (the default) carries
@@ -261,10 +274,30 @@ if [[ "$SMOKE" == "1" ]]; then
         --top-p "$TOP_P" ${TOP_K:+--top-k "$TOP_K"}
 fi
 
-echo "[$(date +%T)] baseline: split=$SPLIT concurrency=$CONCURRENCY limit=$LIMIT"
-python -u scripts/run_baseline.py \
-    --split "$SPLIT" --concurrency "$CONCURRENCY" --limit "$LIMIT" \
+# Sampling/budget flags shared by every driver; --limit is added per-driver since
+# reflexion pass2 runs over the pass1 episode set, not a fresh --limit slice.
+COMMON_ARGS=(--split "$SPLIT" --concurrency "$CONCURRENCY" \
     --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" \
-    --top-p "$TOP_P" ${TOP_K:+--top-k "$TOP_K"}
+    --top-p "$TOP_P" ${TOP_K:+--top-k "$TOP_K"})
+
+case "$DRIVER" in
+  baseline)
+    echo "[$(date +%T)] baseline: split=$SPLIT concurrency=$CONCURRENCY limit=$LIMIT"
+    python -u scripts/run_baseline.py "${COMMON_ARGS[@]}" --limit "$LIMIT"
+    ;;
+  reflexion)
+    if [[ "$PHASE" == "pass1" ]]; then
+        echo "[$(date +%T)] reflexion pass1 (trial-1 + reflect): split=$SPLIT limit=$LIMIT"
+        python -u scripts/run_reflexion.py --phase pass1 "${COMMON_ARGS[@]}" \
+            --limit "$LIMIT" --reflect-max-tokens "$REFLECT_MAX_TOKENS"
+    else
+        [[ -n "$PASS1" ]] || { echo "PHASE=pass2 needs PASS1=<reflexion_pass1_*.json>" >&2; exit 1; }
+        echo "[$(date +%T)] reflexion pass2 (retry with reflections): PASS1=$PASS1"
+        python -u scripts/run_reflexion.py --phase pass2 --pass1 "$PASS1" "${COMMON_ARGS[@]}"
+    fi
+    ;;
+  *)
+    echo "unknown DRIVER=$DRIVER (expected: baseline | reflexion)" >&2; exit 1 ;;
+esac
 
 echo "[$(date +%T)] done; the cleanup trap stops vLLM and frees the GPUs."

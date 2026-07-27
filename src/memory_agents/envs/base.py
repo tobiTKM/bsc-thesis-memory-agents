@@ -8,12 +8,18 @@ class Transition:
 
     def __init__(self, step: int, action: int, reward: float,
                  legal_actions: list, rule_status: dict,
+                 agent_location=None,
                  prompt_tokens: int = 0, completion_tokens: int = 0):
         self.step = step
         self.action = action
         self.reward = reward
         self.legal_actions = legal_actions
         self.rule_status = rule_status
+        # Where the path head sat *after* this move. The env's observation already
+        # carries the full path each step (visited nodes, current head), so this is
+        # not the only record of the path -- it just gives the Reflector a compact,
+        # explicitly *ordered* move log the final grid alone doesn't spell out.
+        self.agent_location = agent_location
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
 
@@ -23,13 +29,21 @@ class EpisodeResult:
 
     def __init__(self, puzzle_id: str, success: bool, terminated: bool,
                  truncated: bool, difficulty: int,
-                 transitions: list[Transition] | None = None):
+                 transitions: list[Transition] | None = None,
+                 first_obs: str = "", last_obs: str = "", terminal_reason: str = ""):
         self.puzzle_id = puzzle_id
         self.success = success
         self.terminated = terminated
         self.truncated = truncated
         self.difficulty = difficulty
         self.transitions = transitions if transitions is not None else []
+        # Reflection context. The env observation *is* the path drawn, so last_obs
+        # (the final grid) is the richest single record of what the agent produced;
+        # first_obs is the puzzle it started from and terminal_reason is *why* it
+        # ended (see _terminal_reason() in the harness).
+        self.first_obs = first_obs
+        self.last_obs = last_obs
+        self.terminal_reason = terminal_reason
 
     def steps(self) -> int:
         return len(self.transitions)
