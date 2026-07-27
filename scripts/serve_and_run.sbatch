@@ -252,6 +252,7 @@ echo "[$(date +%T)] vLLM healthy after ~${waited}s."
 # ---- (c) run the driver against it ------------------------------------------
 export LLM_BASE_URL="http://127.0.0.1:${PORT}/v1"
 export LLM_MODEL="$SERVED_NAME"
+export LLM_MODEL_ID="$MODEL"   # real checkpoint behind the alias, recorded in results
 
 if [[ "$SMOKE" == "1" ]]; then
     echo "[$(date +%T)] smoke check..."

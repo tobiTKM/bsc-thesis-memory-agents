@@ -111,7 +111,7 @@ async def main():
 
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
     fail_log = pathlib.Path(
-        args.failure_log or f"results/format_failures_{args.split}_{stamp}.jsonl")
+        args.failure_log or f"results/json/format_failures_{args.split}_{stamp}.jsonl")
     # BaselineAgent reads this env var lazily, so setting it here is enough.
     os.environ["FORMAT_FAILURE_LOG"] = str(fail_log)
     print(f"server={base_url} model={model} split={args.split} "
@@ -131,12 +131,23 @@ async def main():
     summary = summarize(results)
     summary["elapsed_sec"] = round(elapsed, 1)
     summary["model"] = model
+    # `model` is only the --served-model-name alias ("qwen"), which is stable on
+    # purpose so result filenames are. The real checkpoint comes from the serve
+    # job, so a report can name what was actually run.
+    summary["model_id"] = os.environ.get("LLM_MODEL_ID") or model
     summary["split"] = args.split
     summary["max_tokens"] = args.max_tokens
+    summary["temperature"] = args.temperature
+    summary["top_p"] = args.top_p
+    summary["top_k"] = args.top_k
+    summary["seed"] = client.seed
+    summary["concurrency"] = args.concurrency
     summary["format_failures"] = summarize_format_failures(fail_log)
 
+    # results/json holds the machine-readable run data (this file plus the failure
+    # log); results/txt holds the reports scripts/summarize_results.py writes.
     out = args.out or (
-        f"results/baseline_{model.replace('/', '_')}_{args.split}_{stamp}.json")
+        f"results/json/baseline_{model.replace('/', '_')}_{args.split}_{stamp}.json")
     out_path = pathlib.Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(
