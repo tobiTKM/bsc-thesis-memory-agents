@@ -6,12 +6,27 @@ import Spatial_Gym
 
 from .base import make_json_safe
 
-_FINAL_RE = re.compile(r"^(?:Final:\s*)?([0-3])$")
+# A "Final:" line anywhere in the reply, tolerating markdown bold and trailing
+# punctuation. \b keeps it from matching the first digit of a longer number.
+_FINAL_RE = re.compile(r"Final:\s*\**\s*([0-3])\b")
+# Fallback: the whole last line is just the digit (what the strict parser accepted).
+_BARE_RE = re.compile(r"^\**\s*([0-3])\s*\**[.)]?$")
+
+# Env step cap. Recorded in the results so summarize_results' reading of a
+# truncation -- a dead end, not a step-limit cutoff -- stays checkable: episodes
+# run ~15 steps against this, so the cap never fires.
+MAX_STEPS = 100
 
 
 class SparcEnv:
     def __init__(self, split="test", config="all", df_name="lkaesberg/SPaRC",
-                 max_steps=100, traceback=False):
+                 max_steps=MAX_STEPS, traceback=False):
+        """Three different senses of "split" collide in this call, so, explicitly:
+
+        `split` is the dataset split (train/test) and maps to the env's `df_set`;
+        `config` is the HuggingFace dataset *config* name ("all") and maps to the
+        env's `df_split`. The names are the env's, not ours.
+        """
         self.env = gym.make(
             "Spatial-Gym",
             df_name=df_name,
@@ -65,11 +80,25 @@ def parse_action(reply: str):
 
     A None here is a *format* failure (malformed output), not a task
     failure: the harness should retry the call, not count it as an attempt.
+
+    Anchoring strictly to the last line (the previous behaviour) rejected replies
+    that were perfectly readable -- `Final: 0.`, `**Final: 0**`, a `Final: 0` with
+    one more sentence after it -- and every rejection costs a whole retry. So scan
+    the reply for `Final:` markers and take the LAST one, which is the model's
+    conclusion rather than a digit it floated while thinking.
+
+    NOTE: this accepts strictly more replies than the strict parser did, so
+    accuracy is not comparable across this change.
     """
+    if not reply:
+        return None
+    matches = _FINAL_RE.findall(reply)
+    if matches:
+        return int(matches[-1])
     lines = reply.strip().splitlines()
     if not lines:
         return None
-    m = _FINAL_RE.match(lines[-1].strip())
+    m = _BARE_RE.match(lines[-1].strip())
     return int(m.group(1)) if m else None
 
 

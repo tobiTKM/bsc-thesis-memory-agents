@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Run the memoryless baseline over a SPaRC split and save results.
 
-Reads the server endpoint from LLM_BASE_URL / LLM_MODEL (set by run_all.sbatch)
-or the discovery file. Writes a JSON with a summary (accuracy overall and by
+Reads the server endpoint from LLM_BASE_URL / LLM_MODEL (set by
+serve_and_run.sbatch). Writes a JSON with a summary (accuracy overall and by
 difficulty, token totals) plus one record per puzzle.
 
   python scripts/run_baseline.py --split test --concurrency 32 --limit 50
@@ -20,7 +20,9 @@ from datetime import datetime
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
+from memory_agents.agents.base import MAX_FORMAT_RETRIES
 from memory_agents.config import resolve_server
+from memory_agents.envs.sparc import MAX_STEPS
 from memory_agents.harness.run import run_sparc_suite_baseline
 from memory_agents.llm.client import LLMClient
 
@@ -73,6 +75,13 @@ def summarize(results) -> dict:
         },
         "prompt_tokens": sum(r.prompt_tokens() for r in results),
         "completion_tokens": sum(r.completion_tokens() for r in results),
+        # Of the two totals above, what went on replies that never yielded a move.
+        # Pure waste, and it has to be visible: a method that provokes more format
+        # failures must not get to look cheap.
+        "retry_tokens": sum(r.retry_tokens() for r in results),
+        # Episodes that crashed rather than failed. Non-zero means the run is
+        # incomplete, not that the model did badly.
+        "errors": sum(1 for r in results if r.terminal_reason == "error"),
         "total_steps": sum(r.steps() for r in results),
     }
 
@@ -85,8 +94,11 @@ def to_record(r) -> dict:
         "steps": r.steps(),
         "terminated": r.terminated,
         "truncated": r.truncated,
+        "terminal_reason": r.terminal_reason,
         "prompt_tokens": r.prompt_tokens(),
         "completion_tokens": r.completion_tokens(),
+        "retry_tokens": r.retry_tokens(),
+        "error": r.error or None,
     }
 
 
@@ -101,6 +113,8 @@ async def main():
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=None,
                     help="vLLM extra param; unset = disabled. Qwen3 thinking: 20.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="decoding seed. Vary it to resample the same split.")
     ap.add_argument("--out", default=None, help="output JSON path")
     ap.add_argument("--failure-log", default=None,
                     help="JSONL of unparseable replies (default: alongside --out)")
@@ -120,7 +134,8 @@ async def main():
           f"top_p={args.top_p} top_k={args.top_k}", flush=True)
 
     client = LLMClient(base_url=base_url, model=model, max_tokens=args.max_tokens,
-                       temperature=args.temperature, top_p=args.top_p, top_k=args.top_k)
+                       temperature=args.temperature, top_p=args.top_p,
+                       top_k=args.top_k, seed=args.seed)
 
     t0 = time.time()
     results = await run_sparc_suite_baseline(
@@ -142,6 +157,12 @@ async def main():
     summary["top_k"] = args.top_k
     summary["seed"] = client.seed
     summary["concurrency"] = args.concurrency
+    # Recorded so summarize_results can tell "retried but recovered" from "aborted
+    # the episode" instead of guessing with a hardcoded default.
+    summary["max_format_retries"] = MAX_FORMAT_RETRIES
+    # The env step cap. summarize_results reads a truncation as a dead end rather
+    # than a step-limit cutoff; that only holds while episodes stay well under this.
+    summary["max_steps"] = MAX_STEPS
     summary["format_failures"] = summarize_format_failures(fail_log)
 
     # results/json holds the machine-readable run data (this file plus the failure
@@ -156,7 +177,10 @@ async def main():
     print(f"\naccuracy={summary['accuracy']:.3f} ({summary['success']}/{summary['n']})  "
           f"by_difficulty={summary['accuracy_by_difficulty']}", flush=True)
     print(f"tokens: prompt={summary['prompt_tokens']} completion={summary['completion_tokens']}  "
-          f"elapsed={elapsed:.1f}s", flush=True)
+          f"wasted_on_retries={summary['retry_tokens']}  elapsed={elapsed:.1f}s", flush=True)
+    if summary["errors"]:
+        print(f"WARNING: {summary['errors']} episodes crashed and are counted as "
+              f"failures; this run is incomplete", flush=True)
     ff = summary["format_failures"]
     if ff:
         print(f"format failures: {ff['n']} replies over {ff['puzzles_affected']} puzzles, "

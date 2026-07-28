@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Smoke test for the hosting + async client.
 
-  # start the server first:  sbatch scripts/serve_vllm.sbatch
+  # start the server first:  sbatch scripts/serve_and_run.sbatch
   python scripts/smoke_test.py                # fire N concurrent chats
   python scripts/smoke_test.py --puzzles 4    # run 4 real SPaRC test puzzles
 

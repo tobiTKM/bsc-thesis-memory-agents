@@ -44,8 +44,14 @@ class ReflexionMemory(Memory):
         return len(self._store)
 
     @classmethod
-    def from_dict(cls, data: dict[str, list[str]]) -> "ReflexionMemory":
-        m = cls()
+    def from_dict(cls, data: dict[str, list[str]], cap: int = 3) -> "ReflexionMemory":
+        """Rebuild a store from its serialised form.
+
+        `cap` has to be passed back in: writing the items through write() re-applies
+        the cap, so restoring a store built with a larger cap through the default
+        would silently drop the oldest reflections it was meant to keep.
+        """
+        m = cls(cap=cap)
         for key, items in data.items():
             for item in items:
                 m.write(key, item)

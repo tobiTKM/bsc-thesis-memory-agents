@@ -31,6 +31,30 @@ def _terminal_reason(success, terminated, format_failed) -> str:
     return "dead-end"                 # painted into a corner: no legal way forward
 
 
+def _drain_and_close(env_pool: asyncio.Queue) -> None:
+    """Close every env in the pool. Each episode returns its env in a finally, so
+    by the time the gather loop is done the pool holds all of them again."""
+    while not env_pool.empty():
+        env_pool.get_nowait().close()
+
+
+def errored_episode(puzzle_id, exc) -> EpisodeResult:
+    """Record a crashed episode as a failure instead of letting it kill the suite.
+
+    There is no try/except between client.chat() and asyncio.as_completed below, so
+    a single transient error (a connection reset, a 5xx from vLLM) used to propagate
+    out of the gather loop and take the whole run down -- losing every result from a
+    multi-hour job because one call blipped at hour eleven. Recording it keeps the
+    run going and makes the error count visible in the summary.
+
+    Deliberately neither terminated nor truncated: an error is not a dead end and
+    must not be counted as one. `terminal_reason` is what tells them apart.
+    """
+    return EpisodeResult(
+        puzzle_id=str(puzzle_id), success=False, terminated=False, truncated=False,
+        difficulty=-1, terminal_reason="error", error=repr(exc))
+
+
 async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
     """Run one puzzle to termination and return its EpisodeResult.
 
@@ -42,6 +66,7 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
     reward = 0.0
     transitions = []
     terminated = truncated = format_failed = False
+    aborted_prompt = aborted_completion = 0
     first_obs = format_obs(obs)      # the starting grid, kept for reflection
 
     while True:
@@ -50,8 +75,14 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
 
         if action is None:
             # Repeated malformed output: abort as a (failed) truncation, matching
-            # the established host's behaviour.
+            # the established host's behaviour. No Transition is appended for this
+            # move, so the replies that burned the budget are charged to the episode
+            # here instead -- retry_* already covers all of them, response's own
+            # counts included (see BaselineAgent.act).
             truncated = format_failed = True
+            if response is not None:
+                aborted_prompt = response.retry_prompt_tokens
+                aborted_completion = response.retry_completion_tokens
             break
 
         obs, reward, terminated, truncated, info = env.step(action)
@@ -64,6 +95,8 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
             agent_location=info.get("agent_location"),
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
+            retry_prompt_tokens=response.retry_prompt_tokens,
+            retry_completion_tokens=response.retry_completion_tokens,
         ))
 
         if terminated or truncated:
@@ -80,6 +113,8 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
         first_obs=first_obs,
         last_obs=format_obs(obs),     # the final grid = the full path the agent drew
         terminal_reason=_terminal_reason(success, terminated, format_failed),
+        aborted_prompt_tokens=aborted_prompt,
+        aborted_completion_tokens=aborted_completion,
     )
 
 
@@ -108,6 +143,7 @@ async def run_sparc_suite_baseline(client, split="test", concurrency=32, limit=N
 
     async def run_one(i):
         env = await env_pool.get()          # blocks until an env is free
+        puzzle_id = None
         try:
             puzzle_id = df["id"][i]
             obs, info = env.reset(puzzle_id=puzzle_id)
@@ -119,14 +155,20 @@ async def run_sparc_suite_baseline(client, split="test", concurrency=32, limit=N
             agent.reset(system_prompt, label=puzzle_id)
 
             return await run_sparc_episode_baseline(env, agent, obs, info, puzzle_id)
+        except Exception as exc:
+            print(f"[error] puzzle {puzzle_id}: {exc!r}", flush=True)
+            return errored_episode(puzzle_id, exc)
         finally:
             await env_pool.put(env)         # return the env even if the episode raised
 
     # Launch every puzzle as a task; the queue caps how many actually run at once.
     tasks = [asyncio.create_task(run_one(i)) for i in range(n)]
     results = []
-    for finished in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
-        results.append(await finished)
+    try:
+        for finished in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+            results.append(await finished)
+    finally:
+        _drain_and_close(env_pool)
     return results
 
 
@@ -169,11 +211,17 @@ async def run_sparc_suite_memory_pass(client, memory, split="test", concurrency=
                         label=df["id"][i])
 
             return await run_sparc_episode_baseline(env, agent, obs, info, df["id"][i])
+        except Exception as exc:
+            print(f"[error] puzzle {puzzle_id}: {exc!r}", flush=True)
+            return errored_episode(puzzle_id, exc)
         finally:
             await env_pool.put(env)
 
     tasks = [asyncio.create_task(run_one(pid)) for pid in todo]
     results = []
-    for finished in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
-        results.append(await finished)
+    try:
+        for finished in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+            results.append(await finished)
+    finally:
+        _drain_and_close(env_pool)
     return results

@@ -83,6 +83,17 @@ def format_reflections(reflections) -> str:
 
 
 def sparc_system_prompt(polyshapes) -> str:
+    """The actor's system prompt, ported verbatim from Spatial-Gym's llm_testing host.
+
+    Kept verbatim on purpose, duplication included (rule cells and the no-revisit
+    rule are each stated twice): our numbers are meant to be comparable with the
+    established baseline, so the prompt is not ours to tidy.
+
+    One structural property worth preserving: the per-puzzle {polyshapes} is
+    interpolated near the END, so the ~145 lines before it are byte-identical for
+    every puzzle and every step. With vLLM's --enable-prefix-caching that is a
+    large shared KV prefix. Do not move the variable part earlier.
+    """
     return f"""
     You are an autonomous agent controlling a path-finding puzzle solver.
     Your goal is to find a valid path (a continuous line) from the specified Start Node to the End Node on the provided grid, adhering to all puzzle rules.

@@ -9,7 +9,8 @@ class Transition:
     def __init__(self, step: int, action: int, reward: float,
                  legal_actions: list, rule_status: dict,
                  agent_location=None,
-                 prompt_tokens: int = 0, completion_tokens: int = 0):
+                 prompt_tokens: int = 0, completion_tokens: int = 0,
+                 retry_prompt_tokens: int = 0, retry_completion_tokens: int = 0):
         self.step = step
         self.action = action
         self.reward = reward
@@ -22,6 +23,11 @@ class Transition:
         self.agent_location = agent_location
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        # Cost of the unparseable replies discarded before this move landed. Held
+        # apart from the two fields above so "tokens per model reply" stays a
+        # meaningful statistic while the waste is still counted somewhere.
+        self.retry_prompt_tokens = retry_prompt_tokens
+        self.retry_completion_tokens = retry_completion_tokens
 
 
 class EpisodeResult:
@@ -30,7 +36,9 @@ class EpisodeResult:
     def __init__(self, puzzle_id: str, success: bool, terminated: bool,
                  truncated: bool, difficulty: int,
                  transitions: list[Transition] | None = None,
-                 first_obs: str = "", last_obs: str = "", terminal_reason: str = ""):
+                 first_obs: str = "", last_obs: str = "", terminal_reason: str = "",
+                 aborted_prompt_tokens: int = 0, aborted_completion_tokens: int = 0,
+                 error: str = ""):
         self.puzzle_id = puzzle_id
         self.success = success
         self.terminated = terminated
@@ -44,15 +52,38 @@ class EpisodeResult:
         self.first_obs = first_obs
         self.last_obs = last_obs
         self.terminal_reason = terminal_reason
+        # An episode that dies on unparseable replies appends no Transition for its
+        # final move, so the whole chain of calls that killed it had nowhere to be
+        # recorded and showed up as free. It lands here instead.
+        self.aborted_prompt_tokens = aborted_prompt_tokens
+        self.aborted_completion_tokens = aborted_completion_tokens
+        # Set only when the episode crashed (terminal_reason == "error"); see
+        # errored_episode() in the harness.
+        self.error = error
 
     def steps(self) -> int:
         return len(self.transitions)
 
     def prompt_tokens(self) -> int:
-        return sum(t.prompt_tokens for t in self.transitions)
+        """Every prompt token the episode paid for, retries and aborts included."""
+        return (sum(t.prompt_tokens + t.retry_prompt_tokens for t in self.transitions)
+                + self.aborted_prompt_tokens)
 
     def completion_tokens(self) -> int:
-        return sum(t.completion_tokens for t in self.transitions)
+        """Every completion token the episode paid for, retries and aborts included."""
+        return (sum(t.completion_tokens + t.retry_completion_tokens
+                    for t in self.transitions)
+                + self.aborted_completion_tokens)
+
+    def retry_tokens(self) -> int:
+        """Of the above, what was spent on replies that never yielded a move.
+
+        Reported separately because it is pure waste: a method that provokes more
+        format failures must not get to look cheap.
+        """
+        return (sum(t.retry_prompt_tokens + t.retry_completion_tokens
+                    for t in self.transitions)
+                + self.aborted_prompt_tokens + self.aborted_completion_tokens)
 
 
 def make_json_safe(obj, seen=None):

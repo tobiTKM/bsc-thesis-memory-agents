@@ -2,7 +2,12 @@ __pycache__/
 .vscode/
 .venv/
 .server/
-logs/
+# logs/* rather than logs/: Slurm's slurmd opens --output/--error on the compute
+# node *before* it execs the job script, so the directory has to exist in a fresh
+# clone or the job dies with no log at all. A negation cannot re-include a file
+# whose parent directory is excluded, hence the contents pattern + .gitkeep.
+logs/*
+!logs/.gitkeep
 results/
 *.egg-info/
 build/

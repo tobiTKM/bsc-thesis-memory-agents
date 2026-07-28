@@ -1,4 +1,4 @@
-# Installed in-job on the compute node by run_all.sbatch (vLLM + the driver deps
+# Installed in-job on the compute node by serve_and_run.sbatch (vLLM + driver deps
 # are installed there so the wheels match the AMD scc-gpu arch). This file holds
 # only what pip can't get from PyPI directly:
 

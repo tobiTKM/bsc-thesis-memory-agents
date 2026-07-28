@@ -68,15 +68,22 @@ def format_failures(summary: dict, replies: int) -> list:
         # at the old flat path; it moved with everything else.
         log = RESULTS_JSON / log.name
     if log.exists():
-        attempts = collections.defaultdict(int)
-        for line in log.read_text().splitlines():
-            if line.strip():
-                try:
-                    attempts[json.loads(line)["puzzle_id"]] += 1
-                except (json.JSONDecodeError, KeyError):
-                    continue
+        # An abort is a reply logged at the LAST attempt index, not simply a puzzle
+        # with many records: an episode whose five separate moves each failed once
+        # and recovered also produces five records, and counting those as aborts
+        # inflated this number with exactly the cases that were harmless.
         retries = summary.get("max_format_retries", 5)
-        aborted = sum(1 for c in attempts.values() if c >= retries)
+        aborted_puzzles = set()
+        for line in log.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                if rec.get("attempt", 0) >= retries - 1:
+                    aborted_puzzles.add(rec["puzzle_id"])
+            except (json.JSONDecodeError, KeyError):
+                continue
+        aborted = len(aborted_puzzles)
 
     rate = f"{100 * n / replies:.2f}%" if replies else "n/a"
     tail = f", {aborted} aborted an episode" if aborted is not None else ""
@@ -185,6 +192,15 @@ def render(a: dict, top: int) -> str:
     # replies = one per step, plus every retry that had to be thrown away
     replies = sum(e.get("steps", 0) for e in eps) + (s.get("format_failures") or {}).get("n", 0)
     out.extend(format_failures(s, replies))
+    # Crashed episodes are neither terminated nor truncated, so they show up in no
+    # bucket above. Say so explicitly: a non-zero count means the run is incomplete,
+    # not that the model did badly.
+    if s.get("errors"):
+        w(f"  errored episodes:    {share(s['errors'], n)}   [crashed; run is INCOMPLETE]")
+    if s.get("retry_tokens"):
+        total = s.get("prompt_tokens", 0) + s.get("completion_tokens", 0)
+        w(f"  wasted on retries:   {share(s['retry_tokens'], total)} of all tokens"
+          f"   [replies that yielded no move]")
 
     w("")
     w("BY DIFFICULTY")

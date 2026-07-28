@@ -1,7 +1,7 @@
 """Async client for the vLLM server.
 
 We host the model with vLLM's OpenAI-compatible server (see
-scripts/serve_vllm.sbatch) and talk to it with the OpenAI SDK. Two consequences:
+scripts/serve_and_run.sbatch) and talk to it with the OpenAI SDK. Two consequences:
 
 * It is *async* (AsyncOpenAI). One episode is sequential -- each move needs the
   previous grid state -- so the throughput win comes from running many episodes
@@ -22,7 +22,8 @@ class LLMResponse:
     """
 
     def __init__(self, text: str, prompt_tokens: int, completion_tokens: int,
-                 finish_reason: str | None = None, reasoning_tokens: int = 0):
+                 finish_reason: str | None = None, reasoning_tokens: int = 0,
+                 reasoning_text: str = ""):
         self.text = text
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
@@ -31,6 +32,18 @@ class LLMResponse:
         # is indistinguishable from a malformed answer unless we keep this.
         self.finish_reason = finish_reason
         self.reasoning_tokens = reasoning_tokens
+        # The <think> block the reasoning parser stripped out of .content. Keeping it
+        # is what makes the format-failure log worth reading: an episode that dies on
+        # empty replies otherwise logs an empty head and tail, which says nothing that
+        # text_len=0 did not already say. The tail of this shows what the model was
+        # actually doing when it ran out of budget.
+        self.reasoning_text = reasoning_text
+        # Tokens spent on replies that were discarded before this one (see
+        # BaselineAgent.act). Zero on the happy path. Kept apart from
+        # prompt_tokens/completion_tokens so "what this reply cost" and "what getting
+        # a usable move cost" stay separable in the results.
+        self.retry_prompt_tokens = 0
+        self.retry_completion_tokens = 0
 
 
 class LLMClient:
@@ -67,7 +80,7 @@ class LLMClient:
         usage = completion.usage
         # vLLM reports the stripped <think> block separately when a reasoning parser
         # is enabled; it is not in .content, so count it here to see where the token
-        # budget actually went.
+        # budget actually went, and keep the text itself for the failure log.
         details = getattr(usage, "completion_tokens_details", None)
         return LLMResponse(
             text=choice.message.content or "",
@@ -75,6 +88,7 @@ class LLMClient:
             completion_tokens=usage.completion_tokens,
             finish_reason=choice.finish_reason,
             reasoning_tokens=getattr(details, "reasoning_tokens", 0) or 0,
+            reasoning_text=getattr(choice.message, "reasoning_content", None) or "",
         )
 
     async def aclose(self) -> None:
