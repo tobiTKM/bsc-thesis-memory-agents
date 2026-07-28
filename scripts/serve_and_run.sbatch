@@ -45,8 +45,10 @@ TP="${TP:-${SLURM_GPUS_ON_NODE:-2}}"      # tensor-parallel size = GPUs requeste
 GPU_UTIL="${GPU_UTIL:-0.90}"
 MAXLEN="${MAXLEN:-32768}"                 # Qwen3 native ctx; must exceed prompt + MAX_TOKENS
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
-REASONING_PARSER="${REASONING_PARSER:-qwen3}"   # strips <think>...</think> out of .content
-                                                # (set to "" to get the raw thinking text)
+REASONING_PARSER="${REASONING_PARSER-qwen3}"    # strips <think>...</think> out of .content.
+                                                # NOTE: `-` not `:-` on purpose, so REASONING_PARSER=
+                                                # (explicit empty) truly DISABLES it; only *unset* defaults
+                                                # to qwen3. With `:-`, an empty value silently re-defaulted.
 SERVE_TIMEOUT="${SERVE_TIMEOUT:-2700}"    # 45 min: 62 GB of weights off ceph is slow
 
 SPLIT="${SPLIT:-test}"
