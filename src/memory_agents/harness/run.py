@@ -2,7 +2,7 @@ from ..agents.base import BaselineAgent
 from ..agents.memory_agent import MemoryAgent
 from ..envs.base import EpisodeResult, Transition
 from ..envs.sparc import SparcEnv, format_obs, is_success
-from ..prompts import format_reflections, sparc_system_prompt
+from ..prompts import sparc_system_prompt
 
 import asyncio
 import yaml
@@ -172,25 +172,30 @@ async def run_sparc_suite_baseline(client, split="test", concurrency=32, limit=N
     return results
 
 
-async def run_sparc_suite_memory_pass(client, memory, split="test", concurrency=32,
-                                      block_of=format_reflections):
-    """Memory-augmented pass: re-attempt only the puzzles that have stored memory,
-    each with its items injected into the actor's context.
+async def run_sparc_suite_memory_pass(client, puzzle_ids, block_for, split="test",
+                                      concurrency=32):
+    """Memory-augmented pass: re-attempt an explicit set of puzzles, each with its
+    own memory block injected into the actor's context.
 
-    This is method-agnostic on purpose (see the Memory ABC). Reflexion is the
-    first caller -- `memory` maps puzzle_id -> its reflections, and `block_of`
-    renders those into a system-prompt block -- but MemoryBank / MemP reuse this
-    same pass by producing `memory` differently and, if needed, passing their own
-    `block_of`. Puzzles solved in the memoryless pass are absent from `memory`:
-    the caller carries their win forward rather than re-running a deterministic
-    success. The env-pool / queue concurrency model is identical to the baseline
-    suite; only which puzzles run and the agent's injected block differ.
+    This is method-agnostic on purpose (see the Memory ABC). Reflexion is the first
+    caller -- `puzzle_ids` is the still-unsolved set and `block_for(pid)` renders
+    that puzzle's reflections -- but MemoryBank / MemP reuse this same pass with a
+    `block_for` that retrieves from a bank instead. The env-pool / queue concurrency
+    model is identical to the baseline suite; only which puzzles run and the agent's
+    injected block differ.
+
+    The puzzle set is passed in rather than derived from the memory store because
+    the two must be able to disagree. Both Reflexion arms have to re-attempt the
+    *same* set for the comparison to hold, yet the control arm has no memory at all
+    and even the memory arm can end up with an empty entry (a reflection call that
+    came back empty). Deriving the set from the store would silently shrink the
+    control arm to nothing and drop exactly the puzzles whose reflection failed.
     """
     ds = load_dataset("lkaesberg/SPaRC", "all", split=split)
     df = ds.to_pandas()
-    # id -> row index, so we can fetch the polyshapes for exactly the stored set.
+    # id -> row index, so we can fetch the polyshapes for exactly the requested set.
     row_of = {str(df["id"][i]): i for i in range(len(df))}
-    todo = [pid for pid in memory if pid in row_of]
+    todo = [str(pid) for pid in puzzle_ids if str(pid) in row_of]
 
     pool_size = min(concurrency, len(todo)) or 1
     env_pool: asyncio.Queue = asyncio.Queue()
@@ -207,7 +212,7 @@ async def run_sparc_suite_memory_pass(client, memory, split="test", concurrency=
             system_prompt = sparc_system_prompt(polyshapes)
 
             agent = MemoryAgent(client)
-            agent.reset(system_prompt, memory_block=block_of(memory[puzzle_id]),
+            agent.reset(system_prompt, memory_block=block_for(puzzle_id),
                         label=df["id"][i])
 
             return await run_sparc_episode_baseline(env, agent, obs, info, df["id"][i])

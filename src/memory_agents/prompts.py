@@ -30,7 +30,26 @@ def format_trajectory(episode, max_steps=None) -> str:
     return "\n".join(lines) if lines else "  (no valid move was ever made)"
 
 
-def reflexion_reflection_prompt(episode) -> str:
+def format_previous_plans(previous) -> str:
+    """The 'plans you already tried' section of the reflection prompt.
+
+    Reflexion's own reflection step is prompted with the reflections already in
+    memory, not just the latest trajectory (noahshinn/reflexion builds its query
+    from the few-shot examples *plus* the prior trial plans). Without this, trial 4
+    reflects as if trial 3 never happened and the model happily re-proposes a plan
+    it has already watched fail. Empty on trial 2, where there is no prior plan.
+    """
+    if not previous:
+        return ""
+    body = "\n".join(f"    - {p}" for p in previous)
+    return (
+        "\n    Plans you already tried on THIS puzzle in earlier trials, all of which\n"
+        "    still ended in failure. Do not repeat them; say what to do differently:\n"
+        f"{body}\n"
+    )
+
+
+def reflexion_reflection_prompt(episode, previous=()) -> str:
     """Reflexion's self-reflection step, following the paper's own prompt shape.
 
     Reflexion (Shinn et al., 2023) prompts an "advanced reasoning agent that can
@@ -39,6 +58,10 @@ def reflexion_reflection_prompt(episode) -> str:
     -- in a few complete sentences, anchored by few-shot example reflections. The
     plan (not a bug report) is what the actor reads before its next attempt at the
     SAME puzzle. See memory/reflexion.py for how it is stored and injected.
+
+    `previous` is that puzzle's existing memory (the reflections from earlier failed
+    trials), which the paper's implementation also conditions on -- see
+    format_previous_plans.
     """
     reasons = {
         "wrong-solution": "you submitted a path, but it broke one or more rules",
@@ -57,7 +80,7 @@ def reflexion_reflection_prompt(episode) -> str:
 
     Here are two examples of good self-reflections:
 {_REFLECTION_EXAMPLES}
-
+{format_previous_plans(previous)}
     Previous trial:
     Starting grid:
     {episode.first_obs}

@@ -21,13 +21,25 @@
 #   sbatch -G A100:4 --export=ALL,TP=4,LIMIT=0 scripts/serve_and_run.sbatch
 #   sbatch --export=ALL,MODEL=Qwen/Qwen2.5-3B-Instruct,TP=1 -G A100:1 scripts/serve_and_run.sbatch
 #
-# Reflexion (three jobs, linked by the pass1 file it prints). The control arm is not
-# optional: only failures get retried, so pass2's "lift" is >= 0 by construction, and
-# a second sample at TEMPERATURE=0.6 converts some failures with no memory at all.
-# Reflexion's real effect is pass2's retried_accuracy minus control's.
-#   sbatch -J reflexion --export=ALL,DRIVER=reflexion,PHASE=pass1,LIMIT=0 scripts/serve_and_run.sbatch
-#   sbatch -J reflexion --export=ALL,DRIVER=reflexion,PHASE=pass2,PASS1=results/json/reflexion_pass1_test_<stamp>.json scripts/serve_and_run.sbatch
-#   sbatch -J reflexion --export=ALL,DRIVER=reflexion,PHASE=control,PASS1=results/json/reflexion_pass1_test_<stamp>.json scripts/serve_and_run.sbatch
+# Reflexion, run as the paper does it: up to TRIALS attempts per puzzle, reflecting on
+# each failure, with a control arm over the SAME number of trials. The control is not
+# optional -- only unsolved puzzles are re-attempted and solved ones are carried
+# forward, so cumulative accuracy rises with the trial index even with no memory at
+# all, and at TEMPERATURE=0.6 ten resamples convert failures on their own. Reflexion's
+# effect is the memory arm minus the control arm at the same trial index.
+#
+# One job runs trial 1 (shared by both arms), then one job per arm:
+#   sbatch -J refl-root --export=ALL,DRIVER=reflexion,PHASE=root,LIMIT=0 scripts/serve_and_run.sbatch
+#   sbatch -J refl-mem  --export=ALL,DRIVER=reflexion,PHASE=arm,ARM=memory,TRIALS=10,ROOT=results/json/reflexion_root_test_<stamp>.json scripts/serve_and_run.sbatch
+#   sbatch -J refl-ctl  --export=ALL,DRIVER=reflexion,PHASE=arm,ARM=control,TRIALS=10,ROOT=results/json/reflexion_root_test_<stamp>.json scripts/serve_and_run.sbatch
+#
+# A trial over the 500-puzzle test split costs ~2 h, so 10 trials do NOT fit in this
+# job's 12 h limit. Each arm checkpoints after every trial; resubmit with RESUME to
+# continue the same file where it stopped (no trial is repeated):
+#   sbatch -J refl-mem --export=ALL,DRIVER=reflexion,PHASE=arm,TRIALS=10,RESUME=results/json/reflexion_memory_test_<stamp>.json scripts/serve_and_run.sbatch
+#
+# Then, on the login node (no GPU needed):
+#   python scripts/run_reflexion.py --phase compare --memory <memory.json> --control <control.json>
 #
 # Some nodes SIGILL the Apptainer launcher (see PREFLIGHT below). The job detects that
 # in ~30 s, appends the node to logs/bad_nodes.txt and resubmits itself excluding every
@@ -71,14 +83,24 @@ SMOKE="${SMOKE:-1}"                       # 0 skips the 2-prompt smoke check
 # memory methods slot in here as extra DRIVER cases -- the serve block above is
 # method-agnostic, so nothing else changes.
 DRIVER="${DRIVER:-baseline}"              # baseline | reflexion
-PHASE="${PHASE:-pass1}"                   # reflexion: pass1 | pass2 | control
-PASS1="${PASS1:-}"                         # reflexion pass2/control: results/json/reflexion_pass1_*.json
-REFLECT_MAX_TOKENS="${REFLECT_MAX_TOKENS:-$MAX_TOKENS}"   # self-reflection budget (pass1)
-SEED="${SEED:-0}"                         # trial-1 / baseline decoding seed
-# Seed for the pass2 and control retries. MUST differ from SEED: same prompt + same
-# seed makes vLLM reproduce trial-1's reply, so the retry would replay rather than
-# resample and the control arm would measure nothing.
-RETRY_SEED="${RETRY_SEED:-1}"
+PHASE="${PHASE:-root}"                    # reflexion: root | arm
+ARM="${ARM:-}"                            # reflexion PHASE=arm: memory | control
+ROOT="${ROOT:-}"                          # start an arm from this root file
+RESUME="${RESUME:-}"                      # ...or continue this arm file where it stopped
+TRIALS="${TRIALS:-10}"                    # total trials INCLUDING trial 1 (the paper runs ~10)
+MEMORY_CAP="${MEMORY_CAP:-3}"             # reflections kept per puzzle (the paper's Omega)
+# Explicit output path. Unset = an auto-named, timestamped file. Set it when running
+# several MODELs: the auto names carry only split+timestamp, so three models' root
+# files are told apart only by when they happened to run. A fixed name is also what
+# lets the arm jobs be submitted up front with --dependency, since they must name
+# their ROOT before the root job has produced it.
+OUT="${OUT:-}"
+REFLECT_MAX_TOKENS="${REFLECT_MAX_TOKENS:-$MAX_TOKENS}"   # self-reflection budget (memory arm)
+# Seed for trial 1. Trial t decodes at SEED + t - 1, in BOTH arms: distinct per trial
+# (with the same prompt and seed vLLM replays its previous reply, so a fixed seed would
+# make the control arm repeat trial 1 instead of resampling) and identical across arms
+# (so the two differ only in whether the reflection block is injected).
+SEED="${SEED:-0}"
 
 # ---- modules: re-resolve Lmod for THIS node's CPU ---------------------------
 # This is what killed six earlier jobs. `sbatch --export=ALL` (the default) carries
@@ -135,7 +157,7 @@ export HF_HOME="${HF_HOME:-$AGPROJ/$USER/hf_cache}"   # client side: SPaRC datas
 # '/mnt/ceph-hdd'"). Node-local /tmp is always writable, is on SSD, and these caches
 # are disposable -- only the weights genuinely need the shared filesystem.
 CACHE_IN="/tmp/vllm-cache-$SLURM_JOB_ID"  # apptainer bind-mounts the host /tmp in
-mkdir -p "$HF_HOME" "$CACHE_IN"
+mkdir -p "$HF_HOME" "$CACHE_IN" "$CACHE_IN/tmp" "$CACHE_IN/tiktoken"
 
 [[ -r "$SIF" ]] || { echo "no such image: $SIF" >&2; exit 1; }
 echo "[$(date +%T)] AGPROJ=$AGPROJ -> $PROJ_IN (in container)"
@@ -238,6 +260,8 @@ apptainer exec --nv \
     --env TRITON_CACHE_DIR="$CACHE_IN/triton" \
     --env TORCHINDUCTOR_CACHE_DIR="$CACHE_IN/inductor" \
     --env OUTLINES_CACHE_DIR="$CACHE_IN/outlines" \
+    --env TMPDIR="$CACHE_IN/tmp" \
+    --env TIKTOKEN_RS_CACHE_DIR="$CACHE_IN/tiktoken" \
     "$SIF" \
     python3 -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_ARG" \
@@ -296,7 +320,7 @@ if [[ "$SMOKE" == "1" ]]; then
 fi
 
 # Sampling/budget flags shared by every driver; --limit is added per-driver since
-# reflexion pass2 runs over the pass1 episode set, not a fresh --limit slice.
+# a reflexion arm runs over the puzzle set stored in its state file, not a fresh --limit slice.
 COMMON_ARGS=(--split "$SPLIT" --concurrency "$CONCURRENCY" \
     --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" \
     --top-p "$TOP_P" --seed "$SEED" ${TOP_K:+--top-k "$TOP_K"})
@@ -307,16 +331,35 @@ case "$DRIVER" in
     python -u scripts/run_baseline.py "${COMMON_ARGS[@]}" --limit "$LIMIT"
     ;;
   reflexion)
-    if [[ "$PHASE" == "pass1" ]]; then
-        echo "[$(date +%T)] reflexion pass1 (trial-1 + reflect): split=$SPLIT limit=$LIMIT"
-        python -u scripts/run_reflexion.py --phase pass1 "${COMMON_ARGS[@]}" \
-            --limit "$LIMIT" --reflect-max-tokens "$REFLECT_MAX_TOKENS"
-    else
-        [[ -n "$PASS1" ]] || { echo "PHASE=$PHASE needs PASS1=<reflexion_pass1_*.json>" >&2; exit 1; }
-        echo "[$(date +%T)] reflexion $PHASE (retry at seed $RETRY_SEED): PASS1=$PASS1"
-        python -u scripts/run_reflexion.py --phase "$PHASE" --pass1 "$PASS1" \
-            --retry-seed "$RETRY_SEED" "${COMMON_ARGS[@]}"
-    fi
+    case "$PHASE" in
+      root)
+        echo "[$(date +%T)] reflexion root (trial 1, shared by both arms): split=$SPLIT limit=$LIMIT"
+        python -u scripts/run_reflexion.py --phase root "${COMMON_ARGS[@]}" \
+            --limit "$LIMIT" --trials "$TRIALS" --memory-cap "$MEMORY_CAP" \
+            ${OUT:+--out "$OUT"}
+        ;;
+      arm)
+        # Everything that defines the run (split, sampling, base seed, memory cap) is
+        # frozen in the root/arm file, so an arm job passes only what may legitimately
+        # differ between jobs. That is what lets a resume extend a curve rather than
+        # silently start a differently-configured one halfway through.
+        if [[ -n "$RESUME" ]]; then
+            echo "[$(date +%T)] reflexion arm: resuming $RESUME up to $TRIALS trials"
+            python -u scripts/run_reflexion.py --phase arm --resume "$RESUME" \
+                --trials "$TRIALS" --concurrency "$CONCURRENCY" \
+                --reflect-max-tokens "$REFLECT_MAX_TOKENS"
+        else
+            [[ -n "$ROOT" ]] || { echo "PHASE=arm needs ROOT=<reflexion_root_*.json> or RESUME=<arm file>" >&2; exit 1; }
+            [[ -n "$ARM"  ]] || { echo "PHASE=arm needs ARM=memory or ARM=control" >&2; exit 1; }
+            echo "[$(date +%T)] reflexion arm=$ARM: $TRIALS trials from $ROOT"
+            python -u scripts/run_reflexion.py --phase arm --arm "$ARM" --root "$ROOT" \
+                --trials "$TRIALS" --concurrency "$CONCURRENCY" \
+                --reflect-max-tokens "$REFLECT_MAX_TOKENS" ${OUT:+--out "$OUT"}
+        fi
+        ;;
+      *)
+        echo "unknown PHASE=$PHASE for DRIVER=reflexion (expected: root | arm)" >&2; exit 1 ;;
+    esac
     ;;
   *)
     echo "unknown DRIVER=$DRIVER (expected: baseline | reflexion)" >&2; exit 1 ;;

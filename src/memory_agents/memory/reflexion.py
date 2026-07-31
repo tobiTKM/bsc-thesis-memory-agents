@@ -68,14 +68,18 @@ class Reflector:
     def __init__(self, client):
         self.client = client
 
-    async def reflect(self, episode):
+    async def reflect(self, episode, previous=()):
         """Return (reflection_text, LLMResponse) for a failed episode.
+
+        `previous` is what this puzzle's memory already holds, so the reflection for
+        trial t is written knowing which plans trials 2..t-1 already tried and failed
+        with (as in the paper's implementation).
 
         The text may be empty if the model returned nothing parseable (e.g. a
         reasoning model that spent its whole budget in <think>); the caller
         decides whether to store it. The LLMResponse is handed back so the driver
         can tally reflection-generation tokens as part of Reflexion's cost.
         """
-        messages = [{"role": "user", "content": reflexion_reflection_prompt(episode)}]
-        response = await self.client.chat(messages)
+        prompt = reflexion_reflection_prompt(episode, previous=previous)
+        response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response

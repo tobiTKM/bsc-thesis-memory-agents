@@ -1,31 +1,48 @@
 #!/usr/bin/env python
-"""Run Reflexion over a SPaRC split, as two disk-linked phases.
+"""Run Reflexion over a SPaRC split for up to N trials, with a matched control arm.
 
-Reflexion adds memory by *retrying*: attempt each puzzle once with no memory,
-turn each failure into a short verbal reflection, then re-attempt the failed
-puzzles with their own reflection in context. We split that across two SLURM jobs
-so the reflections can be inspected (or hand-edited) between them:
+This is the paper's loop (Shinn et al., 2023, Algorithm 1): attempt a task, and while
+it is still unsolved and trials remain, turn the failed trajectory into a short verbal
+reflection, append it to that task's episodic memory (bounded to the last `cap`), and
+re-attempt the SAME task with that memory in context. Solved tasks are never
+re-attempted, exactly like the reference implementation's `skip` flag.
 
-  phase pass1:  trial-1 = the memoryless baseline, then reflect on every failure.
-                Writes results/json/reflexion_pass1_<...>.json (per-puzzle record
-                + that puzzle's reflection).
-  phase pass2:  loads the pass1 file, re-runs only the failed puzzles with their
-                reflection injected, carries the trial-1 wins forward, and writes
-                the final trial-1 vs trial-2 comparison.
-  phase control: the same retry over the same puzzles at the same seed, with NO
-                reflection injected. Required to interpret pass2: only failures are
-                retried, so lift is >= 0 by construction, and a second sample at
-                temperature 0.6 converts some failures on its own. Reflexion's real
-                effect is pass2's retried_accuracy minus this one's.
+Three phases, because a 10-trial run over 500 puzzles is ~20 h of GPU per arm and the
+SLURM limit is 12 h:
 
-  python scripts/run_reflexion.py --phase pass1   --split test --limit 50
-  python scripts/run_reflexion.py --phase pass2   --pass1 results/json/reflexion_pass1_*.json
-  python scripts/run_reflexion.py --phase control --pass1 results/json/reflexion_pass1_*.json
+  root   trial 1 only: the memoryless baseline over the split. Written once and
+         shared by BOTH arms, so they start from the *identical* trial-1 episodes
+         rather than from two independent samples.
+  arm    trials 2..N for one arm, resumable. --arm memory is Reflexion proper;
+         --arm control is the same loop with no reflection injected and no
+         reflection generated -- the paper's own `use_memory=False` baseline.
+  compare  no GPU: prints the two arms' trial curves side by side and the per-trial
+         difference, which is the headline number.
+
+  # 1. shared trial 1
+  python scripts/run_reflexion.py --phase root --split test --limit 0
+  # 2. the two arms (separate jobs; run them in either order or in parallel)
+  python scripts/run_reflexion.py --phase arm --arm memory  --root results/json/reflexion_root_*.json --trials 10
+  python scripts/run_reflexion.py --phase arm --arm control --root results/json/reflexion_root_*.json --trials 10
+  # 3. hit the wall clock? continue the same file, no work repeated
+  python scripts/run_reflexion.py --phase arm --resume results/json/reflexion_memory_*.json --trials 10
+  # 4. the result
+  python scripts/run_reflexion.py --phase compare --memory results/json/reflexion_memory_*.json \
+                                                  --control results/json/reflexion_control_*.json
+
+Why the control arm mirrors the trial count: only *unsolved* puzzles are re-attempted
+and solved ones are carried forward, so cumulative accuracy can only rise with the
+trial index -- an upward curve is guaranteed even with no memory whatsoever. At
+temperature 0.6 a plain resample converts some failures on its own, and ten resamples
+convert more. So "accuracy went up over 10 trials" measures nothing on its own; the
+control arm, run for the same number of trials over the same puzzles at the same
+per-trial seeds, is what turns it into a claim about memory.
 """
 
 import argparse
 import asyncio
 import collections
+import copy
 import json
 import os
 import pathlib
@@ -36,352 +53,532 @@ from datetime import datetime
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from memory_agents.config import resolve_server
+from memory_agents.envs.base import EpisodeResult
 from memory_agents.harness.run import (
     run_sparc_suite_baseline,
     run_sparc_suite_memory_pass,
 )
 from memory_agents.llm.client import LLMClient
 from memory_agents.memory import Reflector, ReflexionMemory
+from memory_agents.prompts import format_reflections
+
+SCHEMA = "reflexion-multitrial-v1"
+
+# Knobs that define what a run *is*. On --resume these come from the state file and
+# the CLI cannot override them: trials 6-10 silently running at a different
+# temperature (or against a different split) would corrupt the curve they extend.
+FROZEN = ("split", "limit", "temperature", "top_p", "top_k", "max_tokens",
+          "base_seed", "memory_cap")
 
 
 # --------------------------------------------------------------------------- #
-# metrics helpers (shared shape with scripts/run_baseline.py)
+# state: one JSON file per arm, checkpointed after every trial
 # --------------------------------------------------------------------------- #
-def accuracy_block(records) -> dict:
-    """Overall + per-difficulty accuracy over an iterable of {success, difficulty}."""
-    n = len(records)
-    wins = sum(r["success"] for r in records)
-    by_diff: dict[int, list] = {}
-    for r in records:
-        by_diff.setdefault(r["difficulty"], []).append(r["success"])
-    return {
-        "n": n,
-        "success": wins,
-        "accuracy": wins / n if n else 0.0,
-        "accuracy_by_difficulty": {
-            str(d): sum(s) / len(s) for d, s in sorted(by_diff.items())
-        },
-    }
+def save_state(path, state) -> None:
+    """Write the state file atomically.
+
+    A checkpoint is written after each trial, i.e. after ~2 h of GPU. A partial
+    write (job killed mid-dump, wall clock hit) would leave unparseable JSON and
+    cost the whole run, so write to a sibling temp file and rename -- os.replace is
+    atomic within a filesystem.
+    """
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, path)
 
 
-def to_record(r) -> dict:
-    """Per-puzzle record, with the reflection fields Reflexion needs downstream."""
-    return {
-        "puzzle_id": str(r.puzzle_id),
-        "success": r.success,
-        "difficulty": r.difficulty,
-        "steps": r.steps(),
-        "terminated": r.terminated,
-        "truncated": r.truncated,
+def puzzle_entry(difficulty: int) -> dict:
+    return {"difficulty": difficulty, "solved": False, "solved_at_trial": None,
+            "attempts": [], "last_episode": None}
+
+
+def record_attempt(state: dict, trial: int, r) -> None:
+    """Fold one episode into the per-puzzle history."""
+    pid = str(r.puzzle_id)
+    entry = state["puzzles"].setdefault(pid, puzzle_entry(r.difficulty))
+    # A crashed episode reports difficulty -1; never let it overwrite a real one.
+    if r.difficulty is not None and r.difficulty >= 0:
+        entry["difficulty"] = r.difficulty
+    entry["attempts"].append({
+        "trial": trial, "success": r.success, "steps": r.steps(),
+        "terminated": r.terminated, "truncated": r.truncated,
         "terminal_reason": r.terminal_reason,
         "prompt_tokens": r.prompt_tokens(),
         "completion_tokens": r.completion_tokens(),
-        "retry_tokens": r.retry_tokens(),   # spent on replies that yielded no move
-        "error": r.error or None,           # set only when the episode crashed
-        "reflection": None,   # filled in for failures during pass1
-    }
-
-
-def make_client(args, max_tokens, seed=None) -> LLMClient:
-    base_url, model = resolve_server()
-    return LLMClient(base_url=base_url, model=model, max_tokens=max_tokens,
-                     temperature=args.temperature, top_p=args.top_p,
-                     top_k=args.top_k,
-                     seed=args.seed if seed is None else seed)
-
-
-# --------------------------------------------------------------------------- #
-# phase 1: baseline trial + reflect on every failure
-# --------------------------------------------------------------------------- #
-async def reflect_on_failures(reflector, results, concurrency):
-    """Generate one reflection per failed episode, `concurrency` at a time.
-
-    Returns (memory, reflections, tokens, n_failed): a ReflexionMemory keyed by
-    puzzle id, the per-puzzle texts, the token totals spent generating them
-    (counted as part of Reflexion's cost), and how many calls blew up.
-    """
-    memory = ReflexionMemory()
-    failures = [r for r in results if not r.success]
-    tokens = collections.Counter()
-    sem = asyncio.Semaphore(concurrency)
-
-    async def one(r):
-        async with sem:
-            text, resp = await reflector.reflect(r)
-        tokens["prompt"] += resp.prompt_tokens
-        tokens["completion"] += resp.completion_tokens
-        # An empty reflection (e.g. a reasoning model that spent its whole budget
-        # in <think>) is useless as a hint; skip it so pass2 just carries the
-        # trial-1 failure rather than re-running with no guidance.
-        if text:
-            memory.write(r.puzzle_id, text)
-        return str(r.puzzle_id), text
-
-    # return_exceptions is load-bearing: this runs *after* trial-1 has finished, so
-    # letting one bad reflection call propagate out of gather would throw away a
-    # completed baseline run that cost hours of GPU time, before anything is written
-    # to disk. A reflection we could not generate just means that puzzle carries its
-    # trial-1 failure forward.
-    outcomes = await asyncio.gather(*(one(r) for r in failures), return_exceptions=True)
-    reflections, n_failed = {}, 0
-    for outcome in outcomes:
-        if isinstance(outcome, BaseException):
-            n_failed += 1
-            print(f"[pass1] reflection failed: {outcome!r}", flush=True)
-            continue
-        pid, text = outcome
-        reflections[pid] = text
-    return memory, reflections, tokens, n_failed
-
-
-async def run_pass1(args):
-    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-    fail_log = pathlib.Path(f"results/json/format_failures_reflexion_{args.split}_{stamp}.jsonl")
-    os.environ["FORMAT_FAILURE_LOG"] = str(fail_log)
-
-    actor = make_client(args, args.max_tokens)
-    reflector = Reflector(make_client(args, args.reflect_max_tokens))
-
-    print(f"[pass1] trial-1 baseline: split={args.split} limit={args.limit} "
-          f"concurrency={args.concurrency}", flush=True)
-    t0 = time.time()
-    results = await run_sparc_suite_baseline(
-        actor, split=args.split, concurrency=args.concurrency, limit=args.limit)
-
-    n_fail = sum(not r.success for r in results)
-    print(f"[pass1] trial-1 done: {len(results)-n_fail}/{len(results)} solved; "
-          f"reflecting on {n_fail} failures...", flush=True)
-    memory, reflections, rtokens, rfailed = await reflect_on_failures(
-        reflector, results, args.concurrency)
-    elapsed = time.time() - t0
-
-    await actor.aclose()
-    await reflector.client.aclose()
-
-    episodes = []
-    for r in results:
-        rec = to_record(r)
-        rec["reflection"] = reflections.get(rec["puzzle_id"])
-        episodes.append(rec)
-
-    summary = accuracy_block(episodes)
-    summary.update({
-        "phase": "pass1",
-        "model": actor.model,
-        "model_id": os.environ.get("LLM_MODEL_ID") or actor.model,
-        "split": args.split,
-        "elapsed_sec": round(elapsed, 1),
-        "seed": actor.seed,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "top_k": args.top_k,
-        "max_tokens": args.max_tokens,
-        "reflect_max_tokens": args.reflect_max_tokens,
-        "concurrency": args.concurrency,
-        "reflections_written": len(memory),
-        "reflections_failed": rfailed,
-        # Episodes that crashed rather than failed; non-zero means trial-1 is
-        # incomplete, not that the model did badly.
-        "errors": sum(1 for r in results if r.terminal_reason == "error"),
-        # actor (trial-1) tokens vs reflection-generation tokens, kept apart so
-        # the final report can show what memory actually costs.
-        "actor_prompt_tokens": sum(e["prompt_tokens"] for e in episodes),
-        "actor_completion_tokens": sum(e["completion_tokens"] for e in episodes),
-        "reflection_prompt_tokens": rtokens["prompt"],
-        "reflection_completion_tokens": rtokens["completion"],
+        "retry_tokens": r.retry_tokens(),
+        "error": r.error or None,
     })
-
-    out = args.out or f"results/json/reflexion_pass1_{args.split}_{stamp}.json"
-    out_path = pathlib.Path(out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps({"summary": summary, "episodes": episodes}, indent=2))
-
-    print(f"[pass1] trial-1 accuracy={summary['accuracy']:.3f} "
-          f"({summary['success']}/{summary['n']}); {len(memory)} reflections written",
-          flush=True)
-    print(f"[pass1] wrote {out_path}\n[pass1] next: "
-          f"python scripts/run_reflexion.py --phase pass2 --pass1 {out_path}", flush=True)
+    if r.success:
+        entry["solved"] = True
+        entry["solved_at_trial"] = trial
+        entry["last_episode"] = None      # never reflected on again; drop the bulk
+    else:
+        # Overwritten every trial: the next reflection is written from the most
+        # recent failure, as in the paper. None for crashes (see reflection_context).
+        entry["last_episode"] = r.reflection_context()
 
 
-# --------------------------------------------------------------------------- #
-# phase pass2 / control: re-attempt the failures, with or without the reflection
-# --------------------------------------------------------------------------- #
-async def run_retry_pass(args, with_memory: bool):
-    """Second attempt at every puzzle trial-1 failed, carrying trial-1 wins forward.
+def unsolved_ids(state: dict) -> list:
+    """The puzzles the next trial attempts, in a stable order."""
+    return sorted(pid for pid, e in state["puzzles"].items() if not e["solved"])
 
-    `with_memory=True` is Reflexion proper: each puzzle gets its own reflection in
-    the actor's context. `with_memory=False` is the CONTROL, and it is what makes
-    the headline number mean anything.
 
-    Why the control is not optional: only trial-1 *failures* are retried and trial-1
-    wins are carried forward untouched, so trial-2 accuracy can never drop below
-    trial-1 and `lift` is >= 0 by construction. The actor also samples at
-    temperature 0.6, so a second attempt converts some failures on its own. Without
-    a no-memory arm the measured lift is (memory effect + resampling effect) with no
-    way to separate the two, which is the first thing an examiner will ask about.
+def cumulative_block(state: dict) -> dict:
+    """Solved-by-now over the whole split -- the paper's per-trial curve.
 
-    Both arms run at --retry-seed, which MUST differ from the seed trial-1 used:
-    given the same prompt and the same seed, vLLM reproduces trial-1's reply, so a
-    control at the trial-1 seed would measure a replay rather than a resample and
-    flatter Reflexion by default. With that held equal, the two arms differ only in
-    whether the reflection block is injected.
+    Cumulative, not per-trial: a puzzle solved at trial 3 stays solved at trial 4.
     """
-    label = "pass2" if with_memory else "control"
-    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-    pass1 = json.loads(pathlib.Path(args.pass1).read_text())
-    ep1 = pass1["episodes"]
-
-    # The retried set: failed puzzles that got a (possibly hand-edited) reflection.
-    # The control re-attempts exactly this set so the two arms stay comparable.
-    memory = {e["puzzle_id"]: [e["reflection"]]
-              for e in ep1 if not e["success"] and e["reflection"]}
-    how = "with reflections" if with_memory else "WITHOUT memory (control arm)"
-    print(f"[{label}] loaded {args.pass1}: trial-1 solved "
-          f"{sum(e['success'] for e in ep1)}/{len(ep1)}; "
-          f"re-attempting {len(memory)} {how} at seed {args.retry_seed}", flush=True)
-
-    fail_log = pathlib.Path(
-        f"results/json/format_failures_reflexion_{label}_{args.split}_{stamp}.jsonl")
-    os.environ["FORMAT_FAILURE_LOG"] = str(fail_log)
-    actor = make_client(args, args.max_tokens, seed=args.retry_seed)
-
-    # A MemoryAgent with an empty block behaves identically to the memoryless
-    # baseline (see MemoryAgent), so the control needs nothing but this.
-    block_kwargs = {} if with_memory else {"block_of": lambda _: ""}
-
-    t0 = time.time()
-    results2 = await run_sparc_suite_memory_pass(
-        actor, memory, split=args.split, concurrency=args.concurrency, **block_kwargs)
-    elapsed = time.time() - t0
-    await actor.aclose()
-
-    # Build the final per-puzzle outcome: trial-2 result where we re-ran, else the
-    # carried-forward trial-1 outcome (solved puzzles + any failure we could not
-    # reflect on).
-    retried = {str(r.puzzle_id): r for r in results2}
-    final = []
-    for e in ep1:
-        pid = e["puzzle_id"]
-        if pid in retried:
-            r = retried[pid]
-            rec = {"puzzle_id": pid, "success": r.success, "difficulty": r.difficulty,
-                   "steps": r.steps(), "terminal_reason": r.terminal_reason,
-                   "prompt_tokens": r.prompt_tokens(),
-                   "completion_tokens": r.completion_tokens(),
-                   "retry_tokens": r.retry_tokens(), "from": "trial2"}
-        else:
-            rec = {"puzzle_id": pid, "success": e["success"], "difficulty": e["difficulty"],
-                   "steps": e["steps"], "terminal_reason": e["terminal_reason"],
-                   "prompt_tokens": 0, "completion_tokens": 0,
-                   "retry_tokens": 0, "from": "carried"}
-        final.append(rec)
-
-    trial1 = accuracy_block(ep1)
-    trial2 = accuracy_block(final)
-    s1 = pass1["summary"]
-    actor2_prompt = sum(r.prompt_tokens() for r in results2)
-    actor2_completion = sum(r.completion_tokens() for r in results2)
-    # The number to actually compare arms on. Whole-split accuracy is diluted by the
-    # carried trial-1 wins, which compresses the effect; on the retried subset
-    # trial-1 accuracy is 0 by construction, so this fraction *is* the effect:
-    # of N re-attempted failures, how many did this arm solve.
-    retried_solved = sum(1 for r in results2 if r.success)
-
-    summary = {
-        "phase": label,
-        "with_memory": with_memory,
-        "model": actor.model,
-        "model_id": s1.get("model_id", actor.model),
-        "split": args.split,
-        "elapsed_sec": round(elapsed, 1),
-        "pass1_file": str(args.pass1),
-        "retried": len(memory),
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "top_k": args.top_k,
-        "max_tokens": args.max_tokens,
-        "concurrency": args.concurrency,
-        "trial1_seed": s1.get("seed"),
-        "retry_seed": args.retry_seed,
-        "trial1_accuracy": trial1["accuracy"],
-        "trial2_accuracy": trial2["accuracy"],
-        "lift": trial2["accuracy"] - trial1["accuracy"],
-        # Compare this across the pass2 and control files; the difference is the
-        # part attributable to memory rather than to resampling.
-        "retried_solved": retried_solved,
-        "retried_accuracy": retried_solved / len(results2) if results2 else 0.0,
-        "errors": sum(1 for r in results2 if r.terminal_reason == "error"),
-        "trial1": trial1,
-        "trial2": trial2,
-        "newly_solved": trial2["success"] - trial1["success"],
-        # total token cost of the whole Reflexion run = trial-1 actor + reflection
-        # generation + trial-2 actor.
-        "tokens": {
-            "trial1_actor_prompt": s1.get("actor_prompt_tokens", 0),
-            "trial1_actor_completion": s1.get("actor_completion_tokens", 0),
-            "reflection_prompt": s1.get("reflection_prompt_tokens", 0),
-            "reflection_completion": s1.get("reflection_completion_tokens", 0),
-            "trial2_actor_prompt": actor2_prompt,
-            "trial2_actor_completion": actor2_completion,
+    puzzles = state["puzzles"]
+    n = len(puzzles)
+    wins = sum(1 for e in puzzles.values() if e["solved"])
+    by_diff: dict[int, list] = {}
+    for e in puzzles.values():
+        by_diff.setdefault(e["difficulty"], []).append(e["solved"])
+    return {
+        "n": n,
+        "solved": wins,
+        "accuracy": wins / n if n else 0.0,
+        "accuracy_by_difficulty": {
+            str(d): sum(v) / len(v) for d, v in sorted(by_diff.items())
         },
     }
 
-    stem = "reflexion_final" if with_memory else "reflexion_control"
-    out = args.out or f"results/json/{stem}_{args.split}_{stamp}.json"
-    out_path = pathlib.Path(out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(
-        {"summary": summary, "episodes": final}, indent=2))
 
-    print(f"[{label}] trial-1={trial1['accuracy']:.3f} -> trial-2={trial2['accuracy']:.3f} "
-          f"(lift {summary['lift']:+.3f}, {summary['newly_solved']} newly solved)", flush=True)
-    print(f"[{label}] on the retried subset: {retried_solved}/{len(results2)} solved "
-          f"({summary['retried_accuracy']:.3f})", flush=True)
-    print(f"[{label}] by_difficulty trial-2={trial2['accuracy_by_difficulty']}", flush=True)
-    if summary["errors"]:
-        print(f"[{label}] WARNING: {summary['errors']} episodes crashed; "
-              f"this pass is incomplete", flush=True)
-    print(f"[{label}] wrote {out_path}", flush=True)
-    if with_memory:
-        print(f"[{label}] next, for the control arm: python scripts/run_reflexion.py "
-              f"--phase control --pass1 {args.pass1}", flush=True)
-    else:
-        print(f"[{label}] Reflexion's effect = pass2 retried_accuracy - "
-              f"{summary['retried_accuracy']:.3f} (this control)", flush=True)
+def trial_seed(base_seed: int, trial: int) -> int:
+    """Decoding seed for trial t. Distinct per trial, identical across arms.
+
+    Load-bearing in both directions. Across arms: the two arms must differ only in
+    the injected block, so trial t gets the same seed in each. Across trials: in the
+    control arm every trial sends a byte-identical prompt, so a fixed seed would make
+    vLLM replay trial 1's reply ten times and the control would measure nothing at
+    all rather than the resampling effect it exists to measure.
+    """
+    return base_seed + trial - 1
 
 
-async def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", choices=["pass1", "pass2", "control"], required=True)
-    ap.add_argument("--pass1", default=None,
-                    help="pass1 JSON (required for --phase pass2 and control)")
+def make_client(cfg: dict, max_tokens: int, seed: int) -> LLMClient:
+    base_url, model = resolve_server()
+    return LLMClient(base_url=base_url, model=model, max_tokens=max_tokens,
+                     temperature=cfg["temperature"], top_p=cfg["top_p"],
+                     top_k=cfg["top_k"], seed=seed)
+
+
+def set_failure_log(cfg: dict, tag: str, trial: int) -> None:
+    """Point the agent's format-failure log at this trial's own file."""
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    os.environ["FORMAT_FAILURE_LOG"] = str(pathlib.Path(
+        f"results/json/format_failures_reflexion_{tag}_{cfg['split']}_t{trial}_{stamp}.jsonl"))
+
+
+def trial_block(trial: int, seed: int, results, state: dict, elapsed: float,
+                reflection: dict | None = None) -> dict:
+    """One row of the trial curve: what this trial attempted, won and cost."""
+    cum = cumulative_block(state)
+    attempted = len(results)
+    solved_now = sum(1 for r in results if r.success)
+    block = {
+        "trial": trial,
+        "seed": seed,
+        "attempted": attempted,
+        "solved_this_trial": solved_now,
+        # Of the puzzles this trial actually re-attempted, how many it converted.
+        # Trial-1 accuracy on that set is 0 by construction from trial 2 on, so this
+        # is the per-trial conversion rate the arms are compared on.
+        "trial_accuracy": solved_now / attempted if attempted else 0.0,
+        "cumulative_solved": cum["solved"],
+        "cumulative_accuracy": cum["accuracy"],
+        "accuracy_by_difficulty": cum["accuracy_by_difficulty"],
+        # Crashed, not failed: a non-zero count means this trial is incomplete.
+        "errors": sum(1 for r in results if r.terminal_reason == "error"),
+        "elapsed_sec": round(elapsed, 1),
+        "actor_prompt_tokens": sum(r.prompt_tokens() for r in results),
+        "actor_completion_tokens": sum(r.completion_tokens() for r in results),
+        "actor_retry_tokens": sum(r.retry_tokens() for r in results),
+        # Zero for the control arm, which never calls the reflection model at all.
+        "reflection_prompt_tokens": 0,
+        "reflection_completion_tokens": 0,
+        "reflections_written": 0,
+        "reflections_empty": 0,
+        "reflections_failed": 0,
+        "reflections_skipped": 0,
+    }
+    if reflection:
+        block.update(reflection)
+    return block
+
+
+# --------------------------------------------------------------------------- #
+# phase root: trial 1, shared by both arms
+# --------------------------------------------------------------------------- #
+async def run_root(args) -> None:
+    cfg = {
+        "schema": SCHEMA, "arm": "root", "split": args.split,
+        "limit": args.limit or 0, "temperature": args.temperature,
+        "top_p": args.top_p, "top_k": args.top_k, "max_tokens": args.max_tokens,
+        "base_seed": args.seed, "memory_cap": args.memory_cap,
+        "concurrency": args.concurrency,
+    }
+    seed = trial_seed(cfg["base_seed"], 1)
+    set_failure_log(cfg, "root", 1)
+
+    print(f"[root] trial 1 (memoryless baseline): split={cfg['split']} "
+          f"limit={args.limit} seed={seed} concurrency={args.concurrency}", flush=True)
+    client = make_client(cfg, cfg["max_tokens"], seed)
+    t0 = time.time()
+    results = await run_sparc_suite_baseline(
+        client, split=cfg["split"], concurrency=args.concurrency, limit=args.limit)
+    elapsed = time.time() - t0
+    await client.aclose()
+
+    cfg["model"] = client.model
+    cfg["model_id"] = os.environ.get("LLM_MODEL_ID") or client.model
+    state = {"config": cfg, "trials": [], "puzzles": {}, "memory": {}}
+    for r in results:
+        record_attempt(state, 1, r)
+    state["trials"].append(trial_block(1, seed, results, state, elapsed))
+
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    out = args.out or f"results/json/reflexion_root_{cfg['split']}_{stamp}.json"
+    save_state(out, state)
+
+    t1 = state["trials"][0]
+    print(f"[root] trial 1: {t1['cumulative_solved']}/{len(state['puzzles'])} solved "
+          f"({t1['cumulative_accuracy']:.3f})", flush=True)
+    if t1["errors"]:
+        print(f"[root] WARNING: {t1['errors']} episodes crashed; trial 1 is incomplete",
+              flush=True)
+    print(f"[root] wrote {out}\n[root] next:\n"
+          f"  python scripts/run_reflexion.py --phase arm --arm memory  --root {out} --trials {args.trials}\n"
+          f"  python scripts/run_reflexion.py --phase arm --arm control --root {out} --trials {args.trials}",
+          flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# phase arm: trials 2..N, resumable
+# --------------------------------------------------------------------------- #
+async def reflect_pass(reflector, state, memory, todo, concurrency) -> dict:
+    """Write one fresh reflection per unsolved puzzle, from its latest failure.
+
+    Runs *before* the trial that consumes it, so a resumed job can always rebuild
+    the memory it needs from the state file alone. Reflection is per-puzzle: the
+    lesson from puzzle X is only ever shown when re-attempting X.
+    """
+    sem = asyncio.Semaphore(concurrency)
+    # A puzzle whose last attempt crashed has no trajectory to reflect on; it is
+    # still re-attempted, just without a new reflection. Reflecting on it would ask
+    # the model to diagnose a failure that never happened.
+    targets = [pid for pid in todo if state["puzzles"][pid]["last_episode"]]
+    skipped = len(todo) - len(targets)
+
+    async def one(pid):
+        entry = state["puzzles"][pid]
+        episode = EpisodeResult.from_reflection_context(entry["last_episode"], pid)
+        async with sem:
+            text, resp = await reflector.reflect(episode, previous=memory.read(pid))
+        return pid, text, resp
+
+    # return_exceptions: this runs after a completed trial that cost hours. One bad
+    # reflection call must not take the run down before the checkpoint is written --
+    # that puzzle just carries the memory it already had into the next trial.
+    outcomes = await asyncio.gather(*(one(p) for p in targets), return_exceptions=True)
+
+    tokens = collections.Counter()
+    written = empty = failed = 0
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            failed += 1
+            print(f"[arm] reflection failed: {outcome!r}", flush=True)
+            continue
+        pid, text, resp = outcome
+        tokens["prompt"] += resp.prompt_tokens
+        tokens["completion"] += resp.completion_tokens
+        if text:
+            memory.write(pid, text)   # applies the cap (keeps the last `cap`)
+            written += 1
+        else:
+            # e.g. a reasoning model that spent its whole budget inside <think>.
+            empty += 1
+    return {
+        "reflections_written": written,
+        "reflections_empty": empty,
+        "reflections_failed": failed,
+        "reflections_skipped": skipped,
+        "reflection_prompt_tokens": tokens["prompt"],
+        "reflection_completion_tokens": tokens["completion"],
+    }
+
+
+def load_arm_state(args) -> tuple[dict, str]:
+    """Return (state, output_path) for a fresh arm or a resumed one."""
+    if args.resume:
+        state = json.loads(pathlib.Path(args.resume).read_text())
+        if state["config"]["arm"] == "root":
+            raise SystemExit(
+                f"--resume expects an arm file; {args.resume} is a root file. "
+                f"Start an arm from it with --root {args.resume} --arm <memory|control>.")
+        if args.arm and args.arm != state["config"]["arm"]:
+            raise SystemExit(
+                f"--arm {args.arm} contradicts the resumed file's arm "
+                f"({state['config']['arm']}); drop --arm to continue it.")
+        return state, args.resume
+
+    if not args.arm:
+        raise SystemExit("--phase arm needs --arm memory|control")
+    # Deep copy so the shared root file is never mutated by either arm.
+    state = copy.deepcopy(json.loads(pathlib.Path(args.root).read_text()))
+    if state["config"]["arm"] != "root":
+        raise SystemExit(
+            f"--root expects a root file; {args.root} is a '{state['config']['arm']}' "
+            f"arm file. Continue that one with --resume instead.")
+    state["config"]["arm"] = args.arm
+    state["config"]["root_file"] = str(args.root)
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    out = args.out or (
+        f"results/json/reflexion_{args.arm}_{state['config']['split']}_{stamp}.json")
+    return state, out
+
+
+async def run_arm(args) -> None:
+    state, out = load_arm_state(args)
+    cfg = state["config"]
+    arm = cfg["arm"]
+    with_memory = arm == "memory"
+
+    # Frozen knobs come from the state, never the CLI: a resumed job must extend the
+    # curve it is continuing, not start a differently-configured one halfway through.
+    overridden = [k for k in FROZEN
+                  if getattr(args, k, None) is not None and args.explicit.get(k)
+                  and getattr(args, k) != cfg.get(k)]
+    if overridden:
+        print(f"[{arm}] ignoring CLI {', '.join(overridden)}: the run's stored values "
+              f"win (" + ", ".join(f"{k}={cfg.get(k)}" for k in overridden) + ")",
+              flush=True)
+    cfg["concurrency"] = args.concurrency
+
+    memory = ReflexionMemory.from_dict(state.get("memory", {}), cap=cfg["memory_cap"])
+    done = len(state["trials"])
+    if done >= args.trials:
+        print(f"[{arm}] {out} already has {done} trials (>= --trials {args.trials}); "
+              f"nothing to do", flush=True)
+        return
+    print(f"[{arm}] arm={arm} memory={'on' if with_memory else 'OFF (control)'} "
+          f"cap={cfg['memory_cap']} trials {done + 1}..{args.trials} "
+          f"temp={cfg['temperature']} base_seed={cfg['base_seed']}", flush=True)
+
+    for trial in range(done + 1, args.trials + 1):
+        todo = unsolved_ids(state)
+        if not todo:
+            print(f"[{arm}] every puzzle solved by trial {trial - 1}; stopping early",
+                  flush=True)
+            break
+
+        seed = trial_seed(cfg["base_seed"], trial)
+        reflection_stats = None
+        if with_memory:
+            print(f"[{arm}] trial {trial}: reflecting on {len(todo)} unsolved puzzles...",
+                  flush=True)
+            # Seeded per trial like the actor: a puzzle that repeats a trajectory and
+            # whose reflection came back empty would otherwise re-send an identical
+            # prompt at an identical seed and get the same empty reply forever.
+            reflector = Reflector(make_client(cfg, args.reflect_max_tokens, seed))
+            try:
+                reflection_stats = await reflect_pass(
+                    reflector, state, memory, todo, args.concurrency)
+            finally:
+                await reflector.client.aclose()
+            print(f"[{arm}] trial {trial}: {reflection_stats['reflections_written']} "
+                  f"reflections written "
+                  f"({reflection_stats['reflections_empty']} empty, "
+                  f"{reflection_stats['reflections_failed']} failed, "
+                  f"{reflection_stats['reflections_skipped']} skipped)", flush=True)
+
+        # The two arms differ here and nowhere else.
+        if with_memory:
+            def block_for(pid, _m=memory):
+                items = _m.read(pid)
+                return format_reflections(items) if items else ""
+        else:
+            def block_for(pid):
+                return ""
+
+        set_failure_log(cfg, arm, trial)
+        print(f"[{arm}] trial {trial}: attempting {len(todo)} puzzles at seed {seed}",
+              flush=True)
+        client = make_client(cfg, cfg["max_tokens"], seed)
+        t0 = time.time()
+        results = await run_sparc_suite_memory_pass(
+            client, todo, block_for, split=cfg["split"], concurrency=args.concurrency)
+        elapsed = time.time() - t0
+        await client.aclose()
+
+        for r in results:
+            record_attempt(state, trial, r)
+        block = trial_block(trial, seed, results, state, elapsed, reflection_stats)
+        state["trials"].append(block)
+        state["memory"] = memory.to_dict()
+        save_state(out, state)   # checkpoint: a killed job resumes from here
+
+        print(f"[{arm}] trial {trial}: solved {block['solved_this_trial']}/"
+              f"{block['attempted']} re-attempted ({block['trial_accuracy']:.3f}); "
+              f"cumulative {block['cumulative_solved']}/{len(state['puzzles'])} "
+              f"= {block['cumulative_accuracy']:.3f}  [{elapsed / 60:.0f} min]", flush=True)
+        if block["errors"]:
+            print(f"[{arm}] WARNING: {block['errors']} episodes crashed this trial",
+                  flush=True)
+
+    # Also covers the case where the loop broke immediately (everything already
+    # solved): a fresh arm must still leave its file on disk, not just claim to.
+    save_state(out, state)
+    print_curve(state, arm)
+    print(f"[{arm}] wrote {out}", flush=True)
+    if len(state["trials"]) < args.trials:
+        print(f"[{arm}] {len(state['trials'])}/{args.trials} trials done; continue with:\n"
+              f"  python scripts/run_reflexion.py --phase arm --resume {out} "
+              f"--trials {args.trials}", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# reporting
+# --------------------------------------------------------------------------- #
+def print_curve(state: dict, label: str) -> None:
+    n = len(state["puzzles"])
+    print(f"\n[{label}] trial curve over {n} puzzles", flush=True)
+    print(f"[{label}]  trial  attempted  new  cumulative   accuracy", flush=True)
+    for t in state["trials"]:
+        print(f"[{label}]  {t['trial']:>5}  {t['attempted']:>9}  {t['solved_this_trial']:>3}  "
+              f"{t['cumulative_solved']:>10}   {t['cumulative_accuracy']:>7.3f}", flush=True)
+
+
+def run_compare(args) -> None:
+    """The headline table: both arms' curves and the memory-minus-control delta."""
+    mem = json.loads(pathlib.Path(args.memory).read_text())
+    ctl = json.loads(pathlib.Path(args.control).read_text())
+    for name, st, want in (("--memory", mem, "memory"), ("--control", ctl, "control")):
+        if st["config"]["arm"] != want:
+            raise SystemExit(f"{name} points at a '{st['config']['arm']}' file, not {want}")
+
+    mc, cc = mem["config"], ctl["config"]
+    for key in ("split", "base_seed", "temperature", "max_tokens", "limit"):
+        if mc.get(key) != cc.get(key):
+            print(f"WARNING: arms disagree on {key}: {mc.get(key)} vs {cc.get(key)} "
+                  f"-- they are not comparable", flush=True)
+    if mc.get("root_file") != cc.get("root_file"):
+        print(f"WARNING: arms started from different trial-1 files "
+              f"({mc.get('root_file')} vs {cc.get('root_file')})", flush=True)
+
+    n = len(mem["puzzles"])
+    rows = []
+    lines = [
+        "=" * 74,
+        f"  REFLEXION vs CONTROL over {n} puzzles ({mc.get('split')}, "
+        f"{mc.get('model_id', mc.get('model'))})",
+        "=" * 74,
+        "",
+        "  cumulative accuracy (solved at least once by trial t)",
+        "",
+        f"  {'trial':>5}  {'seed':>5} | {'memory':>16} | {'control':>16} | {'delta':>8}",
+        f"  {'':>5}  {'':>5} | {'solved':>7} {'acc':>8} | {'solved':>7} {'acc':>8} | {'':>8}",
+        "  " + "-" * 70,
+    ]
+    for m, c in zip(mem["trials"], ctl["trials"]):
+        delta = m["cumulative_accuracy"] - c["cumulative_accuracy"]
+        rows.append((m["trial"], delta))
+        lines.append(
+            f"  {m['trial']:>5}  {m['seed']:>5} | {m['cumulative_solved']:>7} "
+            f"{m['cumulative_accuracy']:>8.3f} | {c['cumulative_solved']:>7} "
+            f"{c['cumulative_accuracy']:>8.3f} | {delta:>+8.3f}")
+
+    if len(mem["trials"]) != len(ctl["trials"]):
+        lines += ["", f"  NOTE: unequal trial counts (memory {len(mem['trials'])}, "
+                      f"control {len(ctl['trials'])}); compared over the common prefix."]
+
+    m_last, c_last = mem["trials"][len(rows) - 1], ctl["trials"][len(rows) - 1]
+    lines += [
+        "",
+        f"  After {rows[-1][0]} trials: memory {m_last['cumulative_accuracy']:.3f} vs "
+        f"control {c_last['cumulative_accuracy']:.3f}  "
+        f"(delta {rows[-1][1]:+.3f}, "
+        f"{m_last['cumulative_solved'] - c_last['cumulative_solved']:+d} puzzles)",
+        "",
+        "  Reflexion's effect is the delta column: both arms retry the same unsolved",
+        "  puzzles at the same per-trial seeds and carry solved ones forward, so each",
+        "  arm's own curve rises with the trial index whether or not memory helps.",
+        "",
+    ]
+
+    tok = lambda st, k: sum(t.get(k, 0) for t in st["trials"])
+    lines += ["  token cost", ""]
+    for name, st in (("memory", mem), ("control", ctl)):
+        actor = tok(st, "actor_prompt_tokens") + tok(st, "actor_completion_tokens")
+        refl = tok(st, "reflection_prompt_tokens") + tok(st, "reflection_completion_tokens")
+        lines.append(f"  {name:<8} actor {actor:>12,}   reflection {refl:>12,}   "
+                     f"total {actor + refl:>12,}")
+    lines.append("")
+
+    report = "\n".join(lines)
+    print(report)
+    if args.out != "-":
+        dest = pathlib.Path(args.out or "results/txt/reflexion_vs_control.txt")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(report)
+        print(f"[written] {dest}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+async def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--phase", choices=["root", "arm", "compare"], required=True)
+    ap.add_argument("--arm", choices=["memory", "control"],
+                    help="which arm to run (--phase arm)")
+    ap.add_argument("--root", default=None, help="root JSON to start an arm from")
+    ap.add_argument("--resume", default=None, help="arm JSON to continue in place")
+    ap.add_argument("--trials", type=int, default=10,
+                    help="total trials INCLUDING trial 1 (the paper runs ~10)")
     ap.add_argument("--split", default="test")
     ap.add_argument("--concurrency", type=int, default=32)
     ap.add_argument("--limit", type=int, default=0, help="0 or less = whole split")
-    ap.add_argument("--max-tokens", type=int, default=1024, help="actor budget")
-    ap.add_argument("--reflect-max-tokens", type=int, default=1024,
-                    help="self-reflection budget (pass1 only)")
-    ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--top-p", type=float, default=1.0)
-    ap.add_argument("--top-k", type=int, default=None)
-    ap.add_argument("--seed", type=int, default=0, help="decoding seed for trial-1")
-    ap.add_argument("--retry-seed", type=int, default=1,
-                    help="seed for pass2 AND control. Must differ from --seed, or "
-                         "the retry replays trial-1 instead of resampling it.")
-    ap.add_argument("--out", default=None, help="output JSON path")
+    ap.add_argument("--max-tokens", type=int, default=12288, help="actor budget")
+    ap.add_argument("--reflect-max-tokens", type=int, default=12288,
+                    help="self-reflection budget (memory arm only)")
+    # Qwen3 in thinking mode loops at temperature 0, and the control arm is only
+    # meaningful under sampling, so the thinking-mode defaults are the defaults here.
+    ap.add_argument("--temperature", type=float, default=0.6)
+    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--top-k", type=int, default=20)
+    ap.add_argument("--seed", type=int, dest="base_seed", default=0,
+                    help="seed for trial 1; trial t uses seed + t - 1")
+    ap.add_argument("--memory-cap", type=int, default=3,
+                    help="reflections kept per puzzle (the paper's Omega, 1-3)")
+    ap.add_argument("--memory", default=None, help="memory-arm JSON (--phase compare)")
+    ap.add_argument("--control", default=None, help="control-arm JSON (--phase compare)")
+    ap.add_argument("--out", default=None, help="output path")
     args = ap.parse_args()
+
+    # Which knobs the user actually typed, so a resume can tell "left at its default"
+    # from "explicitly asked for" when it reports what it is ignoring.
+    typed = {a.lstrip("-").replace("-", "_") for a in sys.argv[1:] if a.startswith("--")}
+    args.explicit = {k: k in typed or (k == "base_seed" and "seed" in typed)
+                     for k in FROZEN}
+    args.seed = args.base_seed
     args.limit = args.limit if args.limit > 0 else None
 
-    if args.phase == "pass1":
-        await run_pass1(args)
+    if args.phase == "root":
+        await run_root(args)
+    elif args.phase == "arm":
+        if not (args.root or args.resume):
+            ap.error("--phase arm needs --root <root.json> or --resume <arm.json>")
+        if args.root and args.resume:
+            ap.error("pass either --root (start) or --resume (continue), not both")
+        if args.trials < 2:
+            ap.error("--trials must be >= 2 for an arm (trial 1 is the root phase)")
+        await run_arm(args)
     else:
-        if not args.pass1:
-            ap.error(f"--phase {args.phase} requires --pass1 <reflexion_pass1_*.json>")
-        if args.retry_seed == args.seed:
-            ap.error("--retry-seed must differ from --seed: with the same prompt and "
-                     "seed vLLM reproduces trial-1's reply, so the retry measures a "
-                     "replay rather than a second attempt.")
-        await run_retry_pass(args, with_memory=args.phase == "pass2")
+        if not (args.memory and args.control):
+            ap.error("--phase compare needs --memory <file> --control <file>")
+        run_compare(args)
 
 
 if __name__ == "__main__":

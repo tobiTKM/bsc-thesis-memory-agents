@@ -85,6 +85,57 @@ class EpisodeResult:
                     for t in self.transitions)
                 + self.aborted_prompt_tokens + self.aborted_completion_tokens)
 
+    # ---- reflection context (survives a job boundary) --------------------
+    # A multi-trial Reflexion run spans more SLURM jobs than one 12h limit fits, so
+    # trial t+1's reflection is written in a *different process* than the trial-t
+    # episode it reflects on. These two methods are that handoff: exactly the fields
+    # reflexion_reflection_prompt() reads, and nothing else -- full transitions carry
+    # per-step rule_status/legal_actions that would multiply the state file's size
+    # for data no prompt looks at.
+
+    def reflection_context(self) -> dict | None:
+        """What a later process needs to reflect on this episode, or None if there
+        is nothing to reflect on.
+
+        None for crashed episodes: `errored_episode` has no trajectory and no grids,
+        so reflecting on it would ask the model to diagnose a failure that never
+        happened and produce a hint invented from nothing.
+        """
+        if self.terminal_reason == "error":
+            return None
+        return {
+            "first_obs": self.first_obs,
+            "last_obs": self.last_obs,
+            "terminal_reason": self.terminal_reason,
+            # [step, action, agent_location] per move -- what format_trajectory renders.
+            "moves": [[t.step, t.action, t.agent_location] for t in self.transitions],
+            # Only the final one is prompted with (the per-rule verdict at the end).
+            "rule_status": self.transitions[-1].rule_status if self.transitions else {},
+        }
+
+    @classmethod
+    def from_reflection_context(cls, ctx: dict, puzzle_id: str = "") -> "EpisodeResult":
+        """Rebuild the stand-in episode the reflection prompt consumes.
+
+        Deliberately a real EpisodeResult with real Transitions rather than a new
+        type: prompts.py then needs no notion of "replayed" episodes and the reflection
+        text is identical whether it is written in-process or after a resume.
+        """
+        moves = ctx.get("moves", [])
+        rule_status = ctx.get("rule_status", {})
+        transitions = [
+            Transition(step=step, action=action, reward=0.0, legal_actions=[],
+                       # only the last move's verdict was kept; it is all that is read
+                       rule_status=rule_status if i == len(moves) - 1 else {},
+                       agent_location=location)
+            for i, (step, action, location) in enumerate(moves)
+        ]
+        return cls(
+            puzzle_id=puzzle_id, success=False, terminated=False, truncated=False,
+            difficulty=-1, transitions=transitions,
+            first_obs=ctx.get("first_obs", ""), last_obs=ctx.get("last_obs", ""),
+            terminal_reason=ctx.get("terminal_reason", ""))
+
 
 def make_json_safe(obj, seen=None):
     """Convert numpy/dataset objects into plain JSON-serialisable values.

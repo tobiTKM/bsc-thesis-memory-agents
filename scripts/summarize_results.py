@@ -140,16 +140,118 @@ def block(episodes: list, indent: str) -> list:
     return out
 
 
+def episodes_from_state(state: dict) -> list:
+    """Flatten a multi-trial run to one record per puzzle: its final outcome.
+
+    A puzzle attempted over several trials still has one outcome for the run --
+    solved or not -- so the per-puzzle stats stay comparable with a single-pass
+    baseline. The representative attempt is the winning one where there is one and
+    the last one otherwise (that is what "how did this puzzle end" means), while
+    tokens are summed over *every* attempt, because all of them were paid for.
+    """
+    out = []
+    for pid, e in sorted(state.get("puzzles", {}).items()):
+        attempts = e.get("attempts") or []
+        if not attempts:
+            continue
+        shown = next((a for a in attempts if a.get("success")), attempts[-1])
+        out.append({
+            "puzzle_id": pid,
+            "difficulty": e.get("difficulty", -1),
+            "success": e.get("solved", False),
+            "terminated": shown.get("terminated"),
+            "truncated": shown.get("truncated"),
+            "terminal_reason": shown.get("terminal_reason"),
+            "steps": shown.get("steps", 0),
+            "prompt_tokens": sum(a.get("prompt_tokens", 0) for a in attempts),
+            "completion_tokens": sum(a.get("completion_tokens", 0) for a in attempts),
+            "retry_tokens": sum(a.get("retry_tokens", 0) for a in attempts),
+            "attempts": len(attempts),
+            "solved_at_trial": e.get("solved_at_trial"),
+        })
+    return out
+
+
+def summary_from_state(state: dict) -> dict:
+    """Rebuild the settings block render() prints, from a multi-trial state file."""
+    cfg = state.get("config", {})
+    trials = state.get("trials", [])
+    return {
+        "model": cfg.get("model", "?"),
+        "model_id": cfg.get("model_id"),
+        "split": cfg.get("split"),
+        "max_tokens": cfg.get("max_tokens"),
+        "temperature": cfg.get("temperature"),
+        "top_p": cfg.get("top_p"),
+        "top_k": cfg.get("top_k"),
+        "seed": cfg.get("base_seed"),
+        "concurrency": cfg.get("concurrency"),
+        "arm": cfg.get("arm"),
+        "memory_cap": cfg.get("memory_cap"),
+        "elapsed_sec": sum(t.get("elapsed_sec", 0) for t in trials),
+        "errors": sum(t.get("errors", 0) for t in trials),
+    }
+
+
+def trial_curve(state: dict) -> list:
+    """The per-trial table: what each trial re-attempted, won and cost."""
+    trials = state.get("trials", [])
+    if not trials:
+        return []
+    cfg = state.get("config", {})
+    n = len(state.get("puzzles", {}))
+    out = [
+        f"TRIAL CURVE  (arm: {cfg.get('arm', '?')}, "
+        f"memory window: {cfg.get('memory_cap', '?')} reflections/puzzle)",
+        f"  {'trial':>5} {'seed':>5} {'attempted':>10} {'new':>5} {'solved':>7} "
+        f"{'acc':>8} {'refl':>6} {'minutes':>8}",
+    ]
+    for t in trials:
+        out.append(
+            f"  {t.get('trial', 0):>5} {t.get('seed', 0):>5} "
+            f"{t.get('attempted', 0):>10} {t.get('solved_this_trial', 0):>5} "
+            f"{t.get('cumulative_solved', 0):>7} "
+            f"{t.get('cumulative_accuracy', 0):>8.3f} "
+            f"{t.get('reflections_written', 0):>6} "
+            f"{t.get('elapsed_sec', 0) / 60:>8.0f}")
+    # Only unsolved puzzles are re-attempted and solved ones are carried forward, so
+    # this curve cannot fall. Saying so here stops the shape being read as evidence.
+    out += [
+        "",
+        f"  cumulative accuracy over {n} puzzles; it can only rise with the trial",
+        "  index (solved puzzles are carried forward), so it is NOT evidence on its",
+        "  own -- compare it against the control arm at the same trial:",
+        "    python scripts/run_reflexion.py --phase compare --memory <f> --control <f>",
+    ]
+    actor = sum(t.get("actor_prompt_tokens", 0) + t.get("actor_completion_tokens", 0)
+                for t in trials)
+    refl = sum(t.get("reflection_prompt_tokens", 0)
+               + t.get("reflection_completion_tokens", 0) for t in trials)
+    out += ["",
+            f"  tokens: actor {actor:,} + reflection {refl:,} = {actor + refl:,}"]
+    return out
+
+
 def analyse(path: pathlib.Path) -> dict:
     data = json.loads(path.read_text())
-    episodes = data.get("episodes", [])
+    # Two on-disk shapes: single-pass runs ({summary, episodes}) and multi-trial
+    # Reflexion state files ({config, trials, puzzles, memory}).
+    if "trials" in data and "puzzles" in data:
+        episodes = episodes_from_state(data)
+        summary = summary_from_state(data)
+        state = data
+    else:
+        episodes = data.get("episodes", [])
+        summary = data.get("summary", {})
+        state = None
     by_diff = collections.defaultdict(list)
     for ep in episodes:
         by_diff[ep.get("difficulty", -1)].append(ep)
     return {
         "path": path,
-        "summary": data.get("summary", {}),
+        "summary": summary,
         "episodes": episodes,
+        "state": state,
         "by_diff": dict(sorted(by_diff.items())),
     }
 
@@ -181,10 +283,18 @@ def render(a: dict, top: int) -> str:
     setting("top_k:", "top_k")
     setting("seed:", "seed")
     setting("concurrency:", "concurrency")
+    if s.get("arm"):
+        w(f"  {'arm:':<20} {s['arm']}"
+          + ("   [Reflexion: reflections injected]" if s["arm"] == "memory"
+             else "   [CONTROL: same trials, no memory]"))
     if s.get("elapsed_sec"):
         w(f"  {'runtime:':<20} {hms(s['elapsed_sec'])}")
         w(f"  {'per puzzle:':<20} {s['elapsed_sec'] / max(n, 1):.1f} s"
           f"   (wall clock / puzzles, so it is divided by concurrency)")
+
+    if a.get("state"):
+        w("")
+        out.extend(trial_curve(a["state"]))
 
     w("")
     w("FULL RUN")
