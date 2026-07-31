@@ -5,6 +5,7 @@ reflections keyed by puzzle id here; MemoryBank / MemP will plug in the same way
 """
 
 from .base import Memory
+from .memp import Distiller, MempMemory
 from .reflexion import Reflector, ReflexionMemory
 
-__all__ = ["Memory", "Reflector", "ReflexionMemory"]
+__all__ = ["Memory", "Distiller", "MempMemory", "Reflector", "ReflexionMemory"]

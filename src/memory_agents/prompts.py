@@ -105,6 +105,136 @@ def format_reflections(reflections) -> str:
     )
 
 
+# One few-shot script anchoring the distillation format, in the same role
+# _REFLECTION_EXAMPLES plays for reflections: a *procedure* for a class of
+# puzzles (rule-combination scoped, no coordinates), not a solution to one.
+_PROCEDURE_EXAMPLE = """Applies to: squares of two colors + dots
+1. Before moving, group the squares by color and decide which side of the grid each color's region will occupy; the path must become the wall between them.
+2. Sketch a rough wall separating the color groups, then bend it to collect every dot cell, since dots must be on the path itself.
+3. Prefer routes along the grid edge early; interior detours burn nodes you may need later, and revisiting is impossible.
+4. Before committing near the end node, verify each enclosed region holds squares of only one color; if not, backtrack the plan, not the path."""
+
+
+def memp_distill_trajectory_prompt(episode, key_text: str) -> str:
+    """Memp's Build step for a puzzle the agent itself solved.
+
+    The paper distills successful trajectories into "script-like abstractions":
+    reusable procedural knowledge for the *class* of task, not a replay of one
+    instance. So the prompt shows the solved episode (start grid, ordered moves,
+    final grid) but asks for a strategy scoped to the puzzle's rule combination,
+    and explicitly bans coordinates and move output -- a memory that says "go to
+    (4,2)" is useless on every other puzzle, and the concrete exemplar is
+    attached separately in code (see format_exemplar).
+    """
+    return f"""
+    You are an expert puzzle-solving agent building a procedural memory: reusable,
+    high-level strategies distilled from puzzles you have already solved.
+
+    You successfully solved the path-finding puzzle below. Distill the strategy your
+    solution embodies into ONE reusable procedure for solving puzzles with this
+    combination of rules. Start with a line "Applies to: <the rule combination>",
+    then give 3-6 numbered strategy steps, including pitfalls to avoid. The
+    procedure must transfer to OTHER puzzles with similar rules: never mention
+    absolute coordinates, this grid's size, or specific moves. At most 120 words.
+    Do not output a move or restate the generic game rules.
+
+    Here is an example of a good procedure:
+{_PROCEDURE_EXAMPLE}
+
+    Puzzle description:
+    {key_text}
+
+    Starting grid:
+    {episode.first_obs}
+
+    The moves of your successful solution, in order (0=right, 1=up, 2=left, 3=down):
+{format_trajectory(episode)}
+
+    Final grid, showing the full solution path you drew (V=visited, L=end):
+    {episode.last_obs}
+
+    Procedure:"""
+
+
+def memp_distill_gold_prompt(key_text: str, text_visualization: str,
+                             gold_actions: list) -> str:
+    """Memp's Build step for a train puzzle the agent failed: hindsight distillation.
+
+    SPaRC ships gold solution paths, so a failed build episode still yields a
+    procedure -- from the known-correct path instead of the agent's own (absent)
+    success. Deliberately reads dataset fields only (key text, text_visualization,
+    the gold path converted to actions in code): no dependency on the failed
+    trajectory means crashed episodes distill exactly like failed ones, and the
+    resulting memory describes how to solve the puzzle class, not how the agent
+    once got lost in it. Same output contract as the trajectory variant so the
+    bank is homogeneous regardless of provenance.
+    """
+    actions = " ".join(str(a) for a in gold_actions)
+    return f"""
+    You are an expert puzzle-solving agent building a procedural memory: reusable,
+    high-level strategies distilled from solved puzzles.
+
+    Below is a path-finding puzzle together with a known-correct solution path.
+    Study why this path satisfies the puzzle's rules, then distill that into ONE
+    reusable procedure for solving puzzles with this combination of rules. Start
+    with a line "Applies to: <the rule combination>", then give 3-6 numbered
+    strategy steps, including pitfalls to avoid. The procedure must transfer to
+    OTHER puzzles with similar rules: never mention absolute coordinates, this
+    grid's size, or specific moves. At most 120 words. Do not output a move or
+    restate the generic game rules.
+
+    Here is an example of a good procedure:
+{_PROCEDURE_EXAMPLE}
+
+    Puzzle description:
+    {key_text}
+
+    Puzzle layout (structured form):
+    {text_visualization}
+
+    A known-correct solution, as moves from the start node (0=right, 1=up, 2=left,
+    3=down): {actions}
+
+    Procedure:"""
+
+
+def format_exemplar(exemplar: dict) -> str:
+    """Render a bank entry's concrete solved example as one compact line pair.
+
+    Built from the exemplar dict the Distiller assembles in code (actions either
+    from the agent's winning Transitions or from the gold path) -- the LLM never
+    writes this part, so it cannot hallucinate a move sequence.
+    """
+    actions = " ".join(str(a) for a in exemplar.get("actions", []))
+    start = tuple(exemplar.get("start", ()))
+    end = tuple(exemplar.get("end", ()))
+    return (f"Example ({exemplar.get('width')}x{exemplar.get('height')} grid, "
+            f"start {start} -> end {end}, {exemplar.get('n_moves')} moves: {actions}; "
+            f"0=right,1=up,2=left,3=down)\n"
+            f"  its grid had: {exemplar.get('grid_summary', '?')}")
+
+
+def format_procedures(entries) -> str:
+    """The block injected into the actor's system prompt at Memp eval time.
+
+    Same seam as format_reflections: MemoryAgent.reset appends this AFTER the full
+    system prompt, so the shared KV prefix (see sparc_system_prompt) survives.
+    Similarity scores are logged in the results but deliberately never rendered
+    here -- the retrieved and random arms must inject byte-identical *formats* so
+    they differ only in which entries were retrieved.
+    """
+    parts = [
+        "\n\nProcedural memory: strategies distilled from previously solved puzzles "
+        "whose rule combinations resemble this one. They come from OTHER puzzles: "
+        "adapt the strategy to this grid, and never copy an example's move sequence "
+        "verbatim."
+    ]
+    for i, entry in enumerate(entries, 1):
+        parts.append(f"\nProcedure {i}:\n{entry['script'].strip()}\n"
+                     f"{format_exemplar(entry['exemplar'])}")
+    return "\n".join(parts)
+
+
 def sparc_system_prompt(polyshapes) -> str:
     """The actor's system prompt, ported verbatim from Spatial-Gym's llm_testing host.
 

@@ -232,11 +232,63 @@ def trial_curve(state: dict) -> list:
     return out
 
 
+def episodes_from_memp_state(state: dict) -> list:
+    """Flatten a memp build/eval state to one record per puzzle.
+
+    The records are already in run_baseline's shape; only the build pass's
+    episode_context (the compact trajectory kept for the distill phase) is
+    dropped, since no stat reads it and it dwarfs everything else.
+    """
+    return [{k: v for k, v in rec.items() if k != "episode_context"}
+            for _pid, rec in sorted(state.get("puzzles", {}).items())]
+
+
+def summary_from_memp_state(state: dict) -> dict:
+    """The settings block for a memp state file: the run's own summary (present
+    once the pass completed) plus the frozen config knobs render() prints."""
+    cfg = state.get("config", {})
+    s = dict(state.get("summary") or {})
+    s.update({
+        "model": cfg.get("model", "?"),
+        "model_id": cfg.get("model_id"),
+        "split": cfg.get("split"),
+        "max_tokens": cfg.get("max_tokens"),
+        "temperature": cfg.get("temperature"),
+        "top_p": cfg.get("top_p"),
+        "top_k": cfg.get("top_k"),
+        "seed": cfg.get("seed"),
+        "concurrency": cfg.get("concurrency"),
+        "arm": cfg.get("arm"),
+        "method": "memp",
+        "phase": cfg.get("phase"),
+        "top_k_memories": cfg.get("top_k_memories"),
+        "bank": cfg.get("bank"),
+        "embed_model": cfg.get("embed_model"),
+        "bank_entries": cfg.get("bank_entries"),
+    })
+    if "errors" not in s:   # pass still running; the summary is written at the end
+        s["errors"] = sum(1 for p in state.get("puzzles", {}).values()
+                          if p.get("terminal_reason") == "error")
+    return s
+
+
 def analyse(path: pathlib.Path) -> dict:
     data = json.loads(path.read_text())
-    # Two on-disk shapes: single-pass runs ({summary, episodes}) and multi-trial
-    # Reflexion state files ({config, trials, puzzles, memory}).
-    if "trials" in data and "puzzles" in data:
+    # Three on-disk shapes: single-pass runs ({summary, episodes}), multi-trial
+    # Reflexion state files ({config, trials, puzzles, memory}) and memp state
+    # files ({config: {schema: memp-*}, puzzles}). A memp *bank* is none of these
+    # -- it holds procedures, not episodes -- so name it rather than render junk.
+    schema = data.get("config", {}).get("schema", "")
+    if data.get("schema") == "memp-bank-v1" or "entries" in data:
+        stats = data.get("stats", {})
+        raise ValueError(
+            f"a memp bank ({len(data.get('entries', []))} entries, "
+            f"stats={stats}), not a run; nothing to summarize")
+    if schema.startswith("memp"):
+        episodes = episodes_from_memp_state(data)
+        summary = summary_from_memp_state(data)
+        state = None
+    elif "trials" in data and "puzzles" in data:
         episodes = episodes_from_state(data)
         summary = summary_from_state(data)
         state = data
@@ -284,9 +336,24 @@ def render(a: dict, top: int) -> str:
     setting("seed:", "seed")
     setting("concurrency:", "concurrency")
     if s.get("arm"):
-        w(f"  {'arm:':<20} {s['arm']}"
-          + ("   [Reflexion: reflections injected]" if s["arm"] == "memory"
-             else "   [CONTROL: same trials, no memory]"))
+        note = {"memory": "   [Reflexion: reflections injected]",
+                "control": "   [CONTROL: same trials, no memory]",
+                "retrieved": "   [Memp: cosine top-k procedures injected]",
+                "random": "   [Memp ABLATION: random procedures injected]"}
+        w(f"  {'arm:':<20} {s['arm']}{note.get(s['arm'], '')}")
+    if s.get("method") == "memp":
+        if s.get("phase") == "build":
+            w(f"  {'phase:':<20} build   [memoryless pass over train; feeds distill]")
+        else:
+            w(f"  {'top-k memories:':<20} {s.get('top_k_memories', '?')}")
+            w(f"  {'bank:':<20} {s.get('bank', '?')}"
+              + (f"   ({s['bank_entries']} entries)" if s.get("bank_entries") else ""))
+            w(f"  {'embed model:':<20} {s.get('embed_model') or '(not recorded)'}")
+            if s.get("mean_top1_similarity") is not None:
+                w(f"  {'top-1 similarity:':<20} mean {s['mean_top1_similarity']}")
+            if s.get("injected_provenance"):
+                w(f"  {'injected entries:':<20} {s['injected_provenance']}"
+                  f"   [agent = distilled from own success, gold = from gold path]")
     if s.get("elapsed_sec"):
         w(f"  {'runtime:':<20} {hms(s['elapsed_sec'])}")
         w(f"  {'per puzzle:':<20} {s['elapsed_sec'] / max(n, 1):.1f} s"
@@ -376,7 +443,7 @@ def main() -> int:
             continue
         try:
             runs.append(analyse(path))
-        except (json.JSONDecodeError, KeyError) as exc:
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
             print(f"skipping {path}: {exc}", file=sys.stderr)
     if not runs:
         return 1
