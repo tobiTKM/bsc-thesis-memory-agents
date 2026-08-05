@@ -52,7 +52,12 @@ echo "[$(date +%T)] job $SLURM_JOB_ID on $(hostname -s)"
 
 # ---- knobs ------------------------------------------------------------------
 MODEL="${MODEL:-Qwen/Qwen3-32B}"
-SERVED_NAME="${SERVED_NAME:-qwen}"        # what the client asks for; keeps result files stable
+# The alias the client asks for (vLLM --served-model-name). Derived from MODEL so it
+# describes what is actually being served: it used to be a flat "qwen" for every
+# checkpoint, which was harmless while everything WAS a Qwen, but once gpt-oss and
+# Qwen3-32B ran side by side the results read "served as qwen" for all of them.
+# Results still record the full checkpoint separately as model_id.
+SERVED_NAME="${SERVED_NAME:-$(basename "$MODEL")}"
 TP="${TP:-${SLURM_GPUS_ON_NODE:-2}}"      # tensor-parallel size = GPUs requested
 GPU_UTIL="${GPU_UTIL:-0.90}"
 MAXLEN="${MAXLEN:-32768}"                 # Qwen3 native ctx; must exceed prompt + MAX_TOKENS

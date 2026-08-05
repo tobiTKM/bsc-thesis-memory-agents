@@ -1,6 +1,6 @@
 from ..agents.base import BaselineAgent
 from ..agents.memory_agent import MemoryAgent
-from ..envs.base import EpisodeResult, Transition
+from ..envs.base import EpisodeResult, Transition, make_json_safe
 from ..envs.sparc import SparcEnv, format_obs, is_success
 from ..prompts import sparc_system_prompt
 
@@ -90,9 +90,15 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
             step=len(transitions),
             action=action,
             reward=reward,
-            legal_actions=list(info.get("legal_actions", [])),
-            rule_status=info.get("rule_status", {}),
-            agent_location=info.get("agent_location"),
+            # Convert numpy -> plain python at the boundary where env data enters.
+            # The env hands back ndarrays and numpy bools; leaving them raw made a
+            # trajectory unserialisable (it killed a 2 h trial in json.dumps) and made
+            # the reflection prompt render `[0 2]` in-process but `[0, 2]` after a
+            # resume -- the same reflection formatted two ways depending on whether
+            # the job happened to restart.
+            legal_actions=make_json_safe(list(info.get("legal_actions", []))),
+            rule_status=make_json_safe(info.get("rule_status", {})),
+            agent_location=make_json_safe(info.get("agent_location")),
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
             retry_prompt_tokens=response.retry_prompt_tokens,

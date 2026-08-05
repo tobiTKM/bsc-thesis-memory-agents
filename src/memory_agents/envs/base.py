@@ -103,14 +103,25 @@ class EpisodeResult:
         """
         if self.terminal_reason == "error":
             return None
+        # make_json_safe is not optional here: agent_location arrives from the env as a
+        # numpy ndarray and rule_status can hold numpy bools, neither of which
+        # json.dumps will encode. Nothing serialised a trajectory before this method
+        # existed, so the raw types had never had to survive a round trip.
+        # Converted per value rather than once over the whole dict, because
+        # make_json_safe's cycle guard returns None for any object it has already
+        # seen -- and if the env hands back the same location array each step (it owns
+        # the buffer, we only read it), one shared traversal would blank every move
+        # after the first.
         return {
             "first_obs": self.first_obs,
             "last_obs": self.last_obs,
             "terminal_reason": self.terminal_reason,
             # [step, action, agent_location] per move -- what format_trajectory renders.
-            "moves": [[t.step, t.action, t.agent_location] for t in self.transitions],
+            "moves": [[t.step, t.action, make_json_safe(t.agent_location)]
+                      for t in self.transitions],
             # Only the final one is prompted with (the per-rule verdict at the end).
-            "rule_status": self.transitions[-1].rule_status if self.transitions else {},
+            "rule_status": make_json_safe(
+                self.transitions[-1].rule_status if self.transitions else {}),
         }
 
     @classmethod

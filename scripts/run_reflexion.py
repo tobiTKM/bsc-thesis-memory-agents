@@ -39,11 +39,17 @@ control arm, run for the same number of trials over the same puzzles at the same
 per-trial seeds, is what turns it into a claim about memory.
 """
 
+# Annotations must stay lazy: several signatures below name types from the optional
+# model stack (LLMClient, ...), and an eagerly-evaluated annotation would raise
+# NameError at import time on the login node, where that stack is deliberately absent.
+from __future__ import annotations
+
 import argparse
 import asyncio
 import collections
 import copy
 import json
+import math
 import os
 import pathlib
 import sys
@@ -52,15 +58,24 @@ from datetime import datetime
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from memory_agents.config import resolve_server
-from memory_agents.envs.base import EpisodeResult
-from memory_agents.harness.run import (
-    run_sparc_suite_baseline,
-    run_sparc_suite_memory_pass,
-)
-from memory_agents.llm.client import LLMClient
-from memory_agents.memory import Reflector, ReflexionMemory
-from memory_agents.prompts import format_reflections
+# Only `root` and `arm` need the model stack; `compare` is pure JSON arithmetic and is
+# meant to run on the LOGIN node, which has neither numpy nor a working project venv
+# (the venv is built for the compute nodes and dies with an illegal instruction here).
+# Importing these eagerly made --phase compare unusable in the one place it was
+# designed for, so the failure is deferred to the phases that actually need them.
+try:
+    from memory_agents.config import resolve_server
+    from memory_agents.envs.base import EpisodeResult
+    from memory_agents.harness.run import (
+        run_sparc_suite_baseline,
+        run_sparc_suite_memory_pass,
+    )
+    from memory_agents.llm.client import LLMClient
+    from memory_agents.memory import Reflector, ReflexionMemory
+    from memory_agents.prompts import format_reflections
+    MODEL_STACK_ERROR = None
+except ImportError as exc:      # noqa: BLE001 - re-raised per phase in main()
+    MODEL_STACK_ERROR = exc
 
 SCHEMA = "reflexion-multitrial-v1"
 
@@ -85,7 +100,17 @@ def save_state(path, state) -> None:
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    try:
+        blob = json.dumps(state, indent=2)
+    except TypeError as exc:
+        # A value the env produced is not JSON-encodable (this cost a 2 h trial once,
+        # to a numpy ndarray). Losing hours of GPU to an encoder error is far worse
+        # than a lossily-encoded field, so degrade instead of raising -- but say so
+        # loudly, because it means something upstream needs make_json_safe.
+        print(f"[save_state] WARNING: {exc}; falling back to str() for unencodable "
+              f"values. The run is preserved but some field is degraded.", flush=True)
+        blob = json.dumps(state, indent=2, default=str)
+    tmp.write_text(blob)
     os.replace(tmp, path)
 
 
@@ -451,6 +476,40 @@ def print_curve(state: dict, label: str) -> None:
               f"{t['cumulative_solved']:>10}   {t['cumulative_accuracy']:>7.3f}", flush=True)
 
 
+def mcnemar(memory_state: dict, control_state: dict) -> dict:
+    """Paired significance test on the final per-puzzle outcomes.
+
+    McNemar rather than a two-sample proportion test, because the arms are *paired*:
+    both attempt the same puzzles from the same trial 1, so the puzzles solved by
+    neither (the large majority here) carry no information about which arm is better.
+    Only the discordant pairs do -- solved by memory but not control, and vice versa.
+    Exact two-sided binomial rather than the chi-square approximation, since the
+    discordant count is small enough for the approximation to be unreliable.
+    """
+    ids = sorted(set(memory_state["puzzles"]) & set(control_state["puzzles"]))
+    both = mem_only = ctl_only = neither = 0
+    for pid in ids:
+        m = memory_state["puzzles"][pid]["solved"]
+        c = control_state["puzzles"][pid]["solved"]
+        if m and c:
+            both += 1
+        elif m:
+            mem_only += 1
+        elif c:
+            ctl_only += 1
+        else:
+            neither += 1
+
+    n = mem_only + ctl_only
+    if n:
+        tail = sum(math.comb(n, k) for k in range(min(mem_only, ctl_only) + 1))
+        p = min(1.0, 2 * tail / (2 ** n))
+    else:
+        p = 1.0
+    return {"n_puzzles": len(ids), "both": both, "memory_only": mem_only,
+            "control_only": ctl_only, "neither": neither, "discordant": n, "p_value": p}
+
+
 def run_compare(args) -> None:
     """The headline table: both arms' curves and the memory-minus-control delta."""
     mem = json.loads(pathlib.Path(args.memory).read_text())
@@ -508,6 +567,24 @@ def run_compare(args) -> None:
         "",
     ]
 
+    mc = mcnemar(mem, ctl)
+    verdict = ("SIGNIFICANT at p<0.05" if mc["p_value"] < 0.05
+               else "NOT significant at p<0.05")
+    lines += [
+        "  paired significance (McNemar, exact two-sided)",
+        "",
+        f"  {'solved by both':<22} {mc['both']:>5}",
+        f"  {'memory only':<22} {mc['memory_only']:>5}   <- discordant",
+        f"  {'control only':<22} {mc['control_only']:>5}   <- discordant",
+        f"  {'solved by neither':<22} {mc['neither']:>5}",
+        "",
+        f"  discordant pairs: {mc['discordant']}     p = {mc['p_value']:.4f}     {verdict}",
+        "",
+        "  Only the discordant pairs carry information: the puzzles both arms solved,",
+        "  and the far larger set neither solved, say nothing about which arm is better.",
+        "",
+    ]
+
     tok = lambda st, k: sum(t.get(k, 0) for t in st["trials"])
     lines += ["  token cost", ""]
     for name, st in (("memory", mem), ("control", ctl)):
@@ -520,7 +597,12 @@ def run_compare(args) -> None:
     report = "\n".join(lines)
     print(report)
     if args.out != "-":
-        dest = pathlib.Path(args.out or "results/txt/reflexion_vs_control.txt")
+        # Name the report after the arm it came from. A fixed default would have each
+        # model's comparison silently overwrite the last one's, and the three runs
+        # differ only by model -- the fastest way to lose a finished 20 h result.
+        default = pathlib.Path("results/txt") / (
+            pathlib.Path(args.memory).stem.replace("memory", "vs_control") + ".txt")
+        dest = pathlib.Path(args.out) if args.out else default
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(report)
         print(f"[written] {dest}", file=sys.stderr)
@@ -564,6 +646,11 @@ async def main() -> None:
                      for k in FROZEN}
     args.seed = args.base_seed
     args.limit = args.limit if args.limit > 0 else None
+
+    if args.phase in ("root", "arm") and MODEL_STACK_ERROR is not None:
+        ap.error(f"--phase {args.phase} needs the model stack, which failed to import "
+                 f"({MODEL_STACK_ERROR}). Run it from a compute node with the project "
+                 f"venv; only --phase compare works on the login node.")
 
     if args.phase == "root":
         await run_root(args)

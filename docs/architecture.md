@@ -225,6 +225,17 @@ accuracy, so trials do not get much cheaper. Use `--limit` for a smaller study.
   = "error"`) and surfaces an `errors` count, instead of taking a multi-hour run down.
   A crashed episode has no trajectory, so it is **excluded from reflection** (there is no
   failure to diagnose) but still re-attempted on the next trial — a crash is not an attempt.
+- **Everything that reaches disk must be plain Python.** Spatial-Gym returns numpy types
+  (`agent_location` is an `ndarray`, `rule_status` holds numpy bools) and `json.dumps`
+  encodes none of them. `harness/run.py` runs env values through `make_json_safe` when it
+  builds each `Transition`, so the conversion happens once, at the boundary. This is not a
+  theoretical concern: it cost a completed 2 h trial, which died in `save_state` *after*
+  the GPU work was done. Two follow-on rules any new method inherits — call
+  `make_json_safe` **per value**, never once over a whole structure (its cycle guard
+  returns `None` for any object seen twice, so a reused env buffer would blank every entry
+  after the first); and note `save_state` degrades to `default=str` with a loud warning
+  rather than raising, because losing hours of compute to an encoder error is worse than
+  one lossily-written field.
 - **Honest token cost:** `retry_*` / `aborted_*` tokens (spent on replies that yielded no
   move) are tracked and reported via `retry_tokens()`, so a method that provokes more
   format-failures cannot look artificially cheap. Reflection-generation tokens are counted

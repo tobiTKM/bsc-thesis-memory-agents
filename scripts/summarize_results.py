@@ -274,8 +274,17 @@ def render(a: dict, top: int) -> str:
 
     w("")
     w("RUN")
+    # `model` is only vLLM's --served-model-name alias, which used to default to
+    # "qwen" for every checkpoint. Printing it next to the real model read as though
+    # gpt-oss had been served as a Qwen, so it is no longer shown: the checkpoint is
+    # the only thing a reader of this report needs. Runs old enough to predate
+    # model_id have nothing but the alias, so those say so instead of passing it off
+    # as the model.
     served, exact = s.get("model", "?"), s.get("model_id")
-    w(f"  {'model:':<20} {exact or served}" + (f'   (served as "{served}")' if exact else ""))
+    if exact:
+        w(f"  {'model:':<20} {exact}")
+    else:
+        w(f"  {'model:':<20} {served}   (API alias; real checkpoint not recorded)")
     setting("split:", "split")
     setting("max_tokens:", "max_tokens")
     setting("temperature:", "temperature")
