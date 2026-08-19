@@ -34,6 +34,7 @@ is a different server than the chat model (vLLM serves one model per process):
 
 import argparse
 import asyncio
+import collections
 import json
 import math
 import os
@@ -71,7 +72,8 @@ FROZEN = {
     "distill": ("build", "distill_max_tokens", "temperature", "top_p", "top_k",
                 "seed"),
     "eval": ("bank", "embeddings", "arm", "top_k_memories", "split", "limit",
-             "temperature", "top_p", "top_k", "max_tokens", "seed"),
+             "temperature", "top_p", "top_k", "max_tokens", "seed",
+             "granularity", "provenance", "update", "groups"),
 }
 
 
@@ -417,6 +419,144 @@ def verify_gold_paths(df, n: int) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# phase upgrade: add round-by-round trajectories to an existing bank (no GPU)
+# --------------------------------------------------------------------------- #
+def run_upgrade(args) -> None:
+    """Attach the paper's `Trajectory` granularity to every entry of a bank.
+
+    Replays each entry's own exemplar action sequence through a real env and
+    stores the resulting round-by-round trace. Uniform across provenance: an
+    agent entry replays the moves the model actually made, a gold entry replays
+    the dataset's solution path. Doing it for the whole bank (rather than only
+    the handful of agent successes) keeps granularity from being confounded with
+    bank size when the arms are compared.
+
+    Pure env replay -- no model, no GPU. Runs on the login node in a minute.
+    """
+    from memory_agents.envs.sparc import SparcEnv, replay_path
+
+    src = pathlib.Path(args.bank)
+    data = json.loads(src.read_text())
+    memory = MempMemory.from_dict(data)
+    out = pathlib.Path(args.out or src.with_name(src.stem + "_traj.json"))
+
+    env = SparcEnv(split="train")
+    upgraded = failed = solved = 0
+    try:
+        for e in memory.entries:
+            actions = (e.get("exemplar") or {}).get("actions") or []
+            if not actions:
+                failed += 1
+                continue
+            try:
+                traj = replay_path(env, e["source_pid"], actions)
+            except Exception as exc:            # a bad exemplar must not kill the run
+                print(f"[upgrade] {e['id']} ({e['source_pid']}): {exc!r}", flush=True)
+                failed += 1
+                continue
+            e["trajectory"] = traj
+            upgraded += 1
+            solved += traj["terminal_reason"] == "solved"
+    finally:
+        env.close()
+
+    save_state(out, {**memory.to_dict(), "config": data.get("config", {})})
+    print(f"[upgrade] {upgraded}/{len(memory)} entries now carry a trajectory "
+          f"({solved} of those replays reached a solved state, {failed} failed)",
+          flush=True)
+    # A replay that does not end solved means the stored exemplar is not a winning
+    # line -- worth knowing, since that entry now shows the agent a losing trace.
+    if upgraded and solved < upgraded:
+        print(f"[upgrade] NOTE: {upgraded - solved} replays did not end solved; "
+              f"those entries' exemplars were not winning paths", flush=True)
+    print(f"[upgrade] wrote {out}", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# phase keywords: AveFact key construction (LLM), then embed-keywords (embeddings)
+# --------------------------------------------------------------------------- #
+async def run_keywords(args) -> None:
+    """Extract per-puzzle keywords for the AveFact retriever (one LLM call each)."""
+    cfg = {"temperature": args.temperature, "top_p": args.top_p,
+           "top_k": args.top_k}
+    distiller = Distiller(make_client(cfg, args.distill_max_tokens, args.seed))
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    out = pathlib.Path(args.out or f"results/json/memp_keywords_{stamp}.json")
+    result = {"model_id": os.environ.get("LLM_MODEL_ID") or distiller.client.model,
+              "key_fn": KEY_FN, "keywords": {}}
+    if out.exists():                      # resume: keyword extraction is 1000 calls
+        result = json.loads(out.read_text())
+    sem = asyncio.Semaphore(args.concurrency)
+
+    async def one(pid, key_text):
+        async with sem:
+            return pid, *(await distiller.keywords(key_text))
+
+    try:
+        for split in ("train", "test"):
+            df = load_dataset("lkaesberg/SPaRC", "all", split=split).to_pandas()
+            n = min(args.limit, len(df)) if args.limit else len(df)
+            todo = [(str(df["id"][i]), puzzle_key_text(df.iloc[i]))
+                    for i in range(n) if str(df["id"][i]) not in result["keywords"]]
+            for lo in range(0, len(todo), args.chunk):
+                outcomes = await asyncio.gather(
+                    *(one(p, t) for p, t in todo[lo:lo + args.chunk]),
+                    return_exceptions=True)
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException):
+                        print(f"[keywords] failed: {outcome!r}", flush=True)
+                        continue
+                    pid, kws, _resp = outcome
+                    if kws:
+                        result["keywords"][pid] = kws
+                save_state(out, result)
+                print(f"[keywords] {len(result['keywords'])} puzzles done",
+                      flush=True)
+    finally:
+        await distiller.client.aclose()
+    empty = sum(1 for v in result["keywords"].values() if not v)
+    print(f"[keywords] wrote {out} ({len(result['keywords'])} puzzles, "
+          f"{empty} empty)", flush=True)
+
+
+async def run_embed_keywords(args) -> None:
+    """Embed the extracted keywords -- the vectors AveFact scores against."""
+    base_url, model = resolve_server()
+    client = EmbeddingClient(base_url=base_url, model=model)
+    data = json.loads(pathlib.Path(args.keywords).read_text())
+    kws = data["keywords"]
+    pids = sorted(kws)
+    flat = [(pid, kw) for pid in pids for kw in kws[pid]]
+    print(f"[embed-kw] {len(flat)} keywords over {len(pids)} puzzles", flush=True)
+
+    vecs: list[list[float]] = []
+    try:
+        for lo in range(0, len(flat), args.batch):
+            vecs.extend(await client.embed([kw for _p, kw in flat[lo:lo + args.batch]]))
+    finally:
+        await client.aclose()
+    mat = np.asarray(vecs, dtype=np.float32)
+    mat /= np.linalg.norm(mat, axis=1, keepdims=True)
+
+    out = pathlib.Path(args.out or
+                       pathlib.Path(args.keywords).with_suffix(".npz"))
+    tmp = out.with_name(out.name + ".tmp.npz")
+    np.savez(tmp, kw_pids=np.asarray([p for p, _k in flat]), kw_vecs=mat)
+    os.replace(tmp, out)
+    print(f"[embed-kw] wrote {out}  ({mat.shape[0]} x {mat.shape[1]})", flush=True)
+
+
+def load_keywords(path):
+    """(keyword vectors per puzzle id) -- used for both queries and bank entries."""
+    npz = np.load(str(pathlib.Path(path).with_suffix(".npz")))
+    by_pid: dict[str, list] = {}
+    for pid, vec in zip(npz["kw_pids"], npz["kw_vecs"]):
+        by_pid.setdefault(str(pid), []).append(vec)
+    grouped = {pid: np.asarray(v, dtype=np.float32) for pid, v in by_pid.items()}
+    return grouped, grouped
+
+
+# --------------------------------------------------------------------------- #
 # phase embed: puzzle_key_text for both splits -> vectors on disk
 # --------------------------------------------------------------------------- #
 async def run_embed(args) -> None:
@@ -492,13 +632,17 @@ def load_embeddings(path) -> tuple[dict, dict]:
     return {k: npz[k] for k in npz.files}, meta
 
 
-def build_blocks(memory, arrays, arm, k, seed, test_ids):
-    """Precompute the injected block + retrieval log for every test puzzle.
+def build_blocks(memory, arrays, cfg, test_ids, keyword_queries=None):
+    """Precompute the injected block + retrieval log for a set of test puzzles.
 
-    Done up front, before any episode runs: the bank is frozen, so retrieval is
-    a pure function of (bank, embeddings, arm, k, seed) -- precomputing makes
-    block_for a dict lookup (trivially safe under concurrency) and means a
-    resumed job injects byte-identical blocks."""
+    With a frozen bank, retrieval is a pure function of (bank, embeddings, arm, k,
+    seed), so precomputing makes block_for a dict lookup (trivially safe under
+    concurrency) and means a resumed job injects byte-identical blocks. The Update
+    policies mutate the bank between groups, so they call this again per group --
+    hence `test_ids` is a parameter rather than the whole split.
+    """
+    arm, k, seed = cfg["arm"], cfg["top_k_memories"], cfg["seed"]
+    granularity = cfg.get("granularity", "script")
     qrow = {str(pid): i for i, pid in enumerate(arrays["test_ids"])}
     blocks, retrieved_log = {}, {}
     for pid in test_ids:
@@ -507,15 +651,123 @@ def build_blocks(memory, arrays, arm, k, seed, test_ids):
                 raise SystemExit(f"test puzzle {pid} has no query embedding; "
                                  f"re-run the embed phase without a limit")
             picks = memory.retrieve(arrays["test_vecs"][qrow[pid]], k)
+        elif arm == "avefact":
+            kws = (keyword_queries or {}).get(pid)
+            # `not kws` would raise: these are numpy arrays, not lists.
+            if kws is None or len(kws) == 0:
+                raise SystemExit(f"test puzzle {pid} has no keyword vectors; "
+                                 f"re-run --phase keywords")
+            picks = memory.avefact_retrieve(kws, k)
+        elif arm == "fixed":
+            picks = memory.fixed_retrieve(k)
         else:
             picks = memory.random_retrieve(k, seed_key=f"{seed}:{pid}")
-        blocks[pid] = format_procedures([entry for entry, _sim in picks])
+        blocks[pid] = format_procedures([entry for entry, _sim in picks],
+                                        granularity=granularity)
         retrieved_log[pid] = [
             {"id": entry["id"], "source_pid": entry["source_pid"],
              "provenance": entry["provenance"],
              "similarity": None if sim is None else round(float(sim), 4)}
             for entry, sim in picks]
     return blocks, retrieved_log
+
+
+# --------------------------------------------------------------------------- #
+# the Update stage (the paper's section 4.3): the bank evolves across the test
+# split, refreshed after every group of tasks.
+# --------------------------------------------------------------------------- #
+async def update_pass(policy, memory, arrays, group_results, retrieved_log,
+                      df_test, row_of, cfg, args, seed) -> dict:
+    """Fold one finished group of test episodes back into the bank.
+
+      vanilla     every trajectory in the group becomes a new memory
+      validation  only the successful ones do; failures are discarded
+      adjustment  each failure revises the memory that was retrieved for it
+
+    Returns counters for the run record. New entries carry the *test* puzzle's own
+    embedding (already in the sidecar), so retrieval for later groups sees them.
+    """
+    stats = collections.Counter()
+    qrow = {str(pid): i for i, pid in enumerate(arrays["test_ids"])}
+    sem = asyncio.Semaphore(args.concurrency)
+    distiller = Distiller(make_client(cfg, cfg["distill_max_tokens"], seed))
+
+    async def one(r):
+        pid = str(r.puzzle_id)
+        ctx = r.reflection_context()
+        if ctx is None:                      # crashed: nothing to learn from
+            return ("skipped", pid, None, None)
+        episode = EpisodeResult.from_reflection_context(ctx, pid)
+        row = df_test.iloc[row_of[pid]]
+        key_text = puzzle_key_text(row)
+        if policy == "adjustment":
+            if r.success:
+                return ("skipped", pid, None, None)   # only failures trigger a fix
+            picks = retrieved_log.get(pid) or []
+            if not picks:
+                return ("skipped", pid, None, None)
+            async with sem:
+                text, resp = await distiller.revise(
+                    _script_of(memory, picks[0]["id"]), episode, key_text)
+            return ("revise", pid, (picks[0]["id"], text), resp)
+        # vanilla / validation both distil the trajectory into a NEW memory
+        async with sem:
+            text, resp = await distiller.distill_from_trajectory(
+                episode, key_text, succeeded=bool(r.success))
+        return ("add", pid, (text, row, ctx), resp)
+
+    targets = [r for r in group_results
+               if policy != "validation" or r.success]
+    stats["considered"] = len(targets)
+    outcomes = await asyncio.gather(*(one(r) for r in targets),
+                                    return_exceptions=True)
+    try:
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                stats["failed"] += 1
+                print(f"[update] call failed: {outcome!r}", flush=True)
+                continue
+            kind, pid, payload, resp = outcome
+            if resp is not None:
+                stats["prompt_tokens"] += resp.prompt_tokens
+                stats["completion_tokens"] += resp.completion_tokens
+            if kind == "skipped":
+                stats["skipped"] += 1
+            elif kind == "revise":
+                entry_id, text = payload
+                if text:
+                    memory.revise(entry_id, text)
+                    stats["revised"] += 1
+                else:
+                    stats["empty"] += 1
+            else:
+                text, row, ctx = payload
+                if not text:
+                    stats["empty"] += 1
+                    continue
+                # The agent's OWN moves, never the dataset's gold path: an online
+                # entry is built from a test puzzle, and a gold exemplar would put
+                # that puzzle's official solution into the context of every later
+                # test puzzle that retrieves it.
+                memory.add_with_vector(pid, {
+                    "provenance": "online",
+                    "difficulty": int(row["difficulty_level"]),
+                    "key_text": puzzle_key_text(row),
+                    "script": text,
+                    "exemplar": agent_exemplar(row, ctx),
+                    "origin": f"update:{policy}",
+                }, arrays["test_vecs"][qrow[pid]])
+                stats["added"] += 1
+    finally:
+        await distiller.client.aclose()
+    return dict(stats)
+
+
+def _script_of(memory, entry_id: str) -> str:
+    for e in memory.entries:
+        if e["id"] == entry_id:
+            return e["script"]
+    raise KeyError(entry_id)
 
 
 async def run_eval(args) -> None:
@@ -537,6 +789,10 @@ async def run_eval(args) -> None:
             "limit": args.limit or 0, "temperature": args.temperature,
             "top_p": args.top_p, "top_k": args.top_k,
             "max_tokens": args.max_tokens, "seed": args.seed,
+            "granularity": args.granularity, "provenance": args.provenance,
+            "update": args.update, "groups": args.groups,
+            "keywords": str(args.keywords) if args.keywords else None,
+            "distill_max_tokens": args.distill_max_tokens,
         }
         state = {"config": cfg, "puzzles": {}}
         stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
@@ -544,42 +800,83 @@ async def run_eval(args) -> None:
                            f"{cfg['split']}_{stamp}.json")
     cfg["concurrency"] = args.concurrency
 
-    memory = MempMemory.from_dict(json.loads(pathlib.Path(cfg["bank"]).read_text()))
+    # An Update run rewrites its bank as it goes, so a resumed job must continue
+    # from the memory the finished groups produced, not from the on-disk seed bank.
+    bank_src = state.get("bank") or json.loads(pathlib.Path(cfg["bank"]).read_text())
+    memory = MempMemory.from_dict(bank_src)
     arrays, meta = load_embeddings(cfg["embeddings"])
     memory.embed_model = cfg["embed_model"] = meta.get("embed_model", "")
+    if not state.get("bank"):     # filtering already applied before it was saved
+        memory = memory.filtered(cfg.get("provenance", "all"))
+    if not len(memory):
+        raise SystemExit(f"provenance={cfg.get('provenance')} leaves the bank empty")
+    # Pool both splits: a resumed Update run holds entries sourced from *test*
+    # puzzles (added online), which are absent from the train arrays alone. For a
+    # frozen run nothing changes -- no entry has a test source_pid.
+    memory.attach_vectors(
+        np.concatenate([arrays["train_ids"], arrays["test_ids"]]),
+        np.concatenate([arrays["train_vecs"], arrays["test_vecs"]]))
     cfg["bank_entries"] = len(memory)
-    memory.attach_vectors(arrays["train_ids"], arrays["train_vecs"])
+    cfg["bank_model"] = json.loads(
+        pathlib.Path(cfg["bank"]).read_text()).get("config", {}).get("model_id")
+
+    if cfg.get("granularity", "script") != "script":
+        missing = sum(1 for e in memory.entries if not e.get("trajectory"))
+        if missing:
+            raise SystemExit(
+                f"granularity={cfg['granularity']} needs stored trajectories but "
+                f"{missing}/{len(memory)} entries lack one; run --phase upgrade "
+                f"on {cfg['bank']} first")
+
+    keyword_queries = None
+    if cfg["arm"] == "avefact":
+        keyword_queries, entry_kw = load_keywords(cfg["keywords"])
+        memory.attach_keyword_vectors(entry_kw)
 
     test_ids = split_ids(cfg["split"], cfg["limit"])
-    blocks, retrieved_log = build_blocks(
-        memory, arrays, cfg["arm"], cfg["top_k_memories"], cfg["seed"], test_ids)
+    state.setdefault("updates", [])
 
-    # One fully rendered block in the log for eyeballing, plus a budget guard:
-    # entries are word-capped at distill time, but a prompt that quietly grew past
-    # ~2k tokens (chars/4) would eat into the actor's thinking budget.
+    def blocks_for(ids):
+        return build_blocks(memory, arrays, cfg, ids, keyword_queries)
+
+    # A frozen bank can precompute every block once. The Update policies rewrite
+    # the bank between groups, so those recompute per group instead.
+    online = cfg.get("update", "none") != "none"
+    blocks, retrieved_log = blocks_for(test_ids)
+
     longest = max(blocks.values(), key=len)
     print(f"[eval] sample injected block (for {test_ids[0]}):"
           f"{blocks[test_ids[0]]}\n", flush=True)
-    if len(longest) / 4 > 2000:
+    if len(longest) / 4 > 6000:
         print(f"[eval] WARNING: largest block ~{len(longest) // 4} tokens; "
-              f"consider a smaller --top-k-memories", flush=True)
+              f"check it still fits under MAXLEN with --max-tokens "
+              f"{cfg['max_tokens']}", flush=True)
 
     todo = [pid for pid in test_ids if pid not in state["puzzles"]]
     if not todo:
         print(f"[eval] {out} already covers every puzzle; nothing to do", flush=True)
         finalize_eval(state, out)
         return
-    print(f"[eval] arm={cfg['arm']} k={cfg['top_k_memories']} bank={len(memory)} "
-          f"entries; attempting {len(todo)} {cfg['split']} puzzles at "
-          f"seed {cfg['seed']}", flush=True)
+    print(f"[eval] arm={cfg['arm']} k={cfg['top_k_memories']} "
+          f"granularity={cfg.get('granularity')} provenance={cfg.get('provenance')} "
+          f"update={cfg.get('update')} bank={len(memory)} entries; attempting "
+          f"{len(todo)} {cfg['split']} puzzles at seed {cfg['seed']}", flush=True)
+
+    # The Update stage processes the split in groups (the paper refreshes memory
+    # "after every t test-set tasks"); a frozen run just uses the chunk size.
+    group_size = max(1, math.ceil(len(test_ids) / cfg["groups"])) if online \
+        else args.chunk
+
+    df_test = load_dataset("lkaesberg/SPaRC", "all", split=cfg["split"]).to_pandas()
+    row_of = {str(df_test["id"][i]): i for i in range(len(df_test))}
 
     set_failure_log(f"eval_{cfg['arm']}")
     client = make_client(cfg, cfg["max_tokens"], cfg["seed"])
     cfg["model"] = client.model
     cfg["model_id"] = os.environ.get("LLM_MODEL_ID") or client.model
     try:
-        for lo in range(0, len(todo), args.chunk):
-            chunk = todo[lo:lo + args.chunk]
+        for lo in range(0, len(todo), group_size):
+            chunk = todo[lo:lo + group_size]
             t0 = time.time()
             results = await run_sparc_suite_memory_pass(
                 client, chunk, lambda pid: blocks[pid],
@@ -589,11 +886,36 @@ async def run_eval(args) -> None:
                 rec.pop("episode_context", None)   # eval keeps no trajectories
                 rec["retrieved"] = retrieved_log[str(r.puzzle_id)]
                 state["puzzles"][str(r.puzzle_id)] = rec
-            save_state(out, state)
             solved = sum(1 for p in state["puzzles"].values() if p["success"])
             print(f"[eval] {len(state['puzzles'])}/{len(test_ids)} done, "
-                  f"{solved} solved  [{(time.time() - t0) / 60:.0f} min/chunk]",
+                  f"{solved} solved  [{(time.time() - t0) / 60:.0f} min/group]",
                   flush=True)
+
+            if online:
+                group_solved = sum(1 for r in results if r.success)
+                stats = await update_pass(
+                    cfg["update"], memory, arrays, results, retrieved_log,
+                    df_test, row_of, cfg, args, cfg["seed"])
+                stats.update({"group": len(state["updates"]) + 1,
+                              "attempted": len(results),
+                              "solved_this_group": group_solved,
+                              "bank_after": len(memory),
+                              "cumulative_solved": solved})
+                state["updates"].append(stats)
+                # Rewrite the bank alongside the episodes so a resume continues
+                # with the memory the finished groups actually produced.
+                state["bank"] = memory.to_dict()
+                print(f"[update] group {stats['group']}: +{stats.get('added', 0)} "
+                      f"added, {stats.get('revised', 0)} revised, "
+                      f"{stats.get('empty', 0)} empty -> bank {len(memory)}",
+                      flush=True)
+                remaining = [p for p in todo[lo + group_size:]]
+                if remaining:
+                    blocks, retrieved_log = blocks_for(remaining)
+                    # keep the finished groups' logs for the record
+                    for pid, rec in state["puzzles"].items():
+                        retrieved_log.setdefault(pid, rec.get("retrieved", []))
+            save_state(out, state)
     finally:
         await client.aclose()
 
@@ -614,6 +936,23 @@ def finalize_eval(state: dict, out) -> None:
         for item in rec.get("retrieved", []):
             prov[item["provenance"]] = prov.get(item["provenance"], 0) + 1
     summary["injected_provenance"] = prov
+    cfg = state.get("config", {})
+    for key in ("granularity", "provenance", "update", "top_k_memories",
+                "bank_entries", "bank_model"):
+        if cfg.get(key) is not None:
+            summary[key] = cfg[key]
+    if state.get("updates"):
+        ups = state["updates"]
+        summary["update_groups"] = len(ups)
+        summary["entries_added"] = sum(u.get("added", 0) for u in ups)
+        summary["entries_revised"] = sum(u.get("revised", 0) for u in ups)
+        summary["update_tokens"] = sum(
+            u.get("prompt_tokens", 0) + u.get("completion_tokens", 0) for u in ups)
+        # The paper's Figure 3 reads as a per-group curve, so keep it renderable.
+        summary["group_curve"] = [
+            {"group": u.get("group"), "solved": u.get("solved_this_group"),
+             "attempted": u.get("attempted"), "bank_after": u.get("bank_after")}
+            for u in ups]
     state["summary"] = summary
     save_state(out, state)
     print(f"[eval] {summary['success']}/{summary['n']} solved "
@@ -651,11 +990,39 @@ def eval_outcomes(path) -> tuple[dict, dict]:
 
 
 def baseline_outcomes(path) -> tuple[dict, dict]:
+    """Wins + a {summary, episodes}-shaped view of the baseline run.
+
+    Accepts either a run_baseline output or a reflexion ROOT state file: the
+    root IS the memoryless baseline over the split (trial 1 at the base seed),
+    so the one root job per model serves as both Reflexion's shared trial 1 and
+    Memp's baseline -- no separate baseline pass needed.
+    """
     data = json.loads(pathlib.Path(path).read_text())
-    if "episodes" not in data:
-        raise SystemExit(f"{path} does not look like a run_baseline output "
-                         f"(no 'episodes')")
-    return ({str(e["puzzle_id"]): e["success"] for e in data["episodes"]}, data)
+    if "episodes" in data:
+        return ({str(e["puzzle_id"]): e["success"] for e in data["episodes"]}, data)
+    cfg = data.get("config", {})
+    if cfg.get("arm") == "root" and "puzzles" in data:
+        episodes = []
+        for pid, e in sorted(data["puzzles"].items()):
+            a = (e.get("attempts") or [{}])[0]   # a root holds exactly one attempt
+            episodes.append({
+                "puzzle_id": pid, "success": e.get("solved", False),
+                "difficulty": e.get("difficulty", -1),
+                "steps": a.get("steps", 0),
+                "terminated": a.get("terminated"), "truncated": a.get("truncated"),
+                "terminal_reason": a.get("terminal_reason"),
+                "prompt_tokens": a.get("prompt_tokens", 0),
+                "completion_tokens": a.get("completion_tokens", 0),
+                "retry_tokens": a.get("retry_tokens", 0),
+                "error": a.get("error")})
+        summary = {"split": cfg.get("split"), "seed": cfg.get("base_seed"),
+                   "temperature": cfg.get("temperature"),
+                   "max_tokens": cfg.get("max_tokens"),
+                   "model": cfg.get("model"), "model_id": cfg.get("model_id")}
+        return ({e["puzzle_id"]: e["success"] for e in episodes},
+                {"summary": summary, "episodes": episodes})
+    raise SystemExit(f"{path} is neither a run_baseline output (no 'episodes') "
+                     f"nor a reflexion root state file")
 
 
 def compare_row(label: str, records: list[dict]) -> str:
@@ -755,7 +1122,8 @@ async def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--phase", required=True,
-                    choices=["build", "distill", "embed", "eval", "compare"])
+                    choices=["build", "distill", "embed", "eval", "compare",
+                             "upgrade", "keywords", "embed-keywords"])
     ap.add_argument("--split", default="test",
                     help="build refuses anything but train; eval defaults to test")
     ap.add_argument("--concurrency", type=int, default=32)
@@ -774,8 +1142,25 @@ async def main() -> None:
                     help="decoding seed; keep equal to the baseline's for eval")
     ap.add_argument("--top-k-memories", type=int, default=3,
                     help="memories injected per test puzzle (eval)")
-    ap.add_argument("--arm", choices=["retrieved", "random"],
-                    help="eval: cosine top-k, or the random-retrieval ablation")
+    ap.add_argument("--arm", choices=["retrieved", "random", "avefact", "fixed"],
+                    help="eval retrieval policy: cosine top-k (the paper's "
+                         "Key=Query), the random-sample ablation, AveFact "
+                         "keyword matching, or a fixed block for every puzzle")
+    ap.add_argument("--granularity", default="script",
+                    choices=["script", "trajectory", "proceduralization"],
+                    help="eval: the paper's Build-policy conditions (Table 1). "
+                         "Anything but 'script' needs a bank run through --phase upgrade")
+    ap.add_argument("--provenance", default="all", choices=["all", "agent", "gold"],
+                    help="eval: restrict the bank. 'agent' is the paper-faithful "
+                         "successes-only build source")
+    ap.add_argument("--update", default="none",
+                    choices=["none", "vanilla", "validation", "adjustment"],
+                    help="eval: the paper's online Update policies (section 4.3). "
+                         "'none' keeps the bank frozen")
+    ap.add_argument("--groups", type=int, default=5,
+                    help="eval: test-set groups between memory refreshes (update arms)")
+    ap.add_argument("--keywords", default=None,
+                    help="memp_keywords_*.json for --arm avefact / --phase embed-keywords")
     ap.add_argument("--build", default=None, help="build JSON (distill phase)")
     ap.add_argument("--bank", default=None, help="bank JSON (eval phase)")
     ap.add_argument("--embeddings", default=None, help="embeddings .npz (eval)")
@@ -803,7 +1188,19 @@ async def main() -> None:
         await run_distill(args)
     elif args.phase == "embed":
         await run_embed(args)
+    elif args.phase == "upgrade":
+        if not args.bank:
+            ap.error("--phase upgrade needs --bank <memp_bank_*.json>")
+        run_upgrade(args)
+    elif args.phase == "keywords":
+        await run_keywords(args)
+    elif args.phase == "embed-keywords":
+        if not args.keywords:
+            ap.error("--phase embed-keywords needs --keywords <memp_keywords_*.json>")
+        await run_embed_keywords(args)
     elif args.phase == "eval":
+        if args.arm == "avefact" and not (args.keywords or args.resume):
+            ap.error("--arm avefact needs --keywords <memp_keywords_*.json>")
         await run_eval(args)
     else:
         if not (args.baseline and args.retrieved):

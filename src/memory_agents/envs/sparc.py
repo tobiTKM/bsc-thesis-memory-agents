@@ -186,6 +186,33 @@ def puzzle_key_text(record) -> str:
     return "\n".join(lines)
 
 
+def replay_path(env, puzzle_id, actions) -> dict:
+    """Replay an action sequence and capture it in `reflection_context` shape.
+
+    Lets a gold-path entry carry the same round-by-round trace an agent-solved
+    entry gets from its own episode, so the Trajectory / Proceduralization arms
+    can run over the whole bank instead of only the handful of puzzles the model
+    happened to solve. Without this, granularity would be confounded with bank
+    size (500 entries vs 71). Pure env replay -- no model call.
+    """
+    obs, info = env.reset(puzzle_id=puzzle_id)
+    first_obs = format_obs(obs)
+    moves, last_obs = [], first_obs
+    for step, action in enumerate(actions):
+        obs, _reward, terminated, truncated, info = env.step(action)
+        last_obs = format_obs(obs)
+        moves.append([step, int(action), info.get("agent_location")])
+        if terminated or truncated:
+            break
+    return {
+        "first_obs": first_obs,
+        "last_obs": last_obs,
+        "terminal_reason": "solved" if is_success(info) else "replayed",
+        "moves": make_json_safe(moves),
+        "rule_status": make_json_safe(info.get("rule_status", {})),
+    }
+
+
 def grid_summary(record) -> str:
     """A one-line census of a puzzle's rule cells, for the exemplar in a memory.
 

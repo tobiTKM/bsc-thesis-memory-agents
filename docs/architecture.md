@@ -249,7 +249,7 @@ and both arms share that one run. That is what keeps the comparison config-match
 
 ---
 
-## 5. Cross-task memory: MemP (implemented) & MemoryBank (coming next)
+## 5. Cross-task memory: MemP (implemented) & MemoryBank (declarative, still to build)
 
 Reflexion is **per-task** (reflect on a puzzle, retry that same puzzle). MemoryBank and MemP
 are **cross-task**: build a memory on the **train** split, freeze it, and apply it to unseen
@@ -315,15 +315,66 @@ config-on-resume discipline as Reflexion; distill checkpoints the bank as it gro
 retries empty replies once at `seed+1`. The bank's distillation token cost lands in its
 `stats` block and `--phase compare` reports it as MemP's amortized construction cost.
 
-### 5.2 MemoryBank (still to build)
+### 5.2 MemoryBank (Zhong et al., 2024 — declarative memory, still to build)
 
-| | MemoryBank | MemP (above) |
+The thesis proposal (`Research_Proposal_Bachelor_first_draft.pdf`) labels MemoryBank the
+**declarative** arm and defines it operationally as *"a declarative agent that retrieves
+similar solved cases via dense embedding search"* — nothing about the paper's Ebbinghaus
+forgetting curve appears in the Methodology or Objectives sections, only in the Introduction
+as a one-line characterization of the original paper. That mechanism is dropped here: it
+would need a *repeat-recall* event to mean anything (the paper's `S` only grows when a memory
+piece is retrieved again in a later conversation turn), and a parallel, memoryless train build
+— the same build MemP already runs — never re-queries earlier entries, so nothing would ever
+reinforce. The source paper itself never ablates the mechanism quantitatively either (Table 2
+has no forgetting on/off comparison), so faithfully porting it would be effort spent on a part
+of the paper that isn't load-bearing even there. **MemoryBank here = case memory: cross-task,
+built on train, frozen, retrieved by embedding similarity — no decay, no reinforcement.**
+
+| | MemoryBank (declarative) | MemP (procedural, 5.1) |
 |---|---|---|
-| Memory type | episodic — "what happened on similar puzzles" | procedural — "how to solve this class of puzzle" |
-| Built from | per-puzzle experience (success strategy / failure note) + embedding | procedures distilled from train trajectories / gold paths |
-| Retrieval | embedding similarity of the puzzle signature | embedding similarity of `puzzle_key_text` |
-| Update | Ebbinghaus forgetting curve (strength decays, recall reinforces); rank by similarity × strength | frozen at test |
+| Memory type | episodic **case** — "here's a similar puzzle I've seen before, and what worked" | procedural **script** — "how to solve this class of puzzle" |
+| Content | a short, concrete case note tied to one instance; never phrased as a rule or numbered strategy | an abstracted "Applies to: \<rule class\>" script with numbered general steps, coordinates/moves explicitly banned from the prose |
+| Built from | the *same* `memp_build_train_*.json` — solved → own trajectory, failed/crashed → gold path (hindsight) | solved → own trajectory, failed/crashed → gold path (hindsight) |
+| Retrieval | embedding similarity of `puzzle_key_text` (same key-fn, same `.npz`) | embedding similarity of `puzzle_key_text` |
+| Update at test | frozen (no decay) | frozen |
 
-MemoryBank can reuse MemP's entire skeleton — the phases, the embeddings `.npz`, the
-retrieval store, the eval/compare drivers — and differ only in what the build/distill step
-writes and how retrieval ranks (similarity × strength instead of similarity alone).
+This is a deliberate methodological choice, not laziness: sub-question 2 of the proposal asks
+*which memory type is most effective, and do different types help different aspects of
+performance* — that comparison is only meaningful if the two cross-task methods differ in
+**content type** (concrete case vs. abstracted procedure) and nothing else. So MemoryBank
+reuses MemP's entire retrieval skeleton verbatim — `Memory` ABC, `MempMemory`'s
+`attach_vectors`/`retrieve`/`random_retrieve`/tie-break, the embed phase, `build_blocks`,
+`run_sparc_suite_memory_pass`, McNemar `compare` — and can even reuse MemP's `build` output and
+embeddings `.npz` outright, since both key on the identical `puzzle_key_text`/`puzzle-key-v1`.
+The only new work is a `distill`-equivalent step that writes case notes instead of scripts, a
+new bank schema tag (`memorybank-bank-v1`), and a differently-worded injected block — everything
+that determines *what the actor reads*, nothing that determines *how it's retrieved*.
+
+```mermaid
+flowchart LR
+  BM["memp_build_train_*.json<br/>(reused, not re-run)"] --> D["distill (case notes)<br/>solved → own trajectory<br/>failed → gold path (hindsight)<br/>memorybank_bank_*.json"]
+  EM["memp_embeddings_*.npz<br/>(reused, not re-run)"] --> EV["eval (test; ARM=retrieved | random)<br/>cosine top-k → inject → solve once<br/>memorybank_eval_*_test_*.json"]
+  D --> EV
+  EV --> C["compare (no GPU)<br/>baseline vs retrieved vs random"]
+```
+
+Resolved design decisions:
+
+| Decision | Choice |
+|---|---|
+| Build source | **reuses `memp_build_train_*.json` directly** — the memoryless train attempts are method-agnostic content, so there is no reason to re-run ~8 h of GPU time for a second cross-task method. |
+| Unit of memory | one entry per train puzzle: a **case note** — 2–3 sentences, LLM-written, instructed to *recount this specific instance* (its shapes, its path) and explicitly forbidden from generalizing into advice, rules, or a numbered procedure — plus the same code-assembled **exemplar** (concrete action sequence + grid census) MemP already builds, so a case is never hallucinated. |
+| Distill prompt shape | contrasts directly with MemP's: *"You are recalling a specific past experience, not writing a strategy guide. Recount what this puzzle looked like and how you solved it, concretely, in 2–3 sentences. Do not phrase this as a rule, a numbered procedure, or advice for other puzzles — you are remembering one instance, not instructing."* No "Applies to:" line, no few-shot procedural example. |
+| Injected block wording | own framing sentence, deliberately un-procedural: *"Declarative memory: specific past cases similar to this puzzle, from puzzles you solved before. Use them only as loose analogies for the kind of layout and rule combination involved — not as instructions to follow."* Appended after the system prompt exactly like MemP's `format_procedures` (prefix-cache invariant), just a sibling render function (`format_cases`) over a different entry shape. |
+| Embedding | **reuses `memp_embeddings_*.npz` and its `.meta.json` outright** — same key-fn, so `attach_vectors` needs no changes and the embed phase never re-runs. |
+| top-k | 3, matching MemP, so the retrieved-vs-random and cross-method comparisons are apples-to-apples. |
+| Update at test | frozen — see above. |
+
+`MemoryBankMemory` can be close to a straight sibling of `MempMemory`: identical
+`attach_vectors`/`retrieve`/`random_retrieve`/`fixed_retrieve` (cosine top-k over the shared
+`.npz`, same id tie-break for reproducibility), identical `filtered(provenance)`; the only
+schema difference is `entries[i]["case_note"]` in place of `entries[i]["script"]`, and a new
+`SCHEMA = "memorybank-bank-v1"`. A thin `CaseDistiller` (parallel to `Distiller`) supplies
+`distill_from_trajectory` / `distill_from_gold`, reusing `gold_exemplar`/`agent_exemplar` from
+`run_memp.py` unchanged. `run_memorybank.py` mirrors `run_memp.py`'s phases minus `embed`
+(borrowed from MemP): `distill → eval → compare`.

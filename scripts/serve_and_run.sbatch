@@ -119,9 +119,15 @@ SEED="${SEED:-0}"
 
 # ---- Memp knobs (DRIVER=memp; ignored otherwise) ----------------------------
 BUILD="${BUILD:-}"                        # PHASE=distill: the memp_build_*.json to distill from
-BANK="${BANK:-}"                          # PHASE=eval: the memp_bank_*.json to retrieve from
+BANK="${BANK:-}"                          # PHASE=eval/upgrade: the memp_bank_*.json
 EMBEDDINGS="${EMBEDDINGS:-}"              # PHASE=eval: the memp_embeddings_*.npz key/query vectors
-TOP_K_MEMORIES="${TOP_K_MEMORIES:-3}"     # memories injected per test puzzle
+TOP_K_MEMORIES="${TOP_K_MEMORIES:-3}"     # memories injected per test puzzle (paper's optimum ~10)
+# Paper-replication knobs (all default to the original frozen-bank behaviour).
+GRANULARITY="${GRANULARITY:-script}"      # script | trajectory | proceduralization  (Table 1)
+PROVENANCE="${PROVENANCE:-all}"           # all | agent | gold -- 'agent' = successes-only build
+UPDATE="${UPDATE:-none}"                  # none | vanilla | validation | adjustment (section 4.3)
+GROUPS="${GROUPS:-5}"                     # test-set groups between memory refreshes
+KEYWORDS="${KEYWORDS:-}"                  # memp_keywords_*.json for ARM=avefact
 CHUNK="${CHUNK:-100}"                     # puzzles per checkpoint (build/eval) / calls per checkpoint (distill)
 DISTILL_MAX_TOKENS="${DISTILL_MAX_TOKENS:-$MAX_TOKENS}"   # distillation budget
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-Embedding-0.6B}"   # served by PHASE=embed (cached in the group hub)
@@ -137,7 +143,7 @@ EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 # cannot run against a pooling server (the driver does its own embed smoke instead).
 # `--runner pooling` is verified against vllm-25.1.sif (vLLM 0.25.1: EngineArgs has
 # `runner`, not the older `task`); an older image would need EXTRA_VLLM_ARGS="--task embed".
-if [[ "$DRIVER" == "memp" && "$PHASE" == "embed" ]]; then
+if [[ "$DRIVER" == "memp" && ( "$PHASE" == "embed" || "$PHASE" == "embed-keywords" ) ]]; then
     MODEL="$EMBED_MODEL"
     REASONING_PARSER=""
     SMOKE=0
@@ -441,6 +447,19 @@ case "$DRIVER" in
         echo "[$(date +%T)] memp embed: all train keys + test queries via $MODEL"
         python -u scripts/run_memp.py --phase embed ${OUT:+--out "$OUT"}
         ;;
+      keywords)
+        # AveFact key construction: one short LLM call per puzzle, resumable.
+        echo "[$(date +%T)] memp keywords: extracting AveFact keys"
+        python -u scripts/run_memp.py --phase keywords "${COMMON_ARGS[@]}" \
+            --limit "$LIMIT" --chunk "$CHUNK" \
+            --distill-max-tokens "$DISTILL_MAX_TOKENS" ${OUT:+--out "$OUT"}
+        ;;
+      embed-keywords)
+        [[ -n "$KEYWORDS" ]] || { echo "PHASE=embed-keywords needs KEYWORDS=<memp_keywords_*.json>" >&2; exit 1; }
+        echo "[$(date +%T)] memp embed-keywords: $KEYWORDS via $MODEL"
+        python -u scripts/run_memp.py --phase embed-keywords --keywords "$KEYWORDS" \
+            ${OUT:+--out "$OUT"}
+        ;;
       eval)
         if [[ -n "$RESUME" ]]; then
             echo "[$(date +%T)] memp eval: resuming $RESUME"
@@ -449,11 +468,15 @@ case "$DRIVER" in
         else
             [[ -n "$BANK" && -n "$EMBEDDINGS" ]] || { echo "PHASE=eval needs BANK=<memp_bank_*.json> and EMBEDDINGS=<memp_embeddings_*.npz>" >&2; exit 1; }
             [[ -n "$ARM" ]] || { echo "PHASE=eval needs ARM=retrieved or ARM=random" >&2; exit 1; }
-            echo "[$(date +%T)] memp eval: arm=$ARM k=$TOP_K_MEMORIES limit=$LIMIT"
+            echo "[$(date +%T)] memp eval: arm=$ARM k=$TOP_K_MEMORIES limit=$LIMIT " \
+                 "granularity=$GRANULARITY provenance=$PROVENANCE update=$UPDATE"
             python -u scripts/run_memp.py --phase eval "${COMMON_ARGS[@]}" \
                 --limit "$LIMIT" --chunk "$CHUNK" --arm "$ARM" --bank "$BANK" \
                 --embeddings "$EMBEDDINGS" --top-k-memories "$TOP_K_MEMORIES" \
-                ${OUT:+--out "$OUT"}
+                --granularity "$GRANULARITY" --provenance "$PROVENANCE" \
+                --update "$UPDATE" --groups "$GROUPS" \
+                --distill-max-tokens "$DISTILL_MAX_TOKENS" \
+                ${KEYWORDS:+--keywords "$KEYWORDS"} ${OUT:+--out "$OUT"}
         fi
         ;;
       *)

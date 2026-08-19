@@ -115,8 +115,13 @@ _PROCEDURE_EXAMPLE = """Applies to: squares of two colors + dots
 4. Before committing near the end node, verify each enclosed region holds squares of only one color; if not, backtrack the plan, not the path."""
 
 
-def memp_distill_trajectory_prompt(episode, key_text: str) -> str:
-    """Memp's Build step for a puzzle the agent itself solved.
+def memp_distill_trajectory_prompt(episode, key_text: str,
+                                   succeeded: bool = True) -> str:
+    """Memp's Build step for a puzzle the agent itself ran.
+
+    `succeeded=False` is used only by the Vanilla update policy, which the paper
+    defines as consolidating *all* trajectories from a group -- failures included.
+    Every other caller distils a success.
 
     The paper distills successful trajectories into "script-like abstractions":
     reusable procedural knowledge for the *class* of task, not a replay of one
@@ -126,12 +131,17 @@ def memp_distill_trajectory_prompt(episode, key_text: str) -> str:
     (4,2)" is useless on every other puzzle, and the concrete exemplar is
     attached separately in code (see format_exemplar).
     """
+    opening = (
+        "You successfully solved the path-finding puzzle below. Distill the strategy\n"
+        "    your solution embodies into ONE reusable procedure"
+        if succeeded else
+        "Your attempt at the path-finding puzzle below did NOT succeed. Distill what\n"
+        "    is still reusable from it -- including what to avoid -- into ONE procedure")
     return f"""
     You are an expert puzzle-solving agent building a procedural memory: reusable,
-    high-level strategies distilled from puzzles you have already solved.
+    high-level strategies distilled from puzzles you have already worked on.
 
-    You successfully solved the path-finding puzzle below. Distill the strategy your
-    solution embodies into ONE reusable procedure for solving puzzles with this
+    {opening} for solving puzzles with this
     combination of rules. Start with a line "Applies to: <the rule combination>",
     then give 3-6 numbered strategy steps, including pitfalls to avoid. The
     procedure must transfer to OTHER puzzles with similar rules: never mention
@@ -147,10 +157,10 @@ def memp_distill_trajectory_prompt(episode, key_text: str) -> str:
     Starting grid:
     {episode.first_obs}
 
-    The moves of your successful solution, in order (0=right, 1=up, 2=left, 3=down):
+    The moves you made, in order (0=right, 1=up, 2=left, 3=down):
 {format_trajectory(episode)}
 
-    Final grid, showing the full solution path you drew (V=visited, L=end):
+    Final grid, showing the full path you drew (V=visited, L=end):
     {episode.last_obs}
 
     Procedure:"""
@@ -214,15 +224,45 @@ def format_exemplar(exemplar: dict) -> str:
             f"  its grid had: {exemplar.get('grid_summary', '?')}")
 
 
-def format_procedures(entries) -> str:
+def format_stored_trajectory(traj: dict) -> str:
+    """Render a bank entry's stored round-by-round trace.
+
+    This is the paper's `Trajectory` granularity: the successful run kept
+    verbatim, round by round, rather than compressed to an action list. Shows the
+    starting grid, the ordered moves with the path head after each, and the final
+    grid with the solution drawn on it.
+    """
+    lines = []
+    for step, action, loc in traj.get("moves", []):
+        direction = _DIRECTIONS.get(action, str(action))
+        lines.append(f"  move {step}: {direction} -> path head at "
+                     f"{loc if loc is not None else '?'}")
+    moves = "\n".join(lines) if lines else "  (no moves recorded)"
+    return (f"  Its starting grid:\n{traj.get('first_obs', '?')}\n"
+            f"  The solution, move by move (0=right, 1=up, 2=left, 3=down):\n{moves}\n"
+            f"  Its final grid, with the solution path drawn (V=visited, L=end):\n"
+            f"{traj.get('last_obs', '?')}")
+
+
+def format_procedures(entries, granularity: str = "script") -> str:
     """The block injected into the actor's system prompt at Memp eval time.
 
     Same seam as format_reflections: MemoryAgent.reset appends this AFTER the full
     system prompt, so the shared KV prefix (see sparc_system_prompt) survives.
     Similarity scores are logged in the results but deliberately never rendered
-    here -- the retrieved and random arms must inject byte-identical *formats* so
-    they differ only in which entries were retrieved.
+    here -- every retrieval arm must inject byte-identical *formats* so they differ
+    only in which entries were retrieved.
+
+    `granularity` reproduces the paper's Build-policy conditions (its Table 1):
+      script            -- the distilled abstraction only
+      trajectory        -- the stored round-by-round run only
+      proceduralization -- both, the paper's best-performing condition
+    The compact exemplar rides along with `script` because that is what the
+    original campaign injected; the trajectory conditions replace it with the real
+    trace rather than stacking both concrete forms.
     """
+    if granularity not in ("script", "trajectory", "proceduralization"):
+        raise ValueError(f"unknown granularity {granularity!r}")
     parts = [
         "\n\nProcedural memory: strategies distilled from previously solved puzzles "
         "whose rule combinations resemble this one. They come from OTHER puzzles: "
@@ -230,9 +270,87 @@ def format_procedures(entries) -> str:
         "verbatim."
     ]
     for i, entry in enumerate(entries, 1):
-        parts.append(f"\nProcedure {i}:\n{entry['script'].strip()}\n"
-                     f"{format_exemplar(entry['exemplar'])}")
+        body = [f"\nProcedure {i}:"]
+        if granularity in ("script", "proceduralization"):
+            body.append(entry["script"].strip())
+        if granularity == "script":
+            body.append(format_exemplar(entry["exemplar"]))
+        else:
+            traj = entry.get("trajectory")
+            body.append(format_stored_trajectory(traj) if traj
+                        else format_exemplar(entry["exemplar"]))
+        parts.append("\n".join(body))
     return "\n".join(parts)
+
+
+def memp_revise_prompt(script: str, episode, key_text: str) -> str:
+    """Memp's `Adjustment` update: repair a procedure that led to a failure.
+
+    The paper's best update strategy -- "when a retrieved procedural memory
+    results in a failed execution, the erroneous trajectory is combined with the
+    original memory and then revised in place". The revision sees what actually
+    went wrong, which is the only mechanism in the framework capable of removing
+    a procedure that misstates a rule.
+    """
+    reasons = {
+        "wrong-solution": "the agent reached the exit but broke one or more rules",
+        "dead-end": "the agent painted the path into a corner with no legal move left",
+        "format-failure": "the agent never produced a parseable move",
+    }
+    why = reasons.get(episode.terminal_reason, "the agent did not solve the puzzle")
+    last_rules = episode.transitions[-1].rule_status if episode.transitions else {}
+    return f"""
+    You maintain a library of procedural memories for a path-finding puzzle solver.
+    The procedure below was retrieved to help solve a new puzzle, and the attempt
+    FAILED: {why}.
+
+    Rewrite the procedure so that an agent following it would not repeat this
+    failure. Keep it general and reusable for the same class of puzzles -- it will
+    be shown for other puzzles too, so do not tailor it to this grid, and do not
+    mention absolute coordinates. Correct anything the old procedure asserts that
+    the failure shows to be wrong. Keep the same shape: an "Applies to:" line, then
+    3-6 numbered steps and pitfalls, at most 120 words. Output only the revised
+    procedure.
+
+    The procedure that was used:
+    {script}
+
+    The puzzle it was used on:
+    {key_text}
+
+    Starting grid:
+    {episode.first_obs}
+
+    Moves the agent made, in order (0=right, 1=up, 2=left, 3=down):
+{format_trajectory(episode)}
+
+    Final grid (V=visited, L=last position):
+    {episode.last_obs}
+
+    Rule status at the end (per-rule pass/fail): {last_rules}
+
+    Revised procedure:"""
+
+
+def memp_keywords_prompt(key_text: str) -> str:
+    """Memp's `AveFact` key construction: extract the task's key features.
+
+    The paper applies "a large model to extract keywords from the task's query",
+    then scores retrieval by the average similarity across matched keywords rather
+    than one whole-query vector.
+    """
+    return f"""
+    Extract the key features of the path-finding puzzle below: the facts that
+    determine HOW it must be solved. Think rule types present, their counts and
+    colours, grid scale, and any structural feature that constrains the path.
+
+    Output 4 to 8 short keyword phrases, one per line, no numbering, no other text.
+    Do not include coordinates.
+
+    Puzzle:
+    {key_text}
+
+    Keywords:"""
 
 
 def sparc_system_prompt(polyshapes) -> str:

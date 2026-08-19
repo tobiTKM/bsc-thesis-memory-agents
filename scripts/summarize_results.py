@@ -346,14 +346,40 @@ def render(a: dict, top: int) -> str:
             w(f"  {'phase:':<20} build   [memoryless pass over train; feeds distill]")
         else:
             w(f"  {'top-k memories:':<20} {s.get('top_k_memories', '?')}")
+            w(f"  {'granularity:':<20} {s.get('granularity', 'script')}"
+              "   [paper's Build policy: script | trajectory | proceduralization]")
+            if s.get("provenance") and s["provenance"] != "all":
+                w(f"  {'bank provenance:':<20} {s['provenance']}"
+                  "   [agent = paper-faithful successes-only build]")
+            if s.get("update") and s["update"] != "none":
+                w(f"  {'update policy:':<20} {s['update']}"
+                  f"   [ONLINE: bank evolved over {s.get('update_groups', '?')} groups]")
             w(f"  {'bank:':<20} {s.get('bank', '?')}"
               + (f"   ({s['bank_entries']} entries)" if s.get("bank_entries") else ""))
+            if s.get("bank_model") and s["bank_model"] != s.get("model_id"):
+                w(f"  {'bank built by:':<20} {s['bank_model']}"
+                  "   [TRANSFER: bank and actor are different models]")
             w(f"  {'embed model:':<20} {s.get('embed_model') or '(not recorded)'}")
             if s.get("mean_top1_similarity") is not None:
                 w(f"  {'top-1 similarity:':<20} mean {s['mean_top1_similarity']}")
             if s.get("injected_provenance"):
                 w(f"  {'injected entries:':<20} {s['injected_provenance']}"
-                  f"   [agent = distilled from own success, gold = from gold path]")
+                  f"   [agent = from own success, gold = from gold path, "
+                  f"online = added during the run]")
+            if s.get("group_curve"):
+                w("")
+                w("UPDATE CURVE  (the paper's Figure 3: does the bank improve as it learns?)")
+                w(f"  {'group':>5} {'attempted':>10} {'solved':>7} {'rate':>7} {'bank':>7}")
+                for g in s["group_curve"]:
+                    att = g.get("attempted") or 0
+                    won = g.get("solved") or 0
+                    w(f"  {g.get('group', 0):>5} {att:>10} {won:>7} "
+                      f"{(won / att if att else 0):>7.3f} {g.get('bank_after', 0):>7}")
+                w(f"  entries added {s.get('entries_added', 0)}, "
+                  f"revised {s.get('entries_revised', 0)}, "
+                  f"update cost {s.get('update_tokens', 0):,} tokens")
+                w("  NOTE: each group is a disjoint slice of the split, so this rate is")
+                w("  directly comparable across groups -- unlike Reflexion's cumulative curve.")
     if s.get("elapsed_sec"):
         w(f"  {'runtime:':<20} {hms(s['elapsed_sec'])}")
         w(f"  {'per puzzle:':<20} {s['elapsed_sec'] / max(n, 1):.1f} s"

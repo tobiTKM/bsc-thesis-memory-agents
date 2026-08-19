@@ -22,7 +22,8 @@ import random
 
 import numpy as np
 
-from ..prompts import memp_distill_gold_prompt, memp_distill_trajectory_prompt
+from ..prompts import (memp_distill_gold_prompt, memp_distill_trajectory_prompt,
+                       memp_keywords_prompt, memp_revise_prompt)
 from .base import Memory
 
 SCHEMA = "memp-bank-v1"
@@ -46,6 +47,8 @@ class MempMemory(Memory):
         # Row i of `vectors` is the L2-normalized key embedding of entries[i].
         # None until attach_vectors(); the distill phase never has vectors.
         self.vectors: np.ndarray | None = None
+        # Per-entry keyword embedding matrices, only for the AveFact retriever.
+        self.keyword_vectors: list | None = None
 
     # ---- Memory ABC (build-side) -----------------------------------------
     def read(self, key) -> list:
@@ -115,6 +118,97 @@ class MempMemory(Memory):
                        key=lambda i: (-float(sims[i]), self.entries[i]["id"]))
         return [(self.entries[i], float(sims[i])) for i in order[:k]]
 
+    def avefact_retrieve(self, query_vecs, k: int) -> list[tuple[dict, float]]:
+        """AveFact retrieval: score by average similarity over matched keywords.
+
+        The paper extracts keywords from the task with an LLM and "computes the
+        average similarity across matched keywords". Concretely: each query
+        keyword is matched to its best-fitting keyword of the candidate entry, and
+        the entry's score is the mean of those best matches -- so an entry scores
+        highly only when most of the query's salient features find a counterpart,
+        rather than when one long description happens to look similar overall.
+        """
+        if self.keyword_vectors is None:
+            raise RuntimeError("attach_keyword_vectors() first")
+        q = np.asarray(query_vecs, dtype=np.float32)
+        if q.ndim != 2 or not len(q):
+            raise ValueError("query_vecs must be a non-empty 2-D array of keywords")
+        q = q / np.linalg.norm(q, axis=1, keepdims=True)
+        scores = []
+        for kw in self.keyword_vectors:
+            if kw is None or not len(kw):
+                scores.append(-1.0)      # no keywords stored: never preferred
+                continue
+            sims = q @ np.asarray(kw, dtype=np.float32).T   # (n_query, n_entry_kw)
+            scores.append(float(sims.max(axis=1).mean()))
+        order = sorted(range(len(self.entries)),
+                       key=lambda i: (-scores[i], self.entries[i]["id"]))
+        return [(self.entries[i], scores[i]) for i in order[:k]]
+
+    def attach_keyword_vectors(self, vectors_by_pid: dict) -> None:
+        """Per-entry keyword embedding matrices, keyed by source puzzle id."""
+        self.keyword_vectors = [
+            vectors_by_pid.get(e["source_pid"]) for e in self.entries]
+        missing = sum(1 for v in self.keyword_vectors if v is None or not len(v))
+        if missing:
+            print(f"[memp] WARNING: {missing}/{len(self.entries)} entries have no "
+                  f"keyword vectors and can never be retrieved by AveFact",
+                  flush=True)
+
+    def fixed_retrieve(self, k: int) -> list[tuple[dict, None]]:
+        """The same k entries for every puzzle -- the control the paper never ran.
+
+        Isolates "any procedural text in context" from "retrieval". Picks the
+        first k by entry id so the choice is deterministic and unremarkable.
+        """
+        picked = sorted(self.entries, key=lambda e: e["id"])[:k]
+        return [(e, None) for e in picked]
+
+    def revise(self, entry_id: str, script: str) -> None:
+        """Adjustment: overwrite one entry's script in place, keeping its vector.
+
+        The key text is unchanged (the entry still describes the same class of
+        puzzle), so the embedding stays valid and retrieval is unaffected -- only
+        what the agent reads changes.
+        """
+        for e in self.entries:
+            if e["id"] == entry_id:
+                e["revisions"] = e.get("revisions", 0) + 1
+                e["script_history"] = e.get("script_history", []) + [e["script"]]
+                e["script"] = script
+                return
+        raise KeyError(f"no bank entry {entry_id!r} to revise")
+
+    def add_with_vector(self, key, item: dict, vec) -> dict:
+        """Append a new entry and its key vector together (Vanilla / Validation).
+
+        Entries added during the Update stage come from *test* puzzles, whose
+        vectors are already in the embeddings sidecar, so the row is stacked onto
+        the matrix directly rather than re-joining the whole bank.
+        """
+        if self.vectors is None:
+            raise RuntimeError("attach_vectors() first")
+        self.write(key, item)
+        v = np.asarray(vec, dtype=np.float32).reshape(1, -1)
+        v = v / np.linalg.norm(v)
+        self.vectors = np.vstack([self.vectors, v])
+        if self.keyword_vectors is not None:
+            self.keyword_vectors.append(None)
+        return self.entries[-1]
+
+    def filtered(self, provenance: str) -> "MempMemory":
+        """A copy holding only entries of one provenance ('agent' or 'gold').
+
+        `agent` gives the paper-faithful bank: memory distilled solely from runs
+        the model itself completed, with no gold-path hindsight.
+        """
+        if provenance == "all":
+            return self
+        m = MempMemory(embed_model=self.embed_model)
+        m.stats = dict(self.stats)
+        m.entries = [e for e in self.entries if e["provenance"] == provenance]
+        return m
+
     def random_retrieve(self, k: int, seed_key: str) -> list[tuple[dict, None]]:
         """The ablation arm: k entries drawn without regard to similarity.
 
@@ -141,9 +235,10 @@ class Distiller:
     def __init__(self, client):
         self.client = client
 
-    async def distill_from_trajectory(self, episode, key_text: str):
-        """Procedure from the agent's own successful train episode."""
-        prompt = memp_distill_trajectory_prompt(episode, key_text)
+    async def distill_from_trajectory(self, episode, key_text: str,
+                                      succeeded: bool = True):
+        """Procedure from an agent episode (a success, unless Vanilla says otherwise)."""
+        prompt = memp_distill_trajectory_prompt(episode, key_text, succeeded=succeeded)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response
 
@@ -153,3 +248,16 @@ class Distiller:
         prompt = memp_distill_gold_prompt(key_text, text_visualization, gold_actions)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response
+
+    async def revise(self, script: str, episode, key_text: str):
+        """Memp's Adjustment update: repair a procedure that led to a failure."""
+        prompt = memp_revise_prompt(script, episode, key_text)
+        response = await self.client.chat([{"role": "user", "content": prompt}])
+        return (response.text or "").strip(), response
+
+    async def keywords(self, key_text: str):
+        """Memp's AveFact key construction: salient features of one task."""
+        prompt = memp_keywords_prompt(key_text)
+        response = await self.client.chat([{"role": "user", "content": prompt}])
+        lines = [l.strip(" -*\t") for l in (response.text or "").splitlines()]
+        return [l for l in lines if l][:8], response
