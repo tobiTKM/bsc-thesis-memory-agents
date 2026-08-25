@@ -3,6 +3,7 @@ import re
 
 import gymnasium as gym
 import Spatial_Gym
+import yaml
 
 from .base import make_json_safe
 
@@ -105,3 +106,128 @@ def parse_action(reply: str):
 def is_success(info) -> bool:
     """Env success = exact match to an enumerated solution path."""
     return info.get("Rewards", {}).get("outcome_reward") == 1
+
+
+# ---- dataset-record plumbing (Memp build/embed; no env state needed) --------
+# The dataset's gold `solutions[i]["path"]` is a list of {x,y} nodes in the same
+# doubled node grid the env plays on, one unit step apart, starting at the start
+# node. This table is the inverse of the env's _action_to_direction, and the one
+# place the two conventions meet -- note "up" is y-1 (grid y grows downward).
+_DELTA_TO_ACTION = {(1, 0): 0, (0, -1): 1, (-1, 0): 2, (0, 1): 3}
+
+
+def path_to_actions(path) -> list[int]:
+    """Convert a gold solution path into the env's action ints.
+
+    Raises on any non-unit delta instead of guessing: a wrong action sequence
+    stored as a "known-correct example" would poison every memory built from it.
+    A path of n nodes yields n-1 moves (the list includes the start node).
+    """
+    actions = []
+    for a, b in zip(path, path[1:]):
+        delta = (b["x"] - a["x"], b["y"] - a["y"])
+        if delta not in _DELTA_TO_ACTION:
+            raise ValueError(f"non-unit step {a} -> {b} in gold path")
+        actions.append(_DELTA_TO_ACTION[delta])
+    return actions
+
+
+def _parsed_cells(record) -> tuple[dict, list]:
+    """(puzzle dict, cells sorted by position) from a record's text_visualization."""
+    puzzle = yaml.safe_load(record["text_visualization"])["puzzle"]
+    cells = sorted(puzzle.get("cells") or [],
+                   key=lambda c: (c["position"]["y"], c["position"]["x"]))
+    return puzzle, cells
+
+
+def _cell_kind(props: dict) -> str:
+    """One word for what a cell is: its type, or the flag (gap/dot) it carries."""
+    if props.get("type"):
+        return props["type"]
+    for flag in ("gap", "dot"):   # untyped cells carry {'gap': 1} or {'dot': 1}
+        if props.get(flag):
+            return flag
+    return "unknown"
+
+
+def puzzle_key_text(record) -> str:
+    """The canonical text a puzzle is embedded from -- key-fn `puzzle-key-v1`.
+
+    Used verbatim for BOTH the train keys and the test queries; that symmetry
+    (same renderer on both sides), not the exact format, is what makes cosine
+    similarity meaningful. Changing anything here invalidates every stored
+    vector, so treat the format as frozen once a bank has shipped -- bump the
+    version name and re-embed instead.
+
+    Deterministic on purpose: cells sorted by (y, x), properties rendered in a
+    fixed order, census sorted alphabetically. Difficulty is deliberately NOT in
+    the key: retrieval should match on puzzle *content* (rules present, layout
+    scale), and difficulty is metadata the bank entry carries separately.
+    """
+    puzzle, cells = _parsed_cells(record)
+    dims, start, end = puzzle["dimensions"], puzzle["start"], puzzle["end"]
+    lines = [f"grid {dims['width']}x{dims['height']}; "
+             f"start ({start['x']},{start['y']}); end ({end['x']},{end['y']})"]
+    census: dict[str, int] = {}
+    for cell in cells:
+        pos, props = cell["position"], cell.get("properties") or {}
+        kind = _cell_kind(props)
+        census[kind] = census.get(kind, 0) + 1
+        parts = [kind]
+        if props.get("count") is not None:      # triangle: edges to touch
+            parts.append(str(props["count"]))
+        if props.get("polyshape") is not None:  # poly/ylop: shape id
+            parts.append(f"shape {props['polyshape']}")
+        if props.get("color"):
+            parts.append(props["color"])
+        lines.append(f"({pos['x']},{pos['y']}) " + " ".join(parts))
+    lines.append("rules: " + (", ".join(f"{k} x{n}" for k, n in sorted(census.items()))
+                              or "none"))
+    return "\n".join(lines)
+
+
+def replay_path(env, puzzle_id, actions) -> dict:
+    """Replay an action sequence and capture it in `reflection_context` shape.
+
+    Lets a gold-path entry carry the same round-by-round trace an agent-solved
+    entry gets from its own episode, so the Trajectory / Proceduralization arms
+    can run over the whole bank instead of only the handful of puzzles the model
+    happened to solve. Without this, granularity would be confounded with bank
+    size (500 entries vs 71). Pure env replay -- no model call.
+    """
+    obs, info = env.reset(puzzle_id=puzzle_id)
+    first_obs = format_obs(obs)
+    moves, last_obs = [], first_obs
+    for step, action in enumerate(actions):
+        obs, _reward, terminated, truncated, info = env.step(action)
+        last_obs = format_obs(obs)
+        moves.append([step, int(action), info.get("agent_location")])
+        if terminated or truncated:
+            break
+    return {
+        "first_obs": first_obs,
+        "last_obs": last_obs,
+        "terminal_reason": "solved" if is_success(info) else "replayed",
+        "moves": make_json_safe(moves),
+        "rule_status": make_json_safe(info.get("rule_status", {})),
+    }
+
+
+def grid_summary(record) -> str:
+    """A one-line census of a puzzle's rule cells, for the exemplar in a memory.
+
+    Coarser than puzzle_key_text on purpose: the exemplar tells the actor what
+    kind of grid the example move sequence solved, and colors matter for that
+    (squares' whole rule is color separation) but positions do not -- the
+    example is to be adapted, not replayed.
+    """
+    _, cells = _parsed_cells(record)
+    counts: dict[str, int] = {}
+    for cell in cells:
+        props = cell.get("properties") or {}
+        kind = _cell_kind(props)
+        label = f"{kind}({props['color']})" if props.get("color") else kind
+        counts[label] = counts.get(label, 0) + 1
+    return (", ".join(f"{label} x{n}" if n > 1 else label
+                      for label, n in sorted(counts.items()))
+            or "no rule cells")

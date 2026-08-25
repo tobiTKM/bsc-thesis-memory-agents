@@ -41,6 +41,30 @@
 # Then, on the login node (no GPU needed):
 #   python scripts/run_reflexion.py --phase compare --memory <memory.json> --control <control.json>
 #
+# Memp (procedural memory): build a bank on the TRAIN split, freeze it, retrieve at
+# test time. Four GPU jobs -- the embed job serves a different (embedding) model, so
+# it cannot share a job with the chat phases; it depends only on the dataset and can
+# run in parallel with build/distill. See scripts/run_memp.py for the full story.
+#   sbatch -J memp-build --export=ALL,DRIVER=memp,PHASE=build,SPLIT=train,LIMIT=0 scripts/serve_and_run.sbatch
+#   sbatch -J memp-dist  --export=ALL,DRIVER=memp,PHASE=distill,BUILD=results/json/memp_build_train_<stamp>.json scripts/serve_and_run.sbatch
+#   sbatch -J memp-embed -G A100:1 -t 01:00:00 --export=ALL,DRIVER=memp,PHASE=embed,TP=1 scripts/serve_and_run.sbatch
+#   sbatch -J memp-ret   --export=ALL,DRIVER=memp,PHASE=eval,ARM=retrieved,LIMIT=0,BANK=<bank.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   sbatch -J memp-rnd   --export=ALL,DRIVER=memp,PHASE=eval,ARM=random,LIMIT=0,BANK=<bank.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+# Set OUT= on the build/distill jobs to fixed paths and the later jobs can be submitted
+# up front with --dependency=afterok:<jobid> (same reasoning as the reflexion OUT note
+# below). Build and eval checkpoint every CHUNK puzzles; resubmit with RESUME=<file> to
+# continue. Then, on the login node:
+#   python scripts/run_memp.py --phase compare --baseline <baseline.json> --retrieved <ret.json> --random <rnd.json>
+#
+# MemoryBank (declarative memory): the same cross-task shape as Memp, but the memories
+# are past CASES rather than procedures. Two GPU phases only -- the train build pass and
+# the embeddings are Memp's, reused verbatim. RULES_PREAMBLE=on|off selects the prompt
+# ablation and is frozen into the bank it builds. See scripts/run_memorybank.py.
+#   sbatch -J mb-dist --export=ALL,DRIVER=memorybank,PHASE=distill,RULES_PREAMBLE=on,BUILD=results/json/memp_build_train_<stamp>.json scripts/serve_and_run.sbatch
+#   sbatch -J mb-ret  --export=ALL,DRIVER=memorybank,PHASE=eval,ARM=retrieved,LIMIT=0,BANK=<memorybank_bank_*.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   sbatch -J mb-rnd  --export=ALL,DRIVER=memorybank,PHASE=eval,ARM=random,LIMIT=0,BANK=<memorybank_bank_*.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   python scripts/run_memorybank.py --phase compare --baseline <root.json> --retrieved <ret.json> --random <rnd.json> --memp <memp_eval_retrieved_*.json>
+#
 # Some nodes SIGILL the Apptainer launcher (see PREFLIGHT below). The job detects that
 # in ~30 s, appends the node to logs/bad_nodes.txt and resubmits itself excluding every
 # node on that list, up to MAX_ATTEMPTS (8) times. AUTO_RESUBMIT=0 turns that off.
@@ -87,9 +111,9 @@ SMOKE="${SMOKE:-1}"                       # 0 skips the 2-prompt smoke check
 # `reflexion` is the two-phase memory method (see scripts/run_reflexion.py). New
 # memory methods slot in here as extra DRIVER cases -- the serve block above is
 # method-agnostic, so nothing else changes.
-DRIVER="${DRIVER:-baseline}"              # baseline | reflexion
-PHASE="${PHASE:-root}"                    # reflexion: root | arm
-ARM="${ARM:-}"                            # reflexion PHASE=arm: memory | control
+DRIVER="${DRIVER:-baseline}"              # baseline | reflexion | memp | memorybank
+PHASE="${PHASE:-root}"                    # reflexion: root | arm    memp: build | distill | embed | eval    memorybank: distill | eval
+ARM="${ARM:-}"                            # reflexion arm: memory | control    memp/memorybank eval: retrieved | random
 ROOT="${ROOT:-}"                          # start an arm from this root file
 RESUME="${RESUME:-}"                      # ...or continue this arm file where it stopped
 TRIALS="${TRIALS:-10}"                    # total trials INCLUDING trial 1 (the paper runs ~10)
@@ -106,6 +130,50 @@ REFLECT_MAX_TOKENS="${REFLECT_MAX_TOKENS:-$MAX_TOKENS}"   # self-reflection budg
 # make the control arm repeat trial 1 instead of resampling) and identical across arms
 # (so the two differ only in whether the reflection block is injected).
 SEED="${SEED:-0}"
+
+# ---- Memp knobs (DRIVER=memp; ignored otherwise) ----------------------------
+BUILD="${BUILD:-}"                        # PHASE=distill: the memp_build_*.json to distill from
+BANK="${BANK:-}"                          # PHASE=eval/upgrade: the memp_bank_*.json
+EMBEDDINGS="${EMBEDDINGS:-}"              # PHASE=eval: the memp_embeddings_*.npz key/query vectors
+TOP_K_MEMORIES="${TOP_K_MEMORIES:-3}"     # memories injected per test puzzle (paper's optimum ~10)
+# Paper-replication knobs (all default to the original frozen-bank behaviour).
+GRANULARITY="${GRANULARITY:-script}"      # script | trajectory | proceduralization  (Table 1)
+PROVENANCE="${PROVENANCE:-all}"           # all | agent | gold -- 'agent' = successes-only build
+UPDATE="${UPDATE:-none}"                  # none | vanilla | validation | adjustment (section 4.3)
+GROUPS="${GROUPS:-5}"                     # test-set groups between memory refreshes
+KEYWORDS="${KEYWORDS:-}"                  # memp_keywords_*.json for ARM=avefact
+CHUNK="${CHUNK:-100}"                     # puzzles per checkpoint (build/eval) / calls per checkpoint (distill)
+DISTILL_MAX_TOKENS="${DISTILL_MAX_TOKENS:-$MAX_TOKENS}"   # distillation budget
+EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-Embedding-0.6B}"   # served by PHASE=embed (cached in the group hub)
+
+# ---- MemoryBank knobs (DRIVER=memorybank; ignored otherwise) -----------------
+# Shares BUILD / BANK / EMBEDDINGS / TOP_K_MEMORIES / PROVENANCE / CHUNK /
+# DISTILL_MAX_TOKENS with memp above -- both are cross-task banks over the same
+# build pass and the same embeddings, which is exactly the point of the design.
+MB_GRANULARITY="${MB_GRANULARITY:-case-record}"   # case-record | case (its own scale, so not GRANULARITY)
+RULES_PREAMBLE="${RULES_PREAMBLE:-on}"    # on | off -- the rulebook ablation, frozen into the bank
+# Deliberately NOT the shared LIMIT (which defaults to 50 and means "eval split
+# size"): a bank silently truncated to 50 of 500 entries would still run, still
+# retrieve, and quietly measure the wrong thing. 0 = the whole build file.
+DISTILL_LIMIT="${DISTILL_LIMIT:-0}"       # smoke-test knob for PHASE=distill
+# Extra args spliced verbatim into the vLLM serve command. Empty by default, so
+# existing drivers are untouched; PHASE=embed defaults it below.
+EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
+
+# PHASE=embed serves the EMBEDding model instead of the chat model: vLLM runs one
+# model per process, so embeddings get their own small job (1 GPU, minutes) and the
+# eval job later needs only the chat model plus the .npz this one writes.
+# REASONING_PARSER= (explicit empty -- see the `-` vs `:-` note above) because an
+# embedding model has no <think> to strip, and SMOKE=0 because the chat smoke test
+# cannot run against a pooling server (the driver does its own embed smoke instead).
+# `--runner pooling` is verified against vllm-25.1.sif (vLLM 0.25.1: EngineArgs has
+# `runner`, not the older `task`); an older image would need EXTRA_VLLM_ARGS="--task embed".
+if [[ "$DRIVER" == "memp" && ( "$PHASE" == "embed" || "$PHASE" == "embed-keywords" ) ]]; then
+    MODEL="$EMBED_MODEL"
+    REASONING_PARSER=""
+    SMOKE=0
+    EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:---runner pooling}"
+fi
 
 # ---- modules: re-resolve Lmod for THIS node's CPU ---------------------------
 # This is what killed six earlier jobs. `sbatch --export=ALL` (the default) carries
@@ -280,6 +348,7 @@ apptainer exec --nv \
         --trust-remote-code \
         --seed 0 \
         ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
+        ${EXTRA_VLLM_ARGS:+$EXTRA_VLLM_ARGS} \
     > "$SERVER_LOG" 2>&1 &
 VLLM_PID=$!
 
@@ -366,8 +435,121 @@ case "$DRIVER" in
         echo "unknown PHASE=$PHASE for DRIVER=reflexion (expected: root | arm)" >&2; exit 1 ;;
     esac
     ;;
+  memp)
+    # Same frozen-config discipline as the reflexion arm: a RESUME job passes only
+    # what may legitimately differ between jobs (concurrency, chunk); everything
+    # that defines the run comes from the state file it is continuing.
+    case "$PHASE" in
+      build)
+        if [[ -n "$RESUME" ]]; then
+            echo "[$(date +%T)] memp build: resuming $RESUME"
+            python -u scripts/run_memp.py --phase build --resume "$RESUME" \
+                --concurrency "$CONCURRENCY" --chunk "$CHUNK"
+        else
+            echo "[$(date +%T)] memp build: memoryless pass over train, limit=$LIMIT"
+            # --split train appended AFTER the common args so it wins: the bank must
+            # be built from puzzles the eval never sees (the driver enforces it too).
+            python -u scripts/run_memp.py --phase build "${COMMON_ARGS[@]}" \
+                --split train --limit "$LIMIT" --chunk "$CHUNK" ${OUT:+--out "$OUT"}
+        fi
+        ;;
+      distill)
+        if [[ -n "$RESUME" ]]; then
+            echo "[$(date +%T)] memp distill: resuming $RESUME"
+            python -u scripts/run_memp.py --phase distill --resume "$RESUME" \
+                --concurrency "$CONCURRENCY" --chunk "$CHUNK"
+        else
+            [[ -n "$BUILD" ]] || { echo "PHASE=distill needs BUILD=<memp_build_*.json> or RESUME=<bank file>" >&2; exit 1; }
+            echo "[$(date +%T)] memp distill: $BUILD -> bank"
+            python -u scripts/run_memp.py --phase distill "${COMMON_ARGS[@]}" \
+                --build "$BUILD" --distill-max-tokens "$DISTILL_MAX_TOKENS" \
+                --chunk "$CHUNK" ${OUT:+--out "$OUT"}
+        fi
+        ;;
+      embed)
+        # Always the full dataset (minutes of work): a limited .npz would poison
+        # every later eval with missing vectors.
+        echo "[$(date +%T)] memp embed: all train keys + test queries via $MODEL"
+        python -u scripts/run_memp.py --phase embed ${OUT:+--out "$OUT"}
+        ;;
+      keywords)
+        # AveFact key construction: one short LLM call per puzzle, resumable.
+        echo "[$(date +%T)] memp keywords: extracting AveFact keys"
+        python -u scripts/run_memp.py --phase keywords "${COMMON_ARGS[@]}" \
+            --limit "$LIMIT" --chunk "$CHUNK" \
+            --distill-max-tokens "$DISTILL_MAX_TOKENS" ${OUT:+--out "$OUT"}
+        ;;
+      embed-keywords)
+        [[ -n "$KEYWORDS" ]] || { echo "PHASE=embed-keywords needs KEYWORDS=<memp_keywords_*.json>" >&2; exit 1; }
+        echo "[$(date +%T)] memp embed-keywords: $KEYWORDS via $MODEL"
+        python -u scripts/run_memp.py --phase embed-keywords --keywords "$KEYWORDS" \
+            ${OUT:+--out "$OUT"}
+        ;;
+      eval)
+        if [[ -n "$RESUME" ]]; then
+            echo "[$(date +%T)] memp eval: resuming $RESUME"
+            python -u scripts/run_memp.py --phase eval --resume "$RESUME" \
+                --concurrency "$CONCURRENCY" --chunk "$CHUNK"
+        else
+            [[ -n "$BANK" && -n "$EMBEDDINGS" ]] || { echo "PHASE=eval needs BANK=<memp_bank_*.json> and EMBEDDINGS=<memp_embeddings_*.npz>" >&2; exit 1; }
+            [[ -n "$ARM" ]] || { echo "PHASE=eval needs ARM=retrieved or ARM=random" >&2; exit 1; }
+            echo "[$(date +%T)] memp eval: arm=$ARM k=$TOP_K_MEMORIES limit=$LIMIT " \
+                 "granularity=$GRANULARITY provenance=$PROVENANCE update=$UPDATE"
+            python -u scripts/run_memp.py --phase eval "${COMMON_ARGS[@]}" \
+                --limit "$LIMIT" --chunk "$CHUNK" --arm "$ARM" --bank "$BANK" \
+                --embeddings "$EMBEDDINGS" --top-k-memories "$TOP_K_MEMORIES" \
+                --granularity "$GRANULARITY" --provenance "$PROVENANCE" \
+                --update "$UPDATE" --groups "$GROUPS" \
+                --distill-max-tokens "$DISTILL_MAX_TOKENS" \
+                ${KEYWORDS:+--keywords "$KEYWORDS"} ${OUT:+--out "$OUT"}
+        fi
+        ;;
+      *)
+        echo "unknown PHASE=$PHASE for DRIVER=memp (expected: build | distill | embed | eval)" >&2; exit 1 ;;
+    esac
+    ;;
+  memorybank)
+    # Two phases only: the train build pass and the embeddings are Memp's, reused
+    # verbatim (both methods key on the identical puzzle_key_text), so there is
+    # nothing here to re-run for them.
+    case "$PHASE" in
+      distill)
+        if [[ -n "$RESUME" ]]; then
+            echo "[$(date +%T)] memorybank distill: resuming $RESUME"
+            python -u scripts/run_memorybank.py --phase distill --resume "$RESUME" \
+                --concurrency "$CONCURRENCY" --chunk "$CHUNK"
+        else
+            [[ -n "$BUILD" ]] || { echo "PHASE=distill needs BUILD=<memp_build_*.json> or RESUME=<bank file>" >&2; exit 1; }
+            echo "[$(date +%T)] memorybank distill: $BUILD -> case bank (rules_preamble=$RULES_PREAMBLE)"
+            python -u scripts/run_memorybank.py --phase distill "${COMMON_ARGS[@]}" \
+                --build "$BUILD" --rules-preamble "$RULES_PREAMBLE" \
+                --distill-max-tokens "$DISTILL_MAX_TOKENS" \
+                --chunk "$CHUNK" --limit "$DISTILL_LIMIT" ${OUT:+--out "$OUT"}
+        fi
+        ;;
+      eval)
+        if [[ -n "$RESUME" ]]; then
+            echo "[$(date +%T)] memorybank eval: resuming $RESUME"
+            python -u scripts/run_memorybank.py --phase eval --resume "$RESUME" \
+                --concurrency "$CONCURRENCY" --chunk "$CHUNK"
+        else
+            [[ -n "$BANK" && -n "$EMBEDDINGS" ]] || { echo "PHASE=eval needs BANK=<memorybank_bank_*.json> and EMBEDDINGS=<memp_embeddings_*.npz>" >&2; exit 1; }
+            [[ -n "$ARM" ]] || { echo "PHASE=eval needs ARM=retrieved or ARM=random" >&2; exit 1; }
+            echo "[$(date +%T)] memorybank eval: arm=$ARM k=$TOP_K_MEMORIES limit=$LIMIT " \
+                 "granularity=$MB_GRANULARITY provenance=$PROVENANCE"
+            python -u scripts/run_memorybank.py --phase eval "${COMMON_ARGS[@]}" \
+                --limit "$LIMIT" --chunk "$CHUNK" --arm "$ARM" --bank "$BANK" \
+                --embeddings "$EMBEDDINGS" --top-k-memories "$TOP_K_MEMORIES" \
+                --granularity "$MB_GRANULARITY" --provenance "$PROVENANCE" \
+                ${OUT:+--out "$OUT"}
+        fi
+        ;;
+      *)
+        echo "unknown PHASE=$PHASE for DRIVER=memorybank (expected: distill | eval)" >&2; exit 1 ;;
+    esac
+    ;;
   *)
-    echo "unknown DRIVER=$DRIVER (expected: baseline | reflexion)" >&2; exit 1 ;;
+    echo "unknown DRIVER=$DRIVER (expected: baseline | reflexion | memp | memorybank)" >&2; exit 1 ;;
 esac
 
 echo "[$(date +%T)] done; the cleanup trap stops vLLM and frees the GPUs."

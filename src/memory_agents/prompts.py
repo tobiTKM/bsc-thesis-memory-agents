@@ -105,17 +105,473 @@ def format_reflections(reflections) -> str:
     )
 
 
-def sparc_system_prompt(polyshapes) -> str:
-    """The actor's system prompt, ported verbatim from Spatial-Gym's llm_testing host.
+# One few-shot script anchoring the distillation format, in the same role
+# _REFLECTION_EXAMPLES plays for reflections: a *procedure* for a class of
+# puzzles (rule-combination scoped, no coordinates), not a solution to one.
+_PROCEDURE_EXAMPLE = """Applies to: squares of two colors + dots
+1. Before moving, group the squares by color and decide which side of the grid each color's region will occupy; the path must become the wall between them.
+2. Sketch a rough wall separating the color groups, then bend it to collect every dot cell, since dots must be on the path itself.
+3. Prefer routes along the grid edge early; interior detours burn nodes you may need later, and revisiting is impossible.
+4. Before committing near the end node, verify each enclosed region holds squares of only one color; if not, backtrack the plan, not the path."""
 
-    Kept verbatim on purpose, duplication included (rule cells and the no-revisit
-    rule are each stated twice): our numbers are meant to be comparable with the
-    established baseline, so the prompt is not ours to tidy.
 
-    One structural property worth preserving: the per-puzzle {polyshapes} is
-    interpolated near the END, so the ~145 lines before it are byte-identical for
-    every puzzle and every step. With vLLM's --enable-prefix-caching that is a
-    large shared KV prefix. Do not move the variable part earlier.
+def distill_rules_preamble(polyshapes, artifact: str = "procedure") -> str:
+    """The rulebook plus the two clarifications a distiller cannot infer from it.
+
+    Goes at the TOP of every prompt that WRITES a procedure (both distill variants
+    and the revise/Adjustment step), so the constant part is a shared KV prefix
+    across the whole distill pass -- the same reason sparc_system_prompt keeps
+    {polyshapes} last. The prefix runs to the polyshape line; the notes after it are
+    constant text but sit past the per-puzzle part, which is a fair trade for
+    reading in the order a person would write it.
+
+    The two notes are not generic hedging -- they name the exact two errors the
+    first bank made, on ~86% gold-provenance entries and on agent entries alike:
+    treating region-rule cells as cells the path steps on, and reading the key
+    text's `rules: square x3` census (how many square CELLS exist) as "each square
+    must be entered three times". Both are unrecoverable from the cell labels alone,
+    which is all the old prompts showed.
+
+    `artifact` names what is being written. The default keeps every Memp prompt
+    byte-identical; MemoryBank's case-note prompts pass "memory note" so the
+    preamble does not itself nudge the writer toward procedural phrasing.
+    """
+    return f"""
+    The rules of the puzzle, reproduced verbatim from the solver's own instructions.
+    They address the solver as "you"; you are not the solver here -- you are writing
+    a {artifact} the solver will later read. Every claim your {artifact} makes must be
+    true of these rules:
+
+    --- BEGIN PUZZLE RULES ---
+{sparc_rules(polyshapes)}
+    --- END PUZZLE RULES ---
+
+    Two points to be clear on before you write anything, because they are the
+    mistakes {artifact}s most often make:
+    * Squares, stars, triangles and polyshapes are NOT cells the path travels
+      through. The path goes *around* them. Their rules constrain the regions the
+      path encloses (squares: one colour per region; stars: exactly one same-colour
+      partner in the region; polyshapes: the region must fit the shape) or how many
+      of a cell's edges the path touches (triangles). Only DOTS are cells the path
+      must pass through, and only GAPS are cells it must keep off.
+    * A line such as "rules: dot x2, square x3" is a census of how many cells of
+      each kind this grid holds. It is NOT a count of required visits, entries or
+      crossings -- no rule of that form exists in this game.
+"""
+
+
+def memp_distill_trajectory_prompt(episode, key_text: str, polyshapes,
+                                   succeeded: bool = True) -> str:
+    """Memp's Build step for a puzzle the agent itself ran.
+
+    `succeeded=False` is used only by the Vanilla update policy, which the paper
+    defines as consolidating *all* trajectories from a group -- failures included.
+    Every other caller distils a success.
+
+    The paper distills successful trajectories into "script-like abstractions":
+    reusable procedural knowledge for the *class* of task, not a replay of one
+    instance. So the prompt shows the solved episode (start grid, ordered moves,
+    final grid) but asks for a strategy scoped to the puzzle's rule combination,
+    and explicitly bans coordinates and move output -- a memory that says "go to
+    (4,2)" is useless on every other puzzle, and the concrete exemplar is
+    attached separately in code (see format_exemplar).
+
+    The rulebook is prepended (distill_rules_preamble): without it the model has to
+    guess the mechanics from cell labels, and a wrong guess becomes a confidently
+    worded procedure in the bank.
+    """
+    opening = (
+        "You successfully solved the path-finding puzzle below. Distill the strategy\n"
+        "    your solution embodies into ONE reusable procedure"
+        if succeeded else
+        "Your attempt at the path-finding puzzle below did NOT succeed. Distill what\n"
+        "    is still reusable from it -- including what to avoid -- into ONE procedure")
+    return f"""{distill_rules_preamble(polyshapes)}
+    You are an expert puzzle-solving agent building a procedural memory: reusable,
+    high-level strategies distilled from puzzles you have already worked on.
+
+    {opening} for solving puzzles with this
+    combination of rules. Start with a line "Applies to: <the rule combination>",
+    then give 3-6 numbered strategy steps, including pitfalls to avoid. The
+    procedure must transfer to OTHER puzzles with similar rules: never mention
+    absolute coordinates, this grid's size, or specific moves. At most 120 words.
+    Do not output a move or restate the generic game rules. Every mechanic you
+    appeal to must be one of the rules above -- do not invent constraints, and say
+    nothing about a rule type you are unsure of.
+
+    Here is an example of a good procedure:
+{_PROCEDURE_EXAMPLE}
+
+    Puzzle description:
+    {key_text}
+
+    Starting grid:
+    {episode.first_obs}
+
+    The moves you made, in order (0=right, 1=up, 2=left, 3=down):
+{format_trajectory(episode)}
+
+    Final grid, showing the full path you drew (V=visited, L=end):
+    {episode.last_obs}
+
+    Procedure:"""
+
+
+def memp_distill_gold_prompt(key_text: str, text_visualization: str,
+                             gold_actions: list, polyshapes=None) -> str:
+    """Memp's Build step for a train puzzle the agent failed: hindsight distillation.
+
+    SPaRC ships gold solution paths, so a failed build episode still yields a
+    procedure -- from the known-correct path instead of the agent's own (absent)
+    success. Deliberately reads dataset fields only (key text, text_visualization,
+    the gold path converted to actions in code): no dependency on the failed
+    trajectory means crashed episodes distill exactly like failed ones, and the
+    resulting memory describes how to solve the puzzle class, not how the agent
+    once got lost in it. Same output contract as the trajectory variant so the
+    bank is homogeneous regardless of provenance.
+
+    This variant needs the prepended rulebook most: it is asked to explain why a
+    path it never watched being drawn is correct, with nothing but cell labels to
+    go on. It is also the majority of the bank (~86% of entries at SPaRC's
+    memoryless success rate), so an error mode here dominates every retrieval.
+    """
+    actions = " ".join(str(a) for a in gold_actions)
+    return f"""{distill_rules_preamble(polyshapes)}
+    You are an expert puzzle-solving agent building a procedural memory: reusable,
+    high-level strategies distilled from solved puzzles.
+
+    Below is a path-finding puzzle together with a known-correct solution path.
+    Study why this path satisfies the puzzle's rules, then distill that into ONE
+    reusable procedure for solving puzzles with this combination of rules. Start
+    with a line "Applies to: <the rule combination>", then give 3-6 numbered
+    strategy steps, including pitfalls to avoid. The procedure must transfer to
+    OTHER puzzles with similar rules: never mention absolute coordinates, this
+    grid's size, or specific moves. At most 120 words. Do not output a move or
+    restate the generic game rules. Every mechanic you appeal to must be one of the
+    rules above -- do not invent constraints, and say nothing about a rule type you
+    are unsure of.
+
+    Here is an example of a good procedure:
+{_PROCEDURE_EXAMPLE}
+
+    Puzzle description:
+    {key_text}
+
+    Puzzle layout (structured form):
+    {text_visualization}
+
+    A known-correct solution, as moves from the start node (0=right, 1=up, 2=left,
+    3=down): {actions}
+
+    Procedure:"""
+
+
+def format_exemplar(exemplar: dict) -> str:
+    """Render a bank entry's concrete solved example as one compact line pair.
+
+    Built from the exemplar dict the Distiller assembles in code (actions either
+    from the agent's winning Transitions or from the gold path) -- the LLM never
+    writes this part, so it cannot hallucinate a move sequence.
+    """
+    actions = " ".join(str(a) for a in exemplar.get("actions", []))
+    start = tuple(exemplar.get("start", ()))
+    end = tuple(exemplar.get("end", ()))
+    return (f"Example ({exemplar.get('width')}x{exemplar.get('height')} grid, "
+            f"start {start} -> end {end}, {exemplar.get('n_moves')} moves: {actions}; "
+            f"0=right,1=up,2=left,3=down)\n"
+            f"  its grid had: {exemplar.get('grid_summary', '?')}")
+
+
+def format_stored_trajectory(traj: dict) -> str:
+    """Render a bank entry's stored round-by-round trace.
+
+    This is the paper's `Trajectory` granularity: the successful run kept
+    verbatim, round by round, rather than compressed to an action list. Shows the
+    starting grid, the ordered moves with the path head after each, and the final
+    grid with the solution drawn on it.
+    """
+    lines = []
+    for step, action, loc in traj.get("moves", []):
+        direction = _DIRECTIONS.get(action, str(action))
+        lines.append(f"  move {step}: {direction} -> path head at "
+                     f"{loc if loc is not None else '?'}")
+    moves = "\n".join(lines) if lines else "  (no moves recorded)"
+    return (f"  Its starting grid:\n{traj.get('first_obs', '?')}\n"
+            f"  The solution, move by move (0=right, 1=up, 2=left, 3=down):\n{moves}\n"
+            f"  Its final grid, with the solution path drawn (V=visited, L=end):\n"
+            f"{traj.get('last_obs', '?')}")
+
+
+def format_procedures(entries, granularity: str = "script") -> str:
+    """The block injected into the actor's system prompt at Memp eval time.
+
+    Same seam as format_reflections: MemoryAgent.reset appends this AFTER the full
+    system prompt, so the shared KV prefix (see sparc_system_prompt) survives.
+    Similarity scores are logged in the results but deliberately never rendered
+    here -- every retrieval arm must inject byte-identical *formats* so they differ
+    only in which entries were retrieved.
+
+    `granularity` reproduces the paper's Build-policy conditions (its Table 1):
+      script            -- the distilled abstraction only
+      trajectory        -- the stored round-by-round run only
+      proceduralization -- both, the paper's best-performing condition
+    The compact exemplar rides along with `script` because that is what the
+    original campaign injected; the trajectory conditions replace it with the real
+    trace rather than stacking both concrete forms.
+    """
+    if granularity not in ("script", "trajectory", "proceduralization"):
+        raise ValueError(f"unknown granularity {granularity!r}")
+    parts = [
+        "\n\nProcedural memory: strategies distilled from previously solved puzzles "
+        "whose rule combinations resemble this one. They come from OTHER puzzles: "
+        "adapt the strategy to this grid, and never copy an example's move sequence "
+        "verbatim."
+    ]
+    for i, entry in enumerate(entries, 1):
+        body = [f"\nProcedure {i}:"]
+        if granularity in ("script", "proceduralization"):
+            body.append(entry["script"].strip())
+        if granularity == "script":
+            body.append(format_exemplar(entry["exemplar"]))
+        else:
+            traj = entry.get("trajectory")
+            body.append(format_stored_trajectory(traj) if traj
+                        else format_exemplar(entry["exemplar"]))
+        parts.append("\n".join(body))
+    return "\n".join(parts)
+
+
+def memp_revise_prompt(script: str, episode, key_text: str, polyshapes=None) -> str:
+    """Memp's `Adjustment` update: repair a procedure that led to a failure.
+
+    The paper's best update strategy -- "when a retrieved procedural memory
+    results in a failed execution, the erroneous trajectory is combined with the
+    original memory and then revised in place". The revision sees what actually
+    went wrong, which is the only mechanism in the framework capable of removing
+    a procedure that misstates a rule.
+
+    Which is precisely why it also gets the rulebook prepended: a reviser without
+    the rules can only tell that the attempt failed, not which of the procedure's
+    claims is false, so it is as free to invent a new wrong mechanic as the original
+    distiller was.
+    """
+    reasons = {
+        "wrong-solution": "the agent reached the exit but broke one or more rules",
+        "dead-end": "the agent painted the path into a corner with no legal move left",
+        "format-failure": "the agent never produced a parseable move",
+    }
+    why = reasons.get(episode.terminal_reason, "the agent did not solve the puzzle")
+    last_rules = episode.transitions[-1].rule_status if episode.transitions else {}
+    return f"""{distill_rules_preamble(polyshapes)}
+    You maintain a library of procedural memories for a path-finding puzzle solver.
+    The procedure below was retrieved to help solve a new puzzle, and the attempt
+    FAILED: {why}.
+
+    Rewrite the procedure so that an agent following it would not repeat this
+    failure. Keep it general and reusable for the same class of puzzles -- it will
+    be shown for other puzzles too, so do not tailor it to this grid, and do not
+    mention absolute coordinates. Correct anything the old procedure asserts that
+    the failure shows to be wrong, and anything it asserts that contradicts the
+    rules above -- a procedure can fail because it states a mechanic this game does
+    not have. Keep the same shape: an "Applies to:" line, then 3-6 numbered steps
+    and pitfalls, at most 120 words. Output only the revised procedure.
+
+    The procedure that was used:
+    {script}
+
+    The puzzle it was used on:
+    {key_text}
+
+    Starting grid:
+    {episode.first_obs}
+
+    Moves the agent made, in order (0=right, 1=up, 2=left, 3=down):
+{format_trajectory(episode)}
+
+    Final grid (V=visited, L=last position):
+    {episode.last_obs}
+
+    Rule status at the end (per-rule pass/fail): {last_rules}
+
+    Revised procedure:"""
+
+
+def memp_keywords_prompt(key_text: str) -> str:
+    """Memp's `AveFact` key construction: extract the task's key features.
+
+    The paper applies "a large model to extract keywords from the task's query",
+    then scores retrieval by the average similarity across matched keywords rather
+    than one whole-query vector.
+    """
+    return f"""
+    Extract the key features of the path-finding puzzle below: the facts that
+    determine HOW it must be solved. Think rule types present, their counts and
+    colours, grid scale, and any structural feature that constrains the path.
+
+    Output 4 to 8 short keyword phrases, one per line, no numbering, no other text.
+    Do not include coordinates.
+
+    Puzzle:
+    {key_text}
+
+    Keywords:"""
+
+
+# --------------------------------------------------------------------------- #
+# MemoryBank (Zhong et al., 2024): declarative memory -- specific past CASES.
+#
+# The paper's memory storage keeps two text layers per interaction: the in-depth
+# record (the conversation verbatim, turn by turn) and a "hierarchical event
+# summary" written by the LLM with the prompt "Summarize the events and key
+# information in the content [dialog]". Mapped onto SPaRC, one past puzzle is one
+# past interaction: its verbatim record is the replayed move-by-move trace
+# (attached in code by the distill phase, so it cannot be hallucinated), and its
+# event summary is the case note the two prompts below write.
+#
+# The contrast with Memp is the whole point of running both (docs/architecture.md
+# section 5.2): Memp abstracts a trajectory into a rule-scoped PROCEDURE, while
+# MemoryBank recounts one INSTANCE. Both are retrieved by the same key text, at
+# the same k, and rendered into the same injection point -- so the comparison
+# isolates the type of content, not the retrieval.
+# --------------------------------------------------------------------------- #
+_CASE_INSTRUCTION = """You are recalling a specific past experience, not writing a strategy
+    guide. Recount what this puzzle looked like and how it was solved, concretely, in
+    2-3 sentences: the shape and scale of the grid, which rule cells were where in
+    general terms, and the shape the successful path took through them. Do not phrase
+    this as a rule, a numbered procedure, or advice for other puzzles -- you are
+    remembering one instance, not instructing. Do not output a move sequence (the
+    moves are stored alongside your note already) and do not restate the game rules."""
+
+
+def memorybank_case_trajectory_prompt(episode, key_text: str, polyshapes,
+                                      rules_preamble: bool = True) -> str:
+    """MemoryBank's event summary for a puzzle the agent itself solved.
+
+    The declarative sibling of memp_distill_trajectory_prompt: same inputs (the
+    episode's start grid, ordered moves and final grid), opposite output contract
+    -- a concrete recollection of THIS puzzle rather than a transferable procedure.
+
+    `rules_preamble` is an ablation knob, not a preference. Memp's v1 banks
+    misstated SPaRC's square/star rule in 33-51% of entries because no distillation
+    prompt contained the rulebook (docs/memp.md section 3.5); the preamble is what
+    fixed that. A case note describes an instance rather than asserting a rule, so
+    it is genuinely unclear whether it needs the same treatment -- hence both banks
+    get built and audited (see scripts/audit_bank.py).
+    """
+    preamble = distill_rules_preamble(polyshapes, artifact="memory note") \
+        if rules_preamble else ""
+    return f"""{preamble}
+    You keep a memory of specific puzzles you have worked on, so that when a new
+    puzzle resembles one of them you can recall the earlier case.
+
+    You successfully solved the path-finding puzzle below. Write the memory entry for
+    it. {_CASE_INSTRUCTION}
+
+    Puzzle description:
+    {key_text}
+
+    Starting grid:
+    {episode.first_obs}
+
+    The moves you made, in order (0=right, 1=up, 2=left, 3=down):
+{format_trajectory(episode)}
+
+    Final grid, showing the full path you drew (V=visited, L=end):
+    {episode.last_obs}
+
+    Memory of this puzzle:"""
+
+
+def memorybank_case_gold_prompt(key_text: str, text_visualization: str,
+                                gold_actions: list, polyshapes=None,
+                                rules_preamble: bool = True) -> str:
+    """MemoryBank's event summary for a train puzzle the agent failed: hindsight.
+
+    Mirrors memp_distill_gold_prompt's role and its crash-safety property -- it
+    reads dataset fields only (key text, layout, the gold path converted to actions
+    in code), so an episode that crashed with no trajectory writes exactly like one
+    that merely failed. At SPaRC's memoryless train accuracy this variant produces
+    ~86-98% of the bank, so its phrasing matters more than the trajectory variant's.
+
+    Written in the same voice as the trajectory variant on purpose: the actor must
+    not be able to tell, from the note alone, whether a case came from its own run
+    or from hindsight -- provenance is recorded in the entry, not in the prose.
+    """
+    actions = " ".join(str(a) for a in gold_actions)
+    preamble = distill_rules_preamble(polyshapes, artifact="memory note") \
+        if rules_preamble else ""
+    return f"""{preamble}
+    You keep a memory of specific puzzles you have worked on, so that when a new
+    puzzle resembles one of them you can recall the earlier case.
+
+    Below is a path-finding puzzle you worked on, together with the solution path
+    that solves it. Write the memory entry for it. {_CASE_INSTRUCTION}
+
+    Puzzle description:
+    {key_text}
+
+    Puzzle layout (structured form):
+    {text_visualization}
+
+    The solution, as moves from the start node (0=right, 1=up, 2=left, 3=down):
+    {actions}
+
+    Memory of this puzzle:"""
+
+
+def format_cases(entries, granularity: str = "case-record") -> str:
+    """The block injected into the actor's system prompt at MemoryBank eval time.
+
+    The declarative sibling of format_procedures, and deliberately the only place
+    the two methods' injected text differs in *framing*: the same seam
+    (MemoryAgent.reset appends it AFTER the full system prompt, preserving the
+    shared KV prefix), the same silence about similarity scores, the same per-entry
+    layout -- but introduced as past cases to reason by analogy from, not as
+    strategies to apply.
+
+    `granularity` selects which layer of the paper's two-layer storage rides along
+    with the case note:
+      case-record  -- the verbatim round-by-round record (the paper's in-depth
+                      storage); the default, and the analogue of Memp's
+                      `proceduralization`.
+      case         -- the compact action-list exemplar instead; the analogue of
+                      Memp's `script`, kept so the two methods can also be compared
+                      at the granularity where Memp's campaign found no effect.
+    """
+    if granularity not in ("case-record", "case"):
+        raise ValueError(f"unknown granularity {granularity!r}")
+    parts = [
+        "\n\nDeclarative memory: specific past cases similar to this puzzle, from "
+        "puzzles you solved before. Use them only as loose analogies for the kind of "
+        "layout and rule combination involved -- not as instructions to follow. This "
+        "puzzle is a different one: never copy a case's move sequence verbatim."
+    ]
+    for i, entry in enumerate(entries, 1):
+        body = [f"\nCase {i}:", entry["case_note"].strip()]
+        traj = entry.get("trajectory")
+        if granularity == "case-record" and traj:
+            body.append(format_stored_trajectory(traj))
+        else:
+            body.append(format_exemplar(entry["exemplar"]))
+        parts.append("\n".join(body))
+    return "\n".join(parts)
+
+
+def sparc_rules(polyshapes) -> str:
+    """The SPaRC rulebook alone -- what the game *is*, with no I/O contract attached.
+
+    Split out of sparc_system_prompt so the distillation prompts can state the same
+    rules, verbatim, that the actor plays under. That is not cosmetic. A distiller
+    that never sees the rulebook has to reverse-engineer the mechanics from cell
+    labels, and it reliably invents the wrong ones: describing squares, stars, polys
+    and triangles as cells the path must "visit" some number of times, when the path
+    goes *around* them and their rules are about enclosed regions and touched edges.
+    Those inventions are written into the bank as confident procedural advice, which
+    is worse than an empty bank -- the actor is told, with authority, a rule that
+    does not exist.
+
+    Ends with the per-puzzle {polyshapes}, so every line before it is byte-identical
+    across puzzles -- see sparc_system_prompt for why that is worth preserving.
     """
     return f"""
     You are an autonomous agent controlling a path-finding puzzle solver.
@@ -179,7 +635,14 @@ def sparc_system_prompt(polyshapes) -> str:
             (4): Path touches EXACTLY 4 edges (fully surrounds) the triangle's cell.
 
     Polyshape Definitions: Shapes are defined by 2D arrays where 1 indicates an occupied cell and 0 indicates an empty cell. {polyshapes}
+"""
 
+
+# The actor's I/O contract. Deliberately NOT part of sparc_rules: it describes the
+# observation format and orders the model to end every reply with `Final: <digit>`.
+# A distiller handed that instruction would answer a "write a procedure" request
+# with a move.
+_SPARC_IO_CONTRACT = """
     At each turn you'll receive current Information as JSON.
     Observation: The current state of the grid, including the path and any rule cells.
     Info: Additional information including solution_count, difficulty, grid_x_size, grid_y_size,
@@ -191,3 +654,21 @@ def sparc_system_prompt(polyshapes) -> str:
     where <digit> is exactly one of 0=right, 1=up, 2=left, 3=down.
     No other output beyond your reasoning and that Final line.
     """
+
+
+def sparc_system_prompt(polyshapes) -> str:
+    """The actor's system prompt, ported verbatim from Spatial-Gym's llm_testing host.
+
+    Kept verbatim on purpose, duplication included (rule cells and the no-revisit
+    rule are each stated twice): our numbers are meant to be comparable with the
+    established baseline, so the prompt is not ours to tidy. It is now assembled
+    from sparc_rules + the I/O contract, and the concatenation is byte-identical to
+    the single string this used to be -- baseline numbers already in results/ stay
+    comparable, and the shared KV prefix is unchanged.
+
+    One structural property worth preserving: the per-puzzle {polyshapes} is
+    interpolated near the END, so the ~145 lines before it are byte-identical for
+    every puzzle and every step. With vLLM's --enable-prefix-caching that is a
+    large shared KV prefix. Do not move the variable part earlier.
+    """
+    return sparc_rules(polyshapes) + _SPARC_IO_CONTRACT

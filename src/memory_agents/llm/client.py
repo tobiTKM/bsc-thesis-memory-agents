@@ -94,3 +94,33 @@ class LLMClient:
     async def aclose(self) -> None:
         """Close the underlying HTTP client (call once at the end of a run)."""
         await self.client.close()
+
+
+class EmbeddingClient:
+    """Async client for a vLLM server running an embedding model.
+
+    A separate class rather than a method on LLMClient because the two are never
+    served by the same process: vLLM runs one model per server, so embeddings come
+    from their own (small, 1-GPU) job while chat comes from the 32B job. Keeping
+    the classes apart means neither run has to construct a client for a server
+    that does not exist.
+    """
+
+    def __init__(self, base_url: str, model: str, timeout: float = 600.0):
+        self.client = AsyncOpenAI(base_url=base_url, api_key="EMPTY", timeout=timeout)
+        self.model = model
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of texts, preserving input order.
+
+        The OpenAI embeddings API returns one item per input with an `index`
+        field; sort on it rather than trusting response order, since order is a
+        convention the spec does not actually guarantee. Callers batch (the
+        driver uses ~64) and L2-normalize; raw vectors are returned here.
+        """
+        resp = await self.client.embeddings.create(model=self.model, input=texts)
+        items = sorted(resp.data, key=lambda d: d.index)
+        return [item.embedding for item in items]
+
+    async def aclose(self) -> None:
+        await self.client.close()
