@@ -240,6 +240,14 @@ async def run_build(args) -> None:
 # --------------------------------------------------------------------------- #
 # phase distill: build pass -> procedure bank
 # --------------------------------------------------------------------------- #
+def polyshapes_of(row):
+    """The puzzle's shape table, parsed exactly as the harness parses it before
+    handing it to sparc_system_prompt (harness/run.py) -- so the rulebook the
+    distiller reads is byte-for-byte the one the actor played under. `{}` for the
+    ~35% of puzzles with no polyshapes."""
+    return yaml.safe_load(row["polyshapes"])
+
+
 def gold_exemplar(row) -> dict:
     """The concrete solved example attached to a gold-provenance entry.
 
@@ -319,15 +327,17 @@ async def run_distill(args) -> None:
         # Route on provenance. A crashed episode has no episode_context, which is
         # exactly why the gold prompt reads dataset fields only.
         from_agent = bool(rec["success"] and rec.get("episode_context"))
+        polyshapes = polyshapes_of(row)
         async with sem:
             if from_agent:
                 episode = EpisodeResult.from_reflection_context(
                     rec["episode_context"], pid)
-                text, resp = await distiller.distill_from_trajectory(episode, key_text)
+                text, resp = await distiller.distill_from_trajectory(
+                    episode, key_text, polyshapes)
             else:
                 gold_actions = path_to_actions(list(row["solutions"][0]["path"]))
                 text, resp = await distiller.distill_from_gold(
-                    key_text, row["text_visualization"], gold_actions)
+                    key_text, row["text_visualization"], gold_actions, polyshapes)
         return pid, from_agent, text, resp
 
     async def distill_pass(pids, seed):
@@ -708,12 +718,13 @@ async def update_pass(policy, memory, arrays, group_results, retrieved_log,
                 return ("skipped", pid, None, None)
             async with sem:
                 text, resp = await distiller.revise(
-                    _script_of(memory, picks[0]["id"]), episode, key_text)
+                    _script_of(memory, picks[0]["id"]), episode, key_text,
+                    polyshapes_of(row))
             return ("revise", pid, (picks[0]["id"], text), resp)
         # vanilla / validation both distil the trajectory into a NEW memory
         async with sem:
             text, resp = await distiller.distill_from_trajectory(
-                episode, key_text, succeeded=bool(r.success))
+                episode, key_text, polyshapes_of(row), succeeded=bool(r.success))
         return ("add", pid, (text, row, ctx), resp)
 
     targets = [r for r in group_results
@@ -982,10 +993,16 @@ def mcnemar_exact(flips_a: int, flips_b: int) -> float:
     return min(1.0, 2 * tail)
 
 
-def eval_outcomes(path) -> tuple[dict, dict]:
+def eval_outcomes(path, schema: str = EVAL_SCHEMA) -> tuple[dict, dict]:
+    """Per-puzzle wins from one eval state file.
+
+    `schema` is a parameter so run_memorybank.py can reuse this (and the compare
+    machinery built on it) for its own eval files; the default keeps every Memp
+    caller unchanged.
+    """
     data = json.loads(pathlib.Path(path).read_text())
-    if data.get("config", {}).get("schema") != EVAL_SCHEMA:
-        raise SystemExit(f"{path} is not a {EVAL_SCHEMA} file")
+    if data.get("config", {}).get("schema") != schema:
+        raise SystemExit(f"{path} is not a {schema} file")
     return ({pid: rec["success"] for pid, rec in data["puzzles"].items()}, data)
 
 

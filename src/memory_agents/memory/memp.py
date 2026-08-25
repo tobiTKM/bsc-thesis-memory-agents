@@ -38,7 +38,12 @@ class MempMemory(Memory):
     Memory ABC's read/write therefore serve the build side only -- read(pid) is
     what lets a resumed distill phase skip puzzles already distilled -- while
     retrieval goes through retrieve()/random_retrieve().
+
+    SCHEMA is a class attribute so a sibling bank (MemoryBankMemory) can inherit
+    every retrieval mechanism and differ only in its schema tag and entry shape.
     """
+
+    SCHEMA = SCHEMA
 
     def __init__(self, embed_model: str = ""):
         self.entries: list[dict] = []
@@ -67,13 +72,13 @@ class MempMemory(Memory):
         return len(self.entries)
 
     def to_dict(self) -> dict:
-        return {"schema": SCHEMA, "embed_model": self.embed_model,
+        return {"schema": self.SCHEMA, "embed_model": self.embed_model,
                 "stats": self.stats, "entries": self.entries}
 
     @classmethod
     def from_dict(cls, data: dict) -> "MempMemory":
-        if data.get("schema") != SCHEMA:
-            raise ValueError(f"not a {SCHEMA} bank: schema={data.get('schema')!r}")
+        if data.get("schema") != cls.SCHEMA:
+            raise ValueError(f"not a {cls.SCHEMA} bank: schema={data.get('schema')!r}")
         m = cls(embed_model=data.get("embed_model", ""))
         m.stats = data.get("stats", {})
         m.entries = list(data.get("entries", []))
@@ -204,7 +209,7 @@ class MempMemory(Memory):
         """
         if provenance == "all":
             return self
-        m = MempMemory(embed_model=self.embed_model)
+        m = type(self)(embed_model=self.embed_model)
         m.stats = dict(self.stats)
         m.entries = [e for e in self.entries if e["provenance"] == provenance]
         return m
@@ -235,23 +240,29 @@ class Distiller:
     def __init__(self, client):
         self.client = client
 
-    async def distill_from_trajectory(self, episode, key_text: str,
+    async def distill_from_trajectory(self, episode, key_text: str, polyshapes=None,
                                       succeeded: bool = True):
-        """Procedure from an agent episode (a success, unless Vanilla says otherwise)."""
-        prompt = memp_distill_trajectory_prompt(episode, key_text, succeeded=succeeded)
+        """Procedure from an agent episode (a success, unless Vanilla says otherwise).
+
+        `polyshapes` is that puzzle's shape table, so the prepended rulebook is the
+        same one the actor solved under -- see prompts.distill_rules_preamble.
+        """
+        prompt = memp_distill_trajectory_prompt(episode, key_text, polyshapes,
+                                                succeeded=succeeded)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response
 
     async def distill_from_gold(self, key_text: str, text_visualization: str,
-                                gold_actions: list):
+                                gold_actions: list, polyshapes=None):
         """Procedure from the dataset's gold path (hindsight, for failed puzzles)."""
-        prompt = memp_distill_gold_prompt(key_text, text_visualization, gold_actions)
+        prompt = memp_distill_gold_prompt(key_text, text_visualization, gold_actions,
+                                          polyshapes)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response
 
-    async def revise(self, script: str, episode, key_text: str):
+    async def revise(self, script: str, episode, key_text: str, polyshapes=None):
         """Memp's Adjustment update: repair a procedure that led to a failure."""
-        prompt = memp_revise_prompt(script, episode, key_text)
+        prompt = memp_revise_prompt(script, episode, key_text, polyshapes)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response
 
