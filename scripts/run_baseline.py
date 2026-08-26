@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""Run the memoryless baseline over a SPaRC split and save results.
+"""Run the memoryless baseline over a benchmark split and save results.
 
 Reads the server endpoint from LLM_BASE_URL / LLM_MODEL (set by
 serve_and_run.sbatch). Writes a JSON with a summary (accuracy overall and by
 difficulty, token totals) plus one record per puzzle.
 
   python scripts/run_baseline.py --split test --concurrency 32 --limit 50
+  python scripts/run_baseline.py --benchmark stepgame --split test
 """
 
 import argparse
@@ -21,9 +22,8 @@ from datetime import datetime
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from memory_agents.agents.base import MAX_FORMAT_RETRIES
+from memory_agents.benchmarks import add_benchmark_args, build_benchmark
 from memory_agents.config import resolve_server
-from memory_agents.envs.sparc import MAX_STEPS
-from memory_agents.harness.run import run_sparc_suite_baseline
 from memory_agents.llm.client import LLMClient
 
 
@@ -66,6 +66,15 @@ def summarize(results) -> dict:
     for r in results:
         by_diff.setdefault(r.difficulty, []).append(r.success)
 
+    # StepGame's second axis: k (above) is the story length, the true hop count is
+    # the reasoning depth, and they are not the same thing. Absent on SPaRC, where
+    # secondary_difficulty is None and nothing lands here.
+    by_hops: dict[int, list] = {}
+    for r in results:
+        hops = (r.extra or {}).get("hops")
+        if hops is not None:
+            by_hops.setdefault(int(hops), []).append(r.success)
+
     return {
         "n": n,
         "success": wins,
@@ -73,6 +82,9 @@ def summarize(results) -> dict:
         "accuracy_by_difficulty": {
             str(d): sum(s) / len(s) for d, s in sorted(by_diff.items())
         },
+        **({"accuracy_by_hops": {str(h): sum(v) / len(v)
+                                 for h, v in sorted(by_hops.items())}}
+           if by_hops else {}),
         "prompt_tokens": sum(r.prompt_tokens() for r in results),
         "completion_tokens": sum(r.completion_tokens() for r in results),
         # Of the two totals above, what went on replies that never yielded a move.
@@ -99,11 +111,13 @@ def to_record(r) -> dict:
         "completion_tokens": r.completion_tokens(),
         "retry_tokens": r.retry_tokens(),
         "error": r.error or None,
+        **({"extra": r.extra} if r.extra else {}),
     }
 
 
 async def main():
     ap = argparse.ArgumentParser()
+    add_benchmark_args(ap)
     ap.add_argument("--split", default="test")
     ap.add_argument("--concurrency", type=int, default=32)
     ap.add_argument("--limit", type=int, default=0, help="0 or less = whole split")
@@ -121,6 +135,7 @@ async def main():
     args = ap.parse_args()
 
     limit = args.limit if args.limit > 0 else None
+    benchmark = build_benchmark(args)
     base_url, model = resolve_server()
 
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
@@ -138,7 +153,7 @@ async def main():
                        top_k=args.top_k, seed=args.seed)
 
     t0 = time.time()
-    results = await run_sparc_suite_baseline(
+    results = await benchmark.run_baseline_suite(
         client, split=args.split, concurrency=args.concurrency, limit=limit)
     elapsed = time.time() - t0
     await client.aclose()
@@ -160,15 +175,22 @@ async def main():
     # Recorded so summarize_results can tell "retried but recovered" from "aborted
     # the episode" instead of guessing with a hardcoded default.
     summary["max_format_retries"] = MAX_FORMAT_RETRIES
+    summary["benchmark"] = benchmark.name
     # The env step cap. summarize_results reads a truncation as a dead end rather
     # than a step-limit cutoff; that only holds while episodes stay well under this.
-    summary["max_steps"] = MAX_STEPS
+    # Single-turn benchmarks have no step cap and no dead ends, so it is omitted
+    # rather than reported as a meaningless 1.
+    if benchmark.interactive:
+        from memory_agents.envs.sparc import MAX_STEPS
+        summary["max_steps"] = MAX_STEPS
     summary["format_failures"] = summarize_format_failures(fail_log)
 
     # results/json holds the machine-readable run data (this file plus the failure
     # log); results/txt holds the reports scripts/summarize_results.py writes.
+    tag = "" if benchmark.name == "sparc" else f"{benchmark.name}_"
     out = args.out or (
-        f"results/json/baseline_{model.replace('/', '_')}_{args.split}_{stamp}.json")
+        f"results/json/baseline_{tag}{model.replace('/', '_')}_"
+        f"{args.split}_{stamp}.json")
     out_path = pathlib.Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(
@@ -176,6 +198,8 @@ async def main():
 
     print(f"\naccuracy={summary['accuracy']:.3f} ({summary['success']}/{summary['n']})  "
           f"by_difficulty={summary['accuracy_by_difficulty']}", flush=True)
+    if "accuracy_by_hops" in summary:
+        print(f"by_hops={summary['accuracy_by_hops']}", flush=True)
     print(f"tokens: prompt={summary['prompt_tokens']} completion={summary['completion_tokens']}  "
           f"wasted_on_retries={summary['retry_tokens']}  elapsed={elapsed:.1f}s", flush=True)
     if summary["errors"]:

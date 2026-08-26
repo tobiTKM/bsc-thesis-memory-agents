@@ -49,7 +49,6 @@ from datetime import datetime
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from datasets import load_dataset
 
 # The whole point of this driver is that MemoryBank differs from Memp in what a
 # memory SAYS, not in how the campaign is run -- so the plumbing is imported
@@ -57,16 +56,14 @@ from datasets import load_dataset
 # state checkpointing, client construction, the episode record shape, the
 # accuracy block, the exemplar builders, and the whole comparison stack.
 import run_memp as memp
-from run_memp import (accuracy_block, agent_exemplar, baseline_outcomes,
+from run_memp import (accuracy_block, agent_exemplar, baseline_outcomes, bench,
                       compare_row, episode_record, eval_outcomes, gold_exemplar,
-                      load_embeddings, make_client, mcnemar_exact, polyshapes_of,
-                      save_state, split_ids, verify_gold_paths)
+                      load_embeddings, make_client, mcnemar_exact,
+                      save_state, split_ids)
 
+from memory_agents.benchmarks import add_benchmark_args, build_benchmark
 from memory_agents.envs.base import EpisodeResult
-from memory_agents.envs.sparc import path_to_actions, puzzle_key_text, replay_path
-from memory_agents.harness.run import run_sparc_suite_memory_pass
 from memory_agents.memory import CaseDistiller, MemoryBankMemory
-from memory_agents.prompts import format_cases
 
 BANK_SCHEMA = "memorybank-bank-v1"      # == MemoryBankMemory.SCHEMA
 EVAL_SCHEMA = "memorybank-eval-v1"
@@ -122,6 +119,10 @@ async def run_distill(args) -> None:
         memory = MemoryBankMemory()
         cfg = {
             "schema": BANK_SCHEMA, "phase": "distill", "build": str(args.build),
+            "benchmark": bench().name, "key_fn": bench().key_fn,
+            "stepgame_train": args.stepgame_train,
+            "stepgame_test": args.stepgame_test,
+            "key_variant": args.key_variant,
             "rules_preamble": args.rules_preamble,
             "limit": args.limit or 0,
             "distill_max_tokens": args.distill_max_tokens,
@@ -133,7 +134,8 @@ async def run_distill(args) -> None:
         # per model exist at once and an eval job names its bank on the submit
         # line, where a wrong pick would be invisible until the results disagree.
         tag = "rp" if args.rules_preamble else "norp"
-        out = args.out or f"results/json/memorybank_bank_{tag}_{stamp}.json"
+        bm = "" if bench().name == "sparc" else f"{bench().name}_"
+        out = args.out or f"results/json/memorybank_bank_{bm}{tag}_{stamp}.json"
     cfg["concurrency"] = args.concurrency
 
     build = json.loads(pathlib.Path(cfg["build"]).read_text())
@@ -141,11 +143,8 @@ async def run_distill(args) -> None:
         raise SystemExit(f"--build expects a {BUILD_SCHEMA} file; "
                          f"{cfg['build']} is {build['config'].get('schema')!r}")
 
-    df = load_dataset("lkaesberg/SPaRC", "all", split="train").to_pandas()
-    row_of = {str(df["id"][i]): i for i in range(len(df))}
-
     if args.verify_gold:
-        verify_gold_paths(df, n=args.verify_gold)
+        bench().verify_gold("train", args.verify_gold)
 
     todo = sorted(pid for pid in build["puzzles"] if pid not in memory)
     if cfg["limit"]:
@@ -163,29 +162,26 @@ async def run_distill(args) -> None:
 
     async def distill_one(distiller, sem, pid):
         rec = build["puzzles"][pid]
-        row = df.iloc[row_of[pid]]
-        key_text = puzzle_key_text(row)
+        row = bench().record("train", pid)
+        key_text = bench().key_text(row)
         # Route on provenance, exactly as Memp does. A crashed episode has no
-        # episode_context, which is why the gold prompt reads dataset fields only.
+        # episode_context, which is why the gold prompt reads the record only.
         from_agent = bool(rec["success"] and rec.get("episode_context"))
-        polyshapes = polyshapes_of(row)
         async with sem:
             if from_agent:
                 episode = EpisodeResult.from_reflection_context(
                     rec["episode_context"], pid)
                 text, resp = await distiller.distill_from_trajectory(
-                    episode, key_text, polyshapes)
+                    episode, key_text, row)
             else:
-                gold_actions = path_to_actions(list(row["solutions"][0]["path"]))
-                text, resp = await distiller.distill_from_gold(
-                    key_text, row["text_visualization"], gold_actions, polyshapes)
+                text, resp = await distiller.distill_from_gold(key_text, row)
         return pid, from_agent, text, resp
 
     async def distill_pass(pids, seed):
         """One pass over `pids`; returns the pids whose reply came back empty."""
         distiller = CaseDistiller(
             make_client(cfg, cfg["distill_max_tokens"], seed),
-            rules_preamble=cfg["rules_preamble"])
+            rules_preamble=cfg["rules_preamble"], benchmark=bench())
         cfg.setdefault("model", distiller.client.model)
         cfg.setdefault("model_id",
                        os.environ.get("LLM_MODEL_ID") or distiller.client.model)
@@ -209,13 +205,13 @@ async def run_distill(args) -> None:
                         empties.append(pid)
                         continue
                     rec = build["puzzles"][pid]
-                    row = df.iloc[row_of[pid]]
+                    row = bench().record("train", pid)
                     memory.write(pid, {
                         "provenance": "agent" if from_agent else "gold",
                         # From the dataset, not the build record: a crashed
                         # episode reports difficulty -1.
-                        "difficulty": int(row["difficulty_level"]),
-                        "key_text": puzzle_key_text(row),
+                        "difficulty": bench().difficulty(row),
+                        "key_text": bench().key_text(row),
                         "case_note": text,
                         "exemplar": (agent_exemplar(row, rec["episode_context"])
                                      if from_agent else gold_exemplar(row)),
@@ -265,24 +261,36 @@ def attach_records(memory, out, cfg) -> None:
     Uniform across provenance, like Memp's upgrade phase: an agent entry replays
     the moves the model actually made, a gold entry the dataset's solution path.
     Idempotent, so a resumed distill only replays what is missing.
-    """
-    from memory_agents.envs.sparc import SparcEnv
 
+    On a single-turn benchmark there is no env to replay through: the verbatim
+    record is the item's question plus its worked derivation, which the benchmark
+    builds directly. This is not an optional granularity for MemoryBank but half
+    of what the paper stores, so the eval refuses `case-record` without it either
+    way.
+    """
     todo = [e for e in memory.entries if not e.get("trajectory")]
     if not todo:
         return
     print(f"[records] replaying {len(todo)} solutions for the verbatim records",
           flush=True)
-    env = SparcEnv(split="train")
+    interactive = bench().interactive
+    env = None
+    if interactive:
+        from memory_agents.envs.sparc import SparcEnv, replay_path
+        env = SparcEnv(split="train")
     attached = failed = solved = 0
     try:
         for e in todo:
-            actions = (e.get("exemplar") or {}).get("actions") or []
-            if not actions:
-                failed += 1
-                continue
             try:
-                traj = replay_path(env, e["source_pid"], actions)
+                if interactive:
+                    actions = (e.get("exemplar") or {}).get("actions") or []
+                    if not actions:
+                        failed += 1
+                        continue
+                    traj = replay_path(env, e["source_pid"], actions)
+                else:
+                    traj = bench().gold_trajectory(
+                        bench().record("train", e["source_pid"]))
             except Exception as exc:      # a bad exemplar must not kill the run
                 print(f"[records] {e['id']} ({e['source_pid']}): {exc!r}", flush=True)
                 failed += 1
@@ -291,7 +299,8 @@ def attach_records(memory, out, cfg) -> None:
             attached += 1
             solved += traj["terminal_reason"] == "solved"
     finally:
-        env.close()
+        if env is not None:
+            env.close()
     memory.stats["records_attached"] = memory.stats.get("records_attached", 0) + attached
     memory.stats["records_failed"] = memory.stats.get("records_failed", 0) + failed
     save_state(out, {**memory.to_dict(), "config": cfg})
@@ -328,7 +337,7 @@ def build_blocks(memory, arrays, cfg, test_ids):
             picks = memory.retrieve(arrays["test_vecs"][qrow[pid]], k)
         else:
             picks = memory.random_retrieve(k, seed_key=f"{seed}:{pid}")
-        blocks[pid] = format_cases([entry for entry, _sim in picks],
+        blocks[pid] = bench().format_cases([entry for entry, _sim in picks],
                                    granularity=granularity)
         retrieved_log[pid] = [
             {"id": entry["id"], "source_pid": entry["source_pid"],
@@ -358,10 +367,14 @@ async def run_eval(args) -> None:
             "top_p": args.top_p, "top_k": args.top_k,
             "max_tokens": args.max_tokens, "seed": args.seed,
             "granularity": args.granularity, "provenance": args.provenance,
+            "benchmark": bench().name, "key_variant": args.key_variant,
+            "stepgame_train": args.stepgame_train,
+            "stepgame_test": args.stepgame_test,
         }
         state = {"config": cfg, "puzzles": {}}
         stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-        out = args.out or (f"results/json/memorybank_eval_{cfg['arm']}_"
+        bm = "" if bench().name == "sparc" else f"{bench().name}_"
+        out = args.out or (f"results/json/memorybank_eval_{bm}{cfg['arm']}_"
                            f"{cfg['split']}_{stamp}.json")
     cfg["concurrency"] = args.concurrency
 
@@ -424,7 +437,7 @@ async def run_eval(args) -> None:
         for lo in range(0, len(todo), args.chunk):
             chunk = todo[lo:lo + args.chunk]
             t0 = time.time()
-            results = await run_sparc_suite_memory_pass(
+            results = await bench().run_memory_pass(
                 client, chunk, lambda pid: blocks[pid],
                 split=cfg["split"], concurrency=args.concurrency)
             for r in results:
@@ -626,6 +639,7 @@ async def main() -> None:
     ap.add_argument("--memp", default=None,
                     help="a memp_eval_*.json to contrast against (compare)")
     ap.add_argument("--out", default=None, help="output path")
+    add_benchmark_args(ap)
     args = ap.parse_args()
 
     # Which frozen knobs the user actually typed, so a resume can tell "left at
@@ -636,6 +650,17 @@ async def main() -> None:
     args.explicit = {k: k in typed for keys in FROZEN.values() for k in keys}
     args.limit = args.limit if args.limit > 0 else None
     args.rules_preamble = args.rules_preamble == "on"
+
+    # One benchmark per process, shared with the run_memp plumbing this driver
+    # imports (they read the same module-level BENCH). On --resume it comes from
+    # the state file: a resumed distill must keep rendering the key-fn and the
+    # prompts its partial bank was written with.
+    stored = memp._resumed_config(args)
+    memp.BENCH = build_benchmark(stored if stored else args)
+    if stored and stored.get("benchmark", "sparc") != getattr(args, "benchmark",
+                                                             "sparc"):
+        print(f"[memorybank] resuming a {stored.get('benchmark', 'sparc')} run; "
+              f"ignoring --benchmark {args.benchmark}", flush=True)
 
     if args.phase == "distill":
         await run_distill(args)

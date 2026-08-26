@@ -3,7 +3,6 @@ import os
 import pathlib
 
 from ..llm.client import LLMClient, LLMResponse
-from ..envs.sparc import parse_action
 
 # Where to append one JSON record per unparseable reply. Read lazily (not at import)
 # so a driver can set it after this module is already loaded.
@@ -38,10 +37,34 @@ def _log_format_failure(record: dict) -> None:
         pass  # diagnostics must never take the run down
 
 
+def _sparc_parse_action(reply):
+    """The default reply parser, imported lazily.
+
+    Lazily because `envs.sparc` pulls in gymnasium and Spatial_Gym, and a
+    single-turn benchmark (StepGame, LogicGame) needs neither -- nor does the
+    login node, where those are deliberately absent. Importing at module scope
+    made every driver that touches an agent depend on the SPaRC env stack.
+    """
+    from ..envs.sparc import parse_action
+    return parse_action(reply)
+
+
 class BaselineAgent:
-    def __init__(self, client, max_format_retries: int = MAX_FORMAT_RETRIES):
+    """The memoryless actor.
+
+    `parse_reply` maps a model reply to an action, or to None for a *format*
+    failure (malformed output, which is retried rather than counted as an
+    attempt). It is injected rather than imported so the same actor drives an
+    interactive grid benchmark and a single-turn QA one: SPaRC returns a
+    direction int, StepGame returns one of nine relation labels, and neither the
+    retry loop nor the failure log cares which.
+    """
+
+    def __init__(self, client, max_format_retries: int = MAX_FORMAT_RETRIES,
+                 parse_reply=None):
         self.client = client
         self.max_format_retries = max_format_retries
+        self.parse_reply = parse_reply or _sparc_parse_action
         self.messages: list[dict] = []
         self.label = None          # puzzle id, carried into the failure log
 
@@ -71,7 +94,7 @@ class BaselineAgent:
         retry_prompt = retry_completion = 0
         for attempt in range(self.max_format_retries):
             response = await self.client.chat(self.messages)
-            action = parse_action(response.text)
+            action = self.parse_reply(response.text)
             if action is not None:
                 break
             retry_prompt += response.prompt_tokens

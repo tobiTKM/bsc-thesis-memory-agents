@@ -38,7 +38,7 @@ class EpisodeResult:
                  transitions: list[Transition] | None = None,
                  first_obs: str = "", last_obs: str = "", terminal_reason: str = "",
                  aborted_prompt_tokens: int = 0, aborted_completion_tokens: int = 0,
-                 error: str = ""):
+                 error: str = "", extra: dict | None = None):
         self.puzzle_id = puzzle_id
         self.success = success
         self.terminated = terminated
@@ -60,6 +60,13 @@ class EpisodeResult:
         # Set only when the episode crashed (terminal_reason == "error"); see
         # errored_episode() in the harness.
         self.error = error
+        # Per-benchmark extras that belong in the RESULTS but not in the
+        # reflection context: StepGame puts the true hop count here (a second
+        # difficulty axis, see docs/stepgame.md section 2.2) along with the gold
+        # and predicted labels for error analysis. Deliberately NOT read by
+        # reflection_context() -- a reflector that could see `gold` would make
+        # the whole Reflexion arm meaningless.
+        self.extra = extra or {}
 
     def steps(self) -> int:
         return len(self.transitions)

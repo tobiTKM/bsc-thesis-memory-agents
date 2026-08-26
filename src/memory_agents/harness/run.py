@@ -1,12 +1,23 @@
 from ..agents.base import BaselineAgent
 from ..agents.memory_agent import MemoryAgent
 from ..envs.base import EpisodeResult, Transition, make_json_safe
-from ..envs.sparc import SparcEnv, format_obs, is_success
-from ..prompts import sparc_system_prompt
 
 import asyncio
-import yaml
-from datasets import load_dataset
+
+# The SPaRC env stack (gymnasium + Spatial_Gym) and `datasets` are imported inside
+# the SPaRC functions, not here. A single-turn benchmark needs none of them, and
+# neither does the login node where --phase compare is meant to run; importing
+# them at module scope made every driver that touches the harness depend on the
+# whole SPaRC stack being installed and importable.
+
+
+def _sparc_deps():
+    """The SPaRC-only imports, resolved on first use."""
+    import yaml
+    from datasets import load_dataset
+    from ..envs.sparc import SparcEnv, format_obs, is_success
+    from ..prompts import sparc_system_prompt
+    return SparcEnv, format_obs, is_success, sparc_system_prompt, load_dataset, yaml
 
 try:
     from tqdm.auto import tqdm
@@ -63,6 +74,7 @@ async def run_sparc_episode_baseline(env, agent, obs, info, puzzle_id):
     run_sparc_suite_baseline), not inside one. The same loop drives both the
     memoryless baseline and a Reflexion trial -- only the `agent` differs.
     """
+    _E, format_obs, is_success, _sp, _ld, _y = _sparc_deps()
     reward = 0.0
     transitions = []
     terminated = truncated = format_failed = False
@@ -135,6 +147,7 @@ async def run_sparc_suite_baseline(client, split="test", concurrency=32, limit=N
     once, which is exactly how many LLM calls are in flight against the server.
     Each episode also gets its own agent, since an agent owns one message list.
     """
+    SparcEnv, _fo, _is, sparc_system_prompt, load_dataset, yaml = _sparc_deps()
     ds = load_dataset("lkaesberg/SPaRC", "all", split=split)
     df = ds.to_pandas()
     n = len(df) if limit is None else min(limit, len(df))
@@ -197,6 +210,7 @@ async def run_sparc_suite_memory_pass(client, puzzle_ids, block_for, split="test
     came back empty). Deriving the set from the store would silently shrink the
     control arm to nothing and drop exactly the puzzles whose reflection failed.
     """
+    SparcEnv, _fo, _is, sparc_system_prompt, load_dataset, yaml = _sparc_deps()
     ds = load_dataset("lkaesberg/SPaRC", "all", split=split)
     df = ds.to_pandas()
     # id -> row index, so we can fetch the polyshapes for exactly the requested set.
@@ -235,4 +249,120 @@ async def run_sparc_suite_memory_pass(client, puzzle_ids, block_for, split="test
             results.append(await finished)
     finally:
         _drain_and_close(env_pool)
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# single-turn benchmarks (StepGame now, LogicGame next)
+# --------------------------------------------------------------------------- #
+# The two suites above drive an interactive env: each move needs the state the
+# env returned for the previous one, and concurrency comes from a pool of envs.
+# A single-turn benchmark has no env and no state to protect, so the pool is gone
+# and a plain semaphore caps in-flight calls. Everything downstream -- the
+# EpisodeResult shape, the token accounting, the format-failure retry loop, the
+# crash handling -- is shared, which is what keeps the two benchmarks comparable.
+
+# The reply text kept on the episode for a later reflection to read. Capped
+# because a thinking model's visible reply can run to thousands of tokens, and
+# every one of them would be re-sent inside the reflection prompt of every
+# subsequent trial.
+_REPLY_KEEP = 4000
+
+
+def _reply_text(response) -> str:
+    """What the model produced, for the reflection prompt.
+
+    Prefers the visible reply. Falls back to the tail of the stripped <think>
+    block when the visible part is a bare "Final: <label>" -- which is the normal
+    case for a reasoning model, and reflecting on "you answered left" with no
+    trace of *why* would ask the reflector to diagnose a decision it cannot see.
+    """
+    if response is None:
+        return ""
+    text = (response.text or "").strip()
+    if len(text) < 200 and (response.reasoning_text or "").strip():
+        tail = response.reasoning_text.strip()[-_REPLY_KEEP:]
+        return (f"{text}\n\n(reasoning leading to it)\n{tail}" if text else tail)
+    return text[:_REPLY_KEEP]
+
+
+def _single_turn_reason(success, format_failed) -> str:
+    if success:
+        return "solved"
+    if format_failed:
+        return "format-failure"    # never produced a parseable answer
+    return "wrong-answer"          # answered, but wrongly
+
+
+async def run_single_turn_episode(benchmark, agent, record):
+    """One item, one reply, one EpisodeResult.
+
+    The `terminated` / `truncated` pair keeps the same meaning it has on SPaRC:
+    terminated means the agent submitted something, truncated means the episode
+    was cut short without one. So a graded answer is terminated, and only a format
+    failure is truncated -- which is what lets summarize_results read both
+    benchmarks with the same code.
+    """
+    first_obs = benchmark.format_item(record)
+    extra = {"hops": benchmark.secondary_difficulty(record), "gold": record.gold}
+    action, response = await agent.act(first_obs)
+
+    if action is None:
+        # Every reply was unparseable. No Transition is appended, so the calls
+        # that burned the budget are charged to the episode here (retry_* already
+        # covers all of them, this response's own counts included).
+        return EpisodeResult(
+            puzzle_id=str(record.id), success=False, terminated=False,
+            truncated=True, difficulty=benchmark.difficulty(record),
+            transitions=[], first_obs=first_obs, last_obs=_reply_text(response),
+            terminal_reason="format-failure", extra={**extra, "predicted": None},
+            aborted_prompt_tokens=response.retry_prompt_tokens if response else 0,
+            aborted_completion_tokens=(response.retry_completion_tokens
+                                       if response else 0))
+
+    success = benchmark.grade(record, action)
+    transition = Transition(
+        step=0, action=action, reward=1.0 if success else 0.0,
+        legal_actions=[], rule_status={}, agent_location=None,
+        prompt_tokens=response.prompt_tokens,
+        completion_tokens=response.completion_tokens,
+        retry_prompt_tokens=response.retry_prompt_tokens,
+        retry_completion_tokens=response.retry_completion_tokens)
+    return EpisodeResult(
+        puzzle_id=str(record.id), success=success, terminated=True, truncated=False,
+        difficulty=benchmark.difficulty(record), transitions=[transition],
+        first_obs=first_obs, last_obs=_reply_text(response),
+        terminal_reason=_single_turn_reason(success, False),
+        extra={**extra, "predicted": action})
+
+
+async def run_single_turn_suite(benchmark, client, item_ids, block_for,
+                                split="test", concurrency=32):
+    """Run a single-turn benchmark over an explicit item set, `concurrency` at a time.
+
+    One function for both the memoryless pass and the memory-augmented one: the
+    baseline is `block_for = lambda _id: ""`, which makes MemoryAgent identical to
+    BaselineAgent (its own docstring says so). Unlike the SPaRC pair, there is no
+    reason to keep two versions -- there is no env pool whose lifetime differs.
+    """
+    todo = [str(i) for i in item_ids]
+    sem = asyncio.Semaphore(max(concurrency, 1))
+    system_prompt = benchmark.system_prompt(None)
+
+    async def run_one(item_id):
+        async with sem:
+            try:
+                record = benchmark.record(split, item_id)
+                agent = MemoryAgent(client, parse_reply=benchmark.parse_reply)
+                agent.reset(system_prompt, memory_block=block_for(item_id),
+                            label=item_id)
+                return await run_single_turn_episode(benchmark, agent, record)
+            except Exception as exc:
+                print(f"[error] item {item_id}: {exc!r}", flush=True)
+                return errored_episode(item_id, exc)
+
+    tasks = [asyncio.create_task(run_one(i)) for i in todo]
+    results = []
+    for finished in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+        results.append(await finished)
     return results

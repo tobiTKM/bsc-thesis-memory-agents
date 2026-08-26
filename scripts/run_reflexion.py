@@ -58,6 +58,10 @@ from datetime import datetime
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
+# Imported eagerly, unlike the model stack below: benchmarks.py pulls in nothing
+# heavier than pathlib at module scope, and --phase compare needs the flags too.
+from memory_agents.benchmarks import add_benchmark_args, build_benchmark  # noqa: E402
+
 # Only `root` and `arm` need the model stack; `compare` is pure JSON arithmetic and is
 # meant to run on the LOGIN node, which has neither numpy nor a working project venv
 # (the venv is built for the compute nodes and dies with an illegal instruction here).
@@ -66,13 +70,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 try:
     from memory_agents.config import resolve_server
     from memory_agents.envs.base import EpisodeResult
-    from memory_agents.harness.run import (
-        run_sparc_suite_baseline,
-        run_sparc_suite_memory_pass,
-    )
     from memory_agents.llm.client import LLMClient
     from memory_agents.memory import Reflector, ReflexionMemory
-    from memory_agents.prompts import format_reflections
     MODEL_STACK_ERROR = None
 except ImportError as exc:      # noqa: BLE001 - re-raised per phase in main()
     MODEL_STACK_ERROR = exc
@@ -82,8 +81,8 @@ SCHEMA = "reflexion-multitrial-v1"
 # Knobs that define what a run *is*. On --resume these come from the state file and
 # the CLI cannot override them: trials 6-10 silently running at a different
 # temperature (or against a different split) would corrupt the curve they extend.
-FROZEN = ("split", "limit", "temperature", "top_p", "top_k", "max_tokens",
-          "base_seed", "memory_cap")
+FROZEN = ("benchmark", "split", "limit", "temperature", "top_p", "top_k",
+          "max_tokens", "base_seed", "memory_cap")
 
 
 # --------------------------------------------------------------------------- #
@@ -238,8 +237,11 @@ def trial_block(trial: int, seed: int, results, state: dict, elapsed: float,
 # phase root: trial 1, shared by both arms
 # --------------------------------------------------------------------------- #
 async def run_root(args) -> None:
+    benchmark = build_benchmark(args)
     cfg = {
-        "schema": SCHEMA, "arm": "root", "split": args.split,
+        "schema": SCHEMA, "arm": "root", "benchmark": benchmark.name,
+        "stepgame_train": args.stepgame_train, "stepgame_test": args.stepgame_test,
+        "key_variant": args.key_variant, "split": args.split,
         "limit": args.limit or 0, "temperature": args.temperature,
         "top_p": args.top_p, "top_k": args.top_k, "max_tokens": args.max_tokens,
         "base_seed": args.seed, "memory_cap": args.memory_cap,
@@ -252,7 +254,7 @@ async def run_root(args) -> None:
           f"limit={args.limit} seed={seed} concurrency={args.concurrency}", flush=True)
     client = make_client(cfg, cfg["max_tokens"], seed)
     t0 = time.time()
-    results = await run_sparc_suite_baseline(
+    results = await benchmark.run_baseline_suite(
         client, split=cfg["split"], concurrency=args.concurrency, limit=args.limit)
     elapsed = time.time() - t0
     await client.aclose()
@@ -265,7 +267,8 @@ async def run_root(args) -> None:
     state["trials"].append(trial_block(1, seed, results, state, elapsed))
 
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-    out = args.out or f"results/json/reflexion_root_{cfg['split']}_{stamp}.json"
+    tag = "" if benchmark.name == "sparc" else f"{benchmark.name}_"
+    out = args.out or f"results/json/reflexion_root_{tag}{cfg['split']}_{stamp}.json"
     save_state(out, state)
 
     t1 = state["trials"][0]
@@ -361,7 +364,9 @@ def load_arm_state(args) -> tuple[dict, str]:
     state["config"]["root_file"] = str(args.root)
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
     out = args.out or (
-        f"results/json/reflexion_{args.arm}_{state['config']['split']}_{stamp}.json")
+        f"results/json/reflexion_{args.arm}_"
+        f"{'' if state['config'].get('benchmark', 'sparc') == 'sparc' else state['config']['benchmark'] + '_'}"
+        f"{state['config']['split']}_{stamp}.json")
     return state, out
 
 
@@ -370,6 +375,9 @@ async def run_arm(args) -> None:
     cfg = state["config"]
     arm = cfg["arm"]
     with_memory = arm == "memory"
+    # From the STATE, not the CLI: a resumed arm must run the benchmark and split
+    # files its curve was started on. `benchmark` is in FROZEN for the same reason.
+    benchmark = build_benchmark(cfg)
 
     # Frozen knobs come from the state, never the CLI: a resumed job must extend the
     # curve it is continuing, not start a differently-configured one halfway through.
@@ -407,7 +415,8 @@ async def run_arm(args) -> None:
             # Seeded per trial like the actor: a puzzle that repeats a trajectory and
             # whose reflection came back empty would otherwise re-send an identical
             # prompt at an identical seed and get the same empty reply forever.
-            reflector = Reflector(make_client(cfg, args.reflect_max_tokens, seed))
+            reflector = Reflector(make_client(cfg, args.reflect_max_tokens, seed),
+                                  benchmark=benchmark)
             try:
                 reflection_stats = await reflect_pass(
                     reflector, state, memory, todo, args.concurrency)
@@ -421,9 +430,9 @@ async def run_arm(args) -> None:
 
         # The two arms differ here and nowhere else.
         if with_memory:
-            def block_for(pid, _m=memory):
+            def block_for(pid, _m=memory, _b=benchmark):
                 items = _m.read(pid)
-                return format_reflections(items) if items else ""
+                return _b.format_reflections(items) if items else ""
         else:
             def block_for(pid):
                 return ""
@@ -433,7 +442,7 @@ async def run_arm(args) -> None:
               flush=True)
         client = make_client(cfg, cfg["max_tokens"], seed)
         t0 = time.time()
-        results = await run_sparc_suite_memory_pass(
+        results = await benchmark.run_memory_pass(
             client, todo, block_for, split=cfg["split"], concurrency=args.concurrency)
         elapsed = time.time() - t0
         await client.aclose()
@@ -613,6 +622,7 @@ async def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--phase", choices=["root", "arm", "compare"], required=True)
+    add_benchmark_args(ap)
     ap.add_argument("--arm", choices=["memory", "control"],
                     help="which arm to run (--phase arm)")
     ap.add_argument("--root", default=None, help="root JSON to start an arm from")

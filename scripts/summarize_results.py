@@ -97,17 +97,36 @@ def format_failures(summary: dict, replies: int) -> list:
 
 
 # ---- analysis ------------------------------------------------------------
-def block(episodes: list, indent: str) -> list:
-    """The per-puzzle stat block, used for the whole split and for each difficulty.
+# What terminated/truncated MEAN differs per benchmark, so the labels do too.
+# The arithmetic is identical -- they are reported over all episodes and sum to
+# 100% -- but printing "dead end, no legal move" next to a StepGame format
+# failure would describe a failure mode that benchmark does not have.
+_LABELS = {
+    "sparc": ("[reached the exit]",
+              "[dead end, no legal move]",
+              "[exit reached, rule broken]"),
+    "stepgame": ("[gave a parseable answer]",
+                 "[never produced a parseable answer]",
+                 "[answered, but wrongly]"),
+}
 
-    `terminated` and `truncated` are reported over *all* puzzles and sum to 100%:
-    in Spatial-Gym `terminated` means the agent reached the exit (wins are a
-    subset of it) and `truncated` means it had no legal action left, i.e. walked
-    into a dead end. The step cap also sets `truncated`, but episodes run ~15
-    steps against a cap of 100, so that never fires. So "failed at exit" below
-    is the rule-violation bucket, and the two failure modes the memory methods
-    have to attack are: lost the path (truncated) vs lost the rules.
+
+def block(episodes: list, indent: str, benchmark: str = "sparc") -> list:
+    """The per-puzzle stat block, used for the whole split and each difficulty.
+
+    `terminated` and `truncated` are reported over *all* puzzles and sum to 100%.
+    On SPaRC `terminated` means the agent reached the exit (wins are a subset of
+    it) and `truncated` means it had no legal action left, i.e. walked into a
+    dead end; the step cap also sets `truncated`, but episodes run ~15 steps
+    against a cap of 100, so that never fires. So "failed at exit" is the
+    rule-violation bucket, and the two failure modes the memory methods have to
+    attack are: lost the path (truncated) vs lost the rules.
+
+    On a single-turn benchmark the same two flags mean "submitted an answer" and
+    "never produced a parseable one", so the third bucket is simply a wrong
+    answer. Same arithmetic, different words.
     """
+    reached, cutoff, missed = _LABELS.get(benchmark, _LABELS["sparc"])
     n = len(episodes)
     wins = sum(1 for e in episodes if e.get("success"))
     term = sum(1 for e in episodes if e.get("terminated"))
@@ -124,9 +143,9 @@ def block(episodes: list, indent: str) -> list:
         f"{indent}total puzzles:        {n}",
         f"{indent}wins:                {share(wins, n)}",
         f"{indent}fails:               {share(n - wins, n)}",
-        f"{indent}terminated runs:     {share(term, n)}   [reached the exit]",
-        f"{indent}truncated runs:      {share(trunc, n)}   [dead end, no legal move]",
-        f"{indent}failed at exit:      {share(term - wins, n)}   [exit reached, rule broken]",
+        f"{indent}terminated runs:     {share(term, n)}   {reached}",
+        f"{indent}truncated runs:      {share(trunc, n)}   {cutoff}",
+        f"{indent}failed at exit:      {share(term - wins, n)}   {missed}",
         "",
         f"{indent}average_completion_tokens_per_puzzle:   [per model reply]",
         f"{indent}  {dist(per_reply)}",
@@ -299,12 +318,24 @@ def analyse(path: pathlib.Path) -> dict:
     by_diff = collections.defaultdict(list)
     for ep in episodes:
         by_diff[ep.get("difficulty", -1)].append(ep)
+    # StepGame's second difficulty axis: `difficulty` above is k, the story
+    # length, while `extra.hops` is the reasoning depth, and they are not the
+    # same thing (docs/stepgame.md section 2.2). Absent on SPaRC.
+    by_hops = collections.defaultdict(list)
+    for ep in episodes:
+        hops = (ep.get("extra") or {}).get("hops")
+        if hops is not None:
+            by_hops[int(hops)].append(ep)
+    benchmark = summary.get("benchmark") or (
+        "stepgame" if by_hops else "sparc")
     return {
         "path": path,
         "summary": summary,
         "episodes": episodes,
         "state": state,
+        "benchmark": benchmark,
         "by_diff": dict(sorted(by_diff.items())),
+        "by_hops": dict(sorted(by_hops.items())),
     }
 
 
@@ -400,7 +431,7 @@ def render(a: dict, top: int) -> str:
 
     w("")
     w("FULL RUN")
-    out.extend(block(eps, "  "))
+    out.extend(block(eps, "  ", a.get("benchmark", "sparc")))
     # replies = one per step, plus every retry that had to be thrown away
     replies = sum(e.get("steps", 0) for e in eps) + (s.get("format_failures") or {}).get("n", 0)
     out.extend(format_failures(s, replies))
@@ -414,20 +445,41 @@ def render(a: dict, top: int) -> str:
         w(f"  wasted on retries:   {share(s['retry_tokens'], total)} of all tokens"
           f"   [replies that yielded no move]")
 
+    bm = a.get("benchmark", "sparc")
+    axis = "k (story length)" if bm == "stepgame" else "Difficulty"
+
     w("")
-    w("BY DIFFICULTY")
+    w("BY DIFFICULTY" if bm != "stepgame" else "BY k  (story length)")
     for d, group in a["by_diff"].items():
-        w(f"  Difficulty {d}")
-        out.extend(block(group, "    "))
+        w(f"  {axis} {d}")
+        out.extend(block(group, "    ", bm))
         w("")
+
+    if a.get("by_hops"):
+        # The honest difficulty axis on StepGame: k counts sentences, this counts
+        # the hops actually separating the two queried objects.
+        w("BY HOPS  (true reasoning depth)")
+        for h, group in a["by_hops"].items():
+            w(f"  hops {h}")
+            out.extend(block(group, "    ", bm))
+            w("")
 
     if top:
         solved = [e for e in eps if e.get("success")]
-        hardest = sorted(solved, key=lambda e: (-e.get("difficulty", 0), e.get("steps", 0)))
+        # Rank by hops where they exist: on StepGame a k=10 item can be one hop,
+        # so ranking "hardest solved" by k would surface trivial items.
+        def hardness(e):
+            hops = (e.get("extra") or {}).get("hops")
+            return (-(hops if hops is not None else e.get("difficulty", 0)),
+                    e.get("steps", 0))
+        hardest = sorted(solved, key=hardness)
         if hardest:
             w(f"HARDEST SOLVED (top {min(top, len(hardest))})")
             for e in hardest[:top]:
-                w(f"  {e['puzzle_id']}  diff {e.get('difficulty')}  "
+                hops = (e.get("extra") or {}).get("hops")
+                depth = (f"diff {e.get('difficulty')}" if hops is None
+                         else f"k {e.get('difficulty')} / {hops} hops")
+                w(f"  {e['puzzle_id']}  {depth}  "
                   f"{e.get('steps')} steps  {e.get('completion_tokens', 0):,} completion tokens")
             w("")
 
