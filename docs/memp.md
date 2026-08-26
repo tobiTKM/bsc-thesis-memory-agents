@@ -159,7 +159,9 @@ On Qwen3-32B, memory trades wrong-solutions for dead-ends (210→179/196, but
 235→270/280+35) and the trade is a net loss: fewer invalid submissions, far more
 stalls, and solved count drops by a third. On gpt-oss both failure modes shrink a
 little and the freed attempts become solves — the same trade Reflexion showed, but at
-much smaller magnitude here because (see §3.5) the injected content is often wrong.
+much smaller magnitude. §3.5 attributes that to the injected content often being wrong;
+§3.9 tests that attribution directly and refutes it, and gives the mechanism instead
+(the script moves rule compliance, not navigation, and navigation is the larger pool).
 
 ### 3.4 Why relevance doesn't matter: retrieval was not the problem
 
@@ -177,9 +179,13 @@ Retrieval hit the exact rule combination 27× more often than chance, and it did
 matter (§3.1: 86 vs 87 solved). Relevance was achieved and changed nothing — so the
 ceiling on this method is not in the retriever.
 
-### 3.5 Why: the memory itself is often wrong
+### 3.5 The memory itself is often wrong
 
-Reading the bank shows why relevance didn't help. Every train puzzle with a square or
+> Originally titled "Why: the memory itself is often wrong". It measures a real defect,
+> but the causal claim in the title did not survive testing — §3.9 repairs the defect and
+> shows accuracy barely moves. Read this section as a measurement, not an explanation.
+
+Reading the bank shows what the retrieved content actually contains. Every train puzzle with a square or
 star rule was checked for whether its distilled script frames it correctly — SPaRC's
 actual rule is a **region/colour constraint** (same-colour squares must share a
 region, the path goes *around* rule cells) — against the common error of describing it
@@ -270,9 +276,16 @@ trace teaches navigation, not rules, so it does not reduce rule violations at al
 
 **The script contributes nothing on top of the trajectory.** Proceduralization beats
 Trajectory by one puzzle (p = 1.00). This diverges from the paper, where
-Proceduralization clearly wins, and it is exactly what §3.5 predicts: the LLM-written
-abstraction is often wrong, the mechanically-extracted trace is correct by
-construction. On SPaRC the concrete example carries the entire effect.
+Proceduralization clearly wins.
+
+> **Superseded explanation.** This section originally attributed that to §3.5: the
+> LLM-written abstraction is often wrong, the mechanically-extracted trace is correct by
+> construction. §3.9 tested that explanation by making the script rule-correct and
+> **refuted it** — a rule-correct script adds nothing on top of the trajectory either
+> (103 → 105, p = 0.89). The conclusion survives on stronger evidence, but the reason is
+> not rule-correctness. See §3.9.
+
+On SPaRC the concrete example carries the entire effect.
 
 **Neither more retrieval nor better retrieval helps at script granularity.** k=10 adds
 nothing over k=3 (89 vs 86, +3, not significant against script k=3). AveFact — the
@@ -323,6 +336,101 @@ Zero empty or failed distillations across all three banks. Every bank is
 overwhelmingly gold-path hindsight (86–98% of entries), because train-split accuracy
 is low for all three models — this is a real departure from the paper's build-from-
 success-only design, addressed directly by the agent-only ablation in §3.6.
+
+### 3.9 The v2 campaign: giving the distiller the rules
+
+§3.5 measured that the banks misstate SPaRC's rules; it did not explain why. The cause
+was in the prompt. Neither `memp_distill_trajectory_prompt` nor
+`memp_distill_gold_prompt` ever contained the rulebook — they showed the model cell
+labels and a move sequence and asked *why this path is correct*, while the "Detailed
+Solving Rules" block the actor reads lived only in `sparc_system_prompt`. The distiller
+had to reverse-engineer the mechanics from labels, and it reliably guessed a
+Hamiltonian-path model: squares/stars/polys as cells to "visit", and the key text's
+census line (`rules: square x3`, i.e. how many square *cells* exist) as a per-cell visit
+count.
+
+**The fix.** `sparc_system_prompt` was split into `sparc_rules(polyshapes)` + the I/O
+contract, and `distill_rules_preamble()` now prepends the verbatim rules to every prompt
+that *writes* a procedure (both distil variants and the revise step). The I/O contract is
+deliberately excluded — a distiller told to end with `Final: <digit>` would answer a
+procedure request with a move. The actor's own prompt is unchanged, byte for byte, so
+every number in §3.1–3.8 stays comparable. `scripts/audit_bank.py` makes §3.5's ad-hoc
+measurement reproducible; the two campaigns below are scored under one definition.
+
+**Manipulation check.** The intervention worked, and it is not a lexical artifact —
+spot-reading confirms entries that previously invented "stars must turn on entry and
+exit" now state the actual pairing rule.
+
+| Bank | region-framed ✓ | "visit the square" ✗ | census-as-count ✗ | few-shot copies |
+|---|---|---|---|---|
+| Qwen3-0.6B | 99.8 → 98.8 | 1.2 → 1.2 | 0.4 → 0.4 | 194 → **342** |
+| Qwen3-32B | 31.7 → **100.0** | 62.0 → **5.1** | 3.8 → 9.2 | 0 → 0 |
+| gpt-oss-120b | 50.7 → **99.8** | 71.8 → **10.2** | 25.0 → **4.6** | 0 → 0 |
+
+Qwen3-0.6B is the exception that proves §3.5's reading of it: its 98.8% is not
+comprehension but copying, and the longer prompt made that *worse* — 342/500 of its
+scripts are now near-verbatim copies of the few-shot example.
+
+**It did not rescue the method.** All arms k=3, script, retrieved, full test split;
+build files and embeddings reused unchanged, so the distillation prompt is the only
+thing that moved.
+
+| Actor / bank | baseline | v1 | v2 | v1 → v2 |
+|---|---|---|---|---|
+| gpt-oss, own bank | 70 | 86 (p=0.060) | **90** (p=0.0225) | +4, p=0.71 |
+| gpt-oss, agent-only (71 entries) | 70 | 80 (p=0.229) | **90** (p=0.0119) | +10, p=0.27 |
+| Qwen3-32B, own bank | 55 | 40 (p=0.036) | **40** (p=0.036) | **0**, p=1.00 |
+| Qwen3-32B, gpt-oss bank | 55 | — | **35** (p=0.0022) | — |
+| Qwen3-0.6B, own bank | 14 | 14 | **19** (p=0.42) | +5, p=0.40 |
+| Qwen3-0.6B, gpt-oss bank | 14 | 16 | **17** (p=0.68) | +1, p=1.00 |
+
+Qwen3-32B is the decisive case: its bank went from 31.7% to 100% rule-correct and it
+solved *exactly* 40 puzzles both times, still significantly worse than memoryless. A
+rule-correct donor bank makes it worse still (35/500, p=0.0022) — transfer remains
+non-replicating, and now significantly harmful.
+
+**What the fix did change is legible, and it is not accuracy.** Failure modes on
+gpt-oss, Δ against the 70/500 memoryless baseline:
+
+| Arm | Solved | Wrong-sol | Dead-end | Δwrong | Δdead |
+|---|---|---|---|---|---|
+| baseline | 70 | 203 | 227 | — | — |
+| script v1 (rule-wrong) | 86 | 192 | 222 | −11 | −5 |
+| script v2 (rule-correct) | 90 | 180 | 229 | **−23** | +2 |
+| trajectory | 102 | 240 | 156 | +37 | **−71** |
+| proceduralization v1 (rule-wrong script) | 103 | 215 | 181 | +12 | −46 |
+| proceduralization v2 (rule-correct script) | **105** | 225 | 166 | +22 | −61 |
+
+The two components fix **different failure modes**. A rule-correct script buys rule
+compliance and nothing on navigation (wrong −23, dead +2); the trajectory buys
+navigation and *costs* rule compliance (wrong +37, dead −71). Making the bank more
+rule-correct doubled the rule-compliance benefit exactly as one would predict
+(−11 → −23) — it simply does not convert into solves, because dead-ends are the larger
+failure pool and the script does nothing about them. The same mechanism explains
+Qwen3-32B's harm, previously unexplained: memory makes it markedly more rule-careful
+(wrong −50) and markedly more prone to stalling (dead +65), for a net −15.
+
+**And the components do not compose.** Proceduralization v2 is the strongest arm in the
+campaign at 105/500 (p < 0.0001 vs baseline) but is statistically indistinguishable from
+both of its neighbours:
+
+| Contrast | Net | p |
+|---|---|---|
+| proc-v2 vs proc-v1 | +2 | 0.89 |
+| proc-v2 vs trajectory alone | +3 | 0.80 |
+| proc-v2 vs script-v2 | +15 | 0.11 |
+
+The prediction going in was that a rule-correct script would push wrong-solutions below
+proc-v1's 215 while the trajectory held dead-ends near 181. Wrong-solutions went *up*, to
+225, and dead-ends fell to 166 — proc-v2's profile shifted **toward** the pure-trajectory
+shape. In context together, the trajectory dominates and the script's rule-compliance
+contribution disappears. This is a clean single-factor test: `rerun_memp_v2.sh verify`
+confirms the v1 and v2 trajectory banks carry **500/500 identical trajectories and 0/500
+identical scripts**, so the script is provably the only difference between the two
+proceduralization arms.
+
+**Cost.** The rulebook roughly triples distillation prompt tokens (0.40M → 1.11M per
+model); completion tokens rise 20–75%. Negligible against eval.
 
 ---
 
@@ -397,20 +505,25 @@ for how many comparisons were run.
    cosine similarity, random sampling, AveFact keyword matching, k=3 vs k=10 — no
    retrieval policy ever significantly beat any other. The retriever reliably finds
    the exact rule-matched procedure (65% vs 2% for random) and it does not matter.
-3. **The content of the memory is frequently wrong**, and this is *why* relevance
-   doesn't help: 33–51% of entries in the two larger banks misstate SPaRC's square/star
-   rule as a visit target rather than a region constraint, and matching a puzzle to a
-   wrong procedure about the right rules buys nothing over a wrong procedure about
-   different rules.
+3. **The content of the memory is frequently wrong** — 33–51% of entries in the two
+   larger banks misstate SPaRC's square/star rule as a visit target rather than a region
+   constraint — **but that is not why memory underperforms.** The cause was a prompt
+   defect (the distiller was never shown the rulebook); fixing it made the banks
+   99.8–100% rule-correct and moved accuracy by +4 on gpt-oss (p = 0.71) and by exactly
+   0 on Qwen3-32B. Memory content being *correct* is necessary for nothing measured
+   here. See §3.9.
 4. **Granularity is the one intervention that produced a large, robust effect.**
    Replacing the compressed action-list exemplar with the verbatim round-by-round
    trajectory more than doubled the gain over baseline (+16 → +32 puzzles) and is the
    only change in this campaign that survives multiple-comparisons correction.
 5. **The mechanism is legible and specific.** The trajectory helps by preventing
-   dead-ends (227→156), not by teaching rules (wrong-solutions actually rise). It works
-   precisely because it is mechanically extracted and cannot misstate a rule, unlike
-   the LLM-written script sitting right next to it in the proceduralization arm, which
-   adds nothing.
+   dead-ends (227→156), not by teaching rules (wrong-solutions actually rise). The
+   script does the opposite — a rule-correct one cuts wrong-solutions by 23 and moves
+   dead-ends by +2 — and dead-ends are the larger failure pool, which is why only the
+   trajectory shows up in the accuracy column. Put both in context and the trajectory
+   dominates: the script's rule-compliance benefit vanishes (§3.9). The earlier claim
+   that the trajectory wins *because* it cannot misstate a rule has been tested and
+   refuted; it wins because it teaches navigation, and nothing else on offer does.
 6. **The paper's transfer claim does not replicate** at script granularity — a
    stronger model's memory does not measurably help a weaker one on SPaRC.
 7. **It is not free.** The trajectory arms cost 14–33% more tokens per solve than the
@@ -422,19 +535,27 @@ for how many comparisons were run.
   repeats — several of the surviving results (e.g. AveFact just missing the Holm
   threshold) are close enough that a repeat run could move them across the line either
   way.
-- **The rule-error rates (§3.5) are a regex proxy**, not a hand-labelled audit; the
-  direction is corroborated by direct reading of sampled entries, but a precise
-  percentage would need manual annotation.
+- **The rule-error rates (§3.5, §3.9) are a regex proxy**, not a hand-labelled audit;
+  the direction is corroborated by direct reading of sampled entries, but a precise
+  percentage would need manual annotation. `scripts/audit_bank.py` at least makes the
+  proxy reproducible and applies one definition to both campaigns, so the *before/after*
+  comparison is sound even where an absolute figure is not.
 - **The agent-only ablation (§3.6) changes two factors at once** (provenance and bank
-  size), so its negative result cannot be attributed to provenance alone.
-- **No random-trajectory control exists.** The retrieved-vs-random ablation (§3.4) was
-  only measured at script granularity. It is not yet known whether the trajectory
-  arms' +32 puzzles requires a *relevant* trajectory or merely the presence of *any*
-  correct worked example — the single most informative run still missing from this
-  campaign.
+  size), so its negative result cannot be attributed to provenance alone. On the v2
+  bank the two arms *tie* exactly (90 vs 90, wrong-solutions 180 in both), which is a
+  cleaner statement than v1's loss but does not remove the confound.
+- **No random-trajectory control exists yet** — the single most informative run still
+  missing. The retrieved-vs-random ablation (§3.4) was measured only at script
+  granularity, the component §3.6 and §3.9 both show to be inert, so it could not have
+  detected a retrieval effect even had one existed. It is still unknown whether the
+  trajectory arms' +32 requires a *relevant* trajectory or merely *any* correct worked
+  example. If random matches retrieved here, Memp on SPaRC reduces to few-shot
+  prompting rather than memory. *(Queued: `rerun_memp_v2.sh randtraj`, gpt-oss, same
+  bank as the retrieved-trajectory run so the arm is the only difference.)*
 - **The three Update-stage arms (Vanilla, Validation, Adjustment) are implemented but
-  not yet run.** Adjustment in particular is the paper's best-performing policy and the
-  only mechanism in the framework that could correct a rule-wrong procedure once
-  identified — directly relevant to the §3.5 finding.
+  not yet run.** Adjustment was motivated as the only mechanism that could repair a
+  rule-wrong procedure once identified — but §3.9 removes rule-wrongness at the source
+  and shows it was not the binding constraint, so this is now paper-completeness rather
+  than a live hypothesis.
 - **Transfer was tested at script granularity only** (§3.7), which §3.6 shows to be
   the inert component; a trajectory-granularity transfer test has not been run.

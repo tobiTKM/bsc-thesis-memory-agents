@@ -7,7 +7,8 @@ benchmark: the **declarative** arm of the thesis, alongside Reflexion (episodic,
 Reflexion trial 1 (`results/json/reflexion_root_*`), the same memoryless pass Memp
 compares against.
 
-**Status:** implemented, campaign not yet run. Sections 3–5 are scaffolding to be
+**Status:** banks built for all three models (§4.6-4.7); the 12 eval arms are queued as of
+2026-08-26. Sections 4.1-4.5 are scaffolding to be
 filled as jobs finish; everything before them is fixed by the design.
 
 ---
@@ -213,8 +214,55 @@ trajectory 102/500, proceduralization 103/500.
 
 ### 4.6 Bank construction
 
-| Model | Bank | Entries | Agent / gold | Records attached | Distill tokens |
-|---|---|---|---|---|---|
+All six banks built 2026-08-25/26 (jobs 15475825-30), distilled from the existing Memp
+train passes. Every bank is complete and structurally clean:
+
+| Model | Entries | Agent / gold | Records attached (all replays solved) | Empty | Failed | Mean note length |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B rp | 500 | 9 / 491 | 500 (500) | 0 | 0 | 58 w |
+| Qwen3-0.6B norp | 500 | 9 / 491 | 500 (500) | 0 | 0 | 49 w |
+| Qwen3-32B rp | 500 | 41 / 459 | 500 (500) | 0 | 0 | 93 w |
+| Qwen3-32B norp | 500 | 41 / 459 | 500 (500) | 0 | 0 | 96 w |
+| gpt-oss-120b rp | 500 | 71 / 429 | 500 (500) | 0 | 0 | 115 w |
+| gpt-oss-120b norp | 500 | 71 / 429 | 500 (500) | 0 | 0 | 106 w |
+
+Provenance matches the source build files exactly, and 500/500 replays reached a solved
+state in every bank — so every stored record is a genuine winning line, and the bank is
+overwhelmingly gold-path hindsight (86-98%), exactly as Memp's is. Distill wall-clock was
+13-37 min per bank.
+
+### 4.7 Does the rules preamble change the case notes? (pre-eval, bank-level)
+
+Measured before spending any eval hours, over the 432 entries whose puzzle carries a
+square or star rule. **`scripts/audit_bank.py`'s regexes are unreliable here** and its raw
+numbers should not be compared against Memp's: they were written for procedures that
+assert rules in the imperative, and they misfire on past-tense narrative — a polyshape's
+shape id (`polyshape (816)`) reads as a visit count, and the correct phrase "passes
+through dots and avoids polyshapes" trips the visit pattern. The table below uses patterns
+written for narrative text instead, and was corroborated by reading samples:
+
+| Bank | says the path went **around** rule cells | says it **visited** them (wrong) |
+|---|---|---|
+| Qwen3-0.6B norp → rp | 13.2% → **50.7%** | 0.2% → 3.2% |
+| Qwen3-32B norp → rp | 36.1% → **88.0%** | 6.9% → **0.5%** |
+| gpt-oss-120b norp → rp | 21.5% → **62.0%** | 6.9% → **1.2%** |
+
+The preamble substantially improves how well-grounded the recollections are, and on the
+two larger models it also removes the classic error. Direct reading confirms the
+mechanism — the same gpt-oss train puzzle, both variants:
+
+> **norp:** "...swept left across the bottom row to **visit** the green poly, the yellow
+> square and the dot..."  ← wrong: the path goes *around* squares and polys
+>
+> **rp:** "...dropped down **around** the blue polyshape, swept across the bottom of the
+> grid, rose up the right side to **thread between** the yellow square and the green
+> poly..."  ← correct
+
+Both variants nonetheless produce coherent, concrete, un-procedural case notes, so neither
+bank is broken and both proceed to eval. Whether better rule grounding translates into
+*accuracy* is the open question the eval arms answer — Memp's campaign is a warning that it
+may not, since there the rule-correct v2 scripts still left the retrieved arm inert.
+
 
 ---
 

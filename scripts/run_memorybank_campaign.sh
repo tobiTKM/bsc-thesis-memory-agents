@@ -52,10 +52,15 @@ ENVX="HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
 
 EMB=results/json/memp_embeddings_qwen3emb06b.npz
 
+# Eval time limits are sized from the observed Memp v2 eval runtimes (qwen06b
+# 1:51, qwen32b 10:34, gptoss 3:04) plus headroom, because MemoryBank's
+# case-record blocks are ~1.7k tokens against Memp's ~1k. Kept as tight as that
+# allows on purpose: on a saturated partition an oversized limit blocks backfill,
+# and the eval checkpoints every chunk, so an overrun resumes with RESUME=.
 # tag           MODEL                    TP  GPUS       extra serve env         eval time
 MODELS=(
-  "qwen06b|Qwen/Qwen3-0.6B|1|A100:1||04:00:00"
-  "qwen32b|Qwen/Qwen3-32B|2|A100:2||12:00:00"
+  "qwen06b|Qwen/Qwen3-0.6B|1|A100:1||03:00:00"
+  "qwen32b|Qwen/Qwen3-32B|2|A100:2||16:00:00"
   "gptoss120b|openai/gpt-oss-120b|4|A100:4|REASONING_PARSER=openai_gptoss|06:00:00"
 )
 # on -> rp, off -> norp. The variant is in every bank and eval filename: two banks

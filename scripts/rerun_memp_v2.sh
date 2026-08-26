@@ -157,6 +157,35 @@ OUT=results/json/memp_eval_gran_proceduralization_gptoss120b_v2.json \
     echo "submitted proceduralization (gpt-oss, v2 rule-correct bank + trajectories)"
     ;;
 
+  randtraj)
+    # The random-trajectory control: docs/memp.md's own "single most informative run
+    # still missing from this campaign", and round 2 made it decisive.
+    #
+    # We now know the trajectory carries the ENTIRE Memp effect on SPaRC (the script
+    # adds nothing whether it is rule-wrong or rule-correct). What has never been
+    # tested is whether that effect needs a RELEVANT trajectory or merely any correct
+    # worked example. Section 3.4 answered retrieved-vs-random at script granularity
+    # (86 vs 87) -- but script turned out to be inert, so that test could not have
+    # detected a retrieval effect even if one existed.
+    #
+    #   retrieved >> random  ->  retrieval matters; this is memory.
+    #   retrieved ~= random  ->  retrieval contributes nothing; Memp on SPaRC reduces
+    #                            to few-shot prompting with any solved example.
+    #
+    # Deliberately uses the SAME bank file as the existing retrieved-trajectory run
+    # (the v1 _traj bank, not v2_traj) so the arm is the only thing that differs.
+    # The `verify` stage proved the two render identically at this granularity, so
+    # nothing is lost by matching v1 exactly.
+    BANK=results/json/memp_bank_gptoss120b_traj.json
+    [[ -f "$BANK" ]] || { echo "missing $BANK" >&2; exit 1; }
+    sbatch -J memp-randtraj-gptoss120b -G A100:4 -t 08:00:00 \
+      --export=ALL,$ENVX,DRIVER=memp,PHASE=eval,MODEL=openai/gpt-oss-120b,TP=4,REASONING_PARSER=openai_gptoss,\
+ARM=random,LIMIT=0,GRANULARITY=trajectory,BANK=$BANK,EMBEDDINGS=$EMB,\
+OUT=results/json/memp_eval_gran_trajectory_random_gptoss120b.json \
+      scripts/serve_and_run.sbatch
+    echo "submitted random-trajectory control (gpt-oss, same bank as the retrieved run)"
+    ;;
+
   verify)
     # Is the v2 trajectory rendering really identical to v1's? If yes, the v1
     # trajectory arm (102/500) transfers as a reference point and needs no re-run.
