@@ -76,22 +76,27 @@ class CaseDistiller:
     bank's config by the driver so the two can never be mixed.
     """
 
-    def __init__(self, client, rules_preamble: bool = True):
+    def __init__(self, client, rules_preamble: bool = True, benchmark=None):
         self.client = client
         self.rules_preamble = rules_preamble
+        self.benchmark = benchmark
 
-    async def distill_from_trajectory(self, episode, key_text: str, polyshapes=None):
+    def _bench(self):
+        if self.benchmark is None:
+            from ..benchmarks import SparcBenchmark
+            self.benchmark = SparcBenchmark()
+        return self.benchmark
+
+    async def distill_from_trajectory(self, episode, key_text: str, record=None):
         """Case note from the agent's own solved episode."""
-        prompt = memorybank_case_trajectory_prompt(
-            episode, key_text, polyshapes, rules_preamble=self.rules_preamble)
+        prompt = self._bench().case_trajectory_prompt(
+            episode, key_text, record, rules_preamble=self.rules_preamble)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response
 
-    async def distill_from_gold(self, key_text: str, text_visualization: str,
-                                gold_actions: list, polyshapes=None):
-        """Case note from the dataset's gold path (hindsight, for failed puzzles)."""
-        prompt = memorybank_case_gold_prompt(
-            key_text, text_visualization, gold_actions, polyshapes,
-            rules_preamble=self.rules_preamble)
+    async def distill_from_gold(self, key_text: str, record=None):
+        """Case note from the task's gold solution (hindsight, for failed items)."""
+        prompt = self._bench().case_gold_prompt(
+            key_text, record, rules_preamble=self.rules_preamble)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response

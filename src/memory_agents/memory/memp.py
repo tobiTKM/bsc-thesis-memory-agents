@@ -237,26 +237,34 @@ class Distiller:
     so the driver can tally distillation tokens as part of Memp's build cost.
     """
 
-    def __init__(self, client):
+    def __init__(self, client, benchmark=None):
         self.client = client
+        # Which task's distill prompts to write. Required for anything but SPaRC;
+        # None keeps the historical SPaRC path for existing callers.
+        self.benchmark = benchmark
 
-    async def distill_from_trajectory(self, episode, key_text: str, polyshapes=None,
+    def _bench(self):
+        if self.benchmark is None:
+            from ..benchmarks import SparcBenchmark
+            self.benchmark = SparcBenchmark()
+        return self.benchmark
+
+    async def distill_from_trajectory(self, episode, key_text: str, record=None,
                                       succeeded: bool = True):
         """Procedure from an agent episode (a success, unless Vanilla says otherwise).
 
-        `polyshapes` is that puzzle's shape table, so the prepended rulebook is the
-        same one the actor solved under -- see prompts.distill_rules_preamble.
+        `record` is the benchmark's per-item record. The benchmark turns it into
+        whatever its prompt needs -- on SPaRC that is the puzzle's shape table, so
+        the prepended rulebook is the same one the actor solved under.
         """
-        prompt = memp_distill_trajectory_prompt(episode, key_text, polyshapes,
-                                                succeeded=succeeded)
+        prompt = self._bench().distill_trajectory_prompt(
+            episode, key_text, record, succeeded=succeeded)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response
 
-    async def distill_from_gold(self, key_text: str, text_visualization: str,
-                                gold_actions: list, polyshapes=None):
-        """Procedure from the dataset's gold path (hindsight, for failed puzzles)."""
-        prompt = memp_distill_gold_prompt(key_text, text_visualization, gold_actions,
-                                          polyshapes)
+    async def distill_from_gold(self, key_text: str, record=None):
+        """Procedure from the task's gold solution (hindsight, for failed items)."""
+        prompt = self._bench().distill_gold_prompt(key_text, record)
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response
 

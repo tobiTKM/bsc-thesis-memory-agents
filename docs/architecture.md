@@ -331,7 +331,11 @@ retries empty replies once at `seed+1`. The bank's distillation token cost lands
 
 ### 5.2 MemoryBank (Zhong et al., 2024 — declarative memory)
 
-Implemented; see `docs/memorybank.md` for the campaign and results.
+Implemented and run; see `docs/memorybank.md` for the full campaign. Headline: declarative
+memory helps gpt-oss-120b substantially (70 → 89-98/500, best arm p=0.0011), hurts
+Qwen3-32B, and is flat on Qwen3-0.6B — and retrieved is indistinguishable from random in
+all six pairings, MemoryBank from MemP in all six contrasts, and the rules-preamble
+ablation moves accuracy nowhere despite markedly improving the notes' rule correctness.
 
 The paper stores each past **interaction** twice — the conversation kept verbatim (its
 "in-depth memory storage") and an LLM-written **event summary** of it — and recalls the

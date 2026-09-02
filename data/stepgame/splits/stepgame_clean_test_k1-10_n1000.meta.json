@@ -1,0 +1,49 @@
+{
+  "variant": "clean",
+  "split": "test",
+  "ks": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "stratify": "k",
+  "per_bucket": 100,
+  "seed": 0,
+  "n": 1000,
+  "by_k": {
+    "1": 100,
+    "2": 100,
+    "3": 100,
+    "4": 100,
+    "5": 100,
+    "6": 100,
+    "7": 100,
+    "8": 100,
+    "9": 100,
+    "10": 100
+  },
+  "by_hops": {
+    "1": 406,
+    "2": 233,
+    "3": 125,
+    "4": 91,
+    "5": 61,
+    "6": 38,
+    "7": 23,
+    "8": 14,
+    "9": 5,
+    "10": 4
+  },
+  "dropped": 0,
+  "dropped_detail": [],
+  "key_fn": "stepgame-key-v1",
+  "solver_verified": true,
+  "source_commit_manifest": "/mnt/vast-standard/home/t.mark/u21167/bsc_thesis/bsc-thesis-memory-agents/data/stepgame/raw/MANIFEST.json"
+}

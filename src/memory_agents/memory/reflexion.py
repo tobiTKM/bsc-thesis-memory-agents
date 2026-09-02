@@ -65,8 +65,12 @@ class Reflector:
     (usually a smaller max_tokens) than the actor without coupling the two.
     """
 
-    def __init__(self, client):
+    def __init__(self, client, benchmark=None):
         self.client = client
+        # Which task's reflection prompt to write. None keeps the historical SPaRC
+        # behaviour so existing callers are unaffected; SparcBenchmark forwards to
+        # the same prompts.reflexion_reflection_prompt either way.
+        self.benchmark = benchmark
 
     async def reflect(self, episode, previous=()):
         """Return (reflection_text, LLMResponse) for a failed episode.
@@ -80,6 +84,8 @@ class Reflector:
         decides whether to store it. The LLMResponse is handed back so the driver
         can tally reflection-generation tokens as part of Reflexion's cost.
         """
-        prompt = reflexion_reflection_prompt(episode, previous=previous)
+        prompt = (self.benchmark.reflection_prompt(episode, previous=previous)
+                  if self.benchmark is not None
+                  else reflexion_reflection_prompt(episode, previous=previous))
         response = await self.client.chat([{"role": "user", "content": prompt}])
         return (response.text or "").strip(), response

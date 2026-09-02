@@ -44,23 +44,36 @@ import time
 from datetime import datetime
 
 import numpy as np
-import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from datasets import load_dataset
-
+from memory_agents.benchmarks import add_benchmark_args, build_benchmark
 from memory_agents.config import resolve_server
 from memory_agents.envs.base import EpisodeResult, make_json_safe
-from memory_agents.envs.sparc import grid_summary, path_to_actions, puzzle_key_text
-from memory_agents.harness.run import run_sparc_suite_memory_pass
 from memory_agents.llm.client import EmbeddingClient, LLMClient
 from memory_agents.memory import Distiller, MempMemory
-from memory_agents.prompts import format_procedures
 
 BUILD_SCHEMA = "memp-build-v1"
 EVAL_SCHEMA = "memp-eval-v1"
-KEY_FN = "puzzle-key-v1"   # must match puzzle_key_text's docstring version
+# The retrieval key-fn is now the benchmark's (SPaRC "puzzle-key-v1", StepGame
+# "stepgame-key-v1" or its lexical variant). Kept as a name for the SPaRC default
+# so an older embeddings sidecar with no key_fn recorded still validates.
+KEY_FN = "puzzle-key-v1"
+
+
+# One Benchmark per process, resolved from the CLI (or a resumed config) in
+# main(). Module-level because the phase functions and run_memorybank both reach
+# for it, and every phase of a run is by definition one benchmark.
+BENCH = None
+
+
+def bench():
+    """The active Benchmark, defaulting to SPaRC for callers that never set one."""
+    global BENCH
+    if BENCH is None:
+        from memory_agents.benchmarks import SparcBenchmark
+        BENCH = SparcBenchmark()
+    return BENCH
 
 # Knobs that define what a run *is*, per phase. On --resume these come from the
 # state file and the CLI cannot override them (same discipline as run_reflexion:
@@ -114,10 +127,8 @@ def report_frozen(args, cfg: dict, phase: str) -> None:
 
 
 def split_ids(split: str, limit) -> list[str]:
-    """The puzzle ids a pass runs over, in dataset order."""
-    df = load_dataset("lkaesberg/SPaRC", "all", split=split).to_pandas()
-    ids = [str(pid) for pid in df["id"]]
-    return ids[:limit] if limit else ids
+    """The item ids a pass runs over, in split order."""
+    return bench().ids(split, limit or None)
 
 
 def episode_record(r) -> dict:
@@ -138,6 +149,10 @@ def episode_record(r) -> dict:
         "retry_tokens": r.retry_tokens(),
         "error": r.error or None,
         "episode_context": r.reflection_context(),
+        # StepGame's true hop count and the predicted/gold labels. Absent on
+        # SPaRC. Never read by a prompt -- reflection_context() is the only thing
+        # a distiller or reflector sees, and `extra` is deliberately not in it.
+        **({"extra": r.extra} if getattr(r, "extra", None) else {}),
     })
 
 
@@ -148,6 +163,12 @@ def accuracy_block(records: list[dict]) -> dict:
     by_diff: dict[int, list] = {}
     for rec in records:
         by_diff.setdefault(rec["difficulty"], []).append(rec["success"])
+    # StepGame's second difficulty axis; see docs/stepgame.md section 2.2.
+    by_hops: dict[int, list] = {}
+    for rec in records:
+        hops = (rec.get("extra") or {}).get("hops")
+        if hops is not None:
+            by_hops.setdefault(int(hops), []).append(rec["success"])
     return {
         "n": n,
         "success": wins,
@@ -155,6 +176,9 @@ def accuracy_block(records: list[dict]) -> dict:
         "accuracy_by_difficulty": {
             str(d): sum(s) / len(s) for d, s in sorted(by_diff.items())
         },
+        **({"accuracy_by_hops": {str(h): sum(v) / len(v)
+                                 for h, v in sorted(by_hops.items())}}
+           if by_hops else {}),
         "prompt_tokens": sum(rec["prompt_tokens"] for rec in records),
         "completion_tokens": sum(rec["completion_tokens"] for rec in records),
         "retry_tokens": sum(rec["retry_tokens"] for rec in records),
@@ -181,14 +205,18 @@ async def run_build(args) -> None:
             raise SystemExit(f"the build pass runs on the train split (got "
                              f"--split {args.split}); submit with SPLIT=train")
         cfg = {
-            "schema": BUILD_SCHEMA, "phase": "build", "split": args.split,
+            "schema": BUILD_SCHEMA, "phase": "build", "benchmark": bench().name,
+            "stepgame_train": args.stepgame_train,
+            "stepgame_test": args.stepgame_test,
+            "key_variant": args.key_variant, "split": args.split,
             "limit": args.limit or 0, "temperature": args.temperature,
             "top_p": args.top_p, "top_k": args.top_k,
             "max_tokens": args.max_tokens, "seed": args.seed,
         }
         state = {"config": cfg, "puzzles": {}}
         stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-        out = args.out or f"results/json/memp_build_train_{stamp}.json"
+        tag = "" if bench().name == "sparc" else f"{bench().name}_"
+        out = args.out or f"results/json/memp_build_{tag}train_{stamp}.json"
     cfg["concurrency"] = args.concurrency
 
     todo = [pid for pid in split_ids(cfg["split"], cfg["limit"])
@@ -212,7 +240,7 @@ async def run_build(args) -> None:
         for lo in range(0, len(todo), args.chunk):
             chunk = todo[lo:lo + args.chunk]
             t0 = time.time()
-            results = await run_sparc_suite_memory_pass(
+            results = await bench().run_memory_pass(
                 client, chunk, lambda pid: "",   # empty block == baseline actor
                 split=cfg["split"], concurrency=args.concurrency)
             for r in results:
@@ -241,38 +269,24 @@ async def run_build(args) -> None:
 # phase distill: build pass -> procedure bank
 # --------------------------------------------------------------------------- #
 def polyshapes_of(row):
-    """The puzzle's shape table, parsed exactly as the harness parses it before
-    handing it to sparc_system_prompt (harness/run.py) -- so the rulebook the
-    distiller reads is byte-for-byte the one the actor played under. `{}` for the
-    ~35% of puzzles with no polyshapes."""
-    return yaml.safe_load(row["polyshapes"])
+    """SPaRC's shape table. Kept as a name because run_memorybank imports it;
+    the distill prompts now get the whole record and let the benchmark decide
+    what to read from it."""
+    return bench().polyshapes(row)
 
 
-def gold_exemplar(row) -> dict:
+def gold_exemplar(record) -> dict:
     """The concrete solved example attached to a gold-provenance entry.
 
-    Assembled in code, never by the LLM: the action sequence comes straight from
-    the dataset's gold path, so it cannot be hallucinated."""
-    puzzle = yaml.safe_load(row["text_visualization"])["puzzle"]
-    actions = path_to_actions(list(row["solutions"][0]["path"]))
-    return {
-        "actions": actions, "n_moves": len(actions),
-        "width": puzzle["dimensions"]["width"],
-        "height": puzzle["dimensions"]["height"],
-        "start": [puzzle["start"]["x"], puzzle["start"]["y"]],
-        "end": [puzzle["end"]["x"], puzzle["end"]["y"]],
-        "grid_summary": grid_summary(row),
-    }
+    Assembled in code, never by the LLM -- on SPaRC the action sequence comes
+    from the dataset's gold path, on StepGame from the verified solver -- so it
+    cannot be hallucinated either way."""
+    return bench().gold_exemplar(record)
 
 
-def agent_exemplar(row, episode_ctx: dict) -> dict:
-    """Same shape, but the actions are the agent's own winning moves. Success in
-    SPaRC is an exact match to an enumerated solution, so this sequence is
-    guaranteed to be a valid solution path too."""
-    ex = gold_exemplar(row)
-    actions = [int(action) for _step, action, _loc in episode_ctx["moves"]]
-    ex["actions"], ex["n_moves"] = actions, len(actions)
-    return ex
+def agent_exemplar(record, episode_ctx: dict) -> dict:
+    """Same shape, from the agent's own successful attempt."""
+    return bench().agent_exemplar(record, episode_ctx)
 
 
 async def run_distill(args) -> None:
@@ -289,12 +303,17 @@ async def run_distill(args) -> None:
         cfg = {
             "schema": BUILD_SCHEMA.replace("build", "bank"),  # informational only
             "phase": "distill", "build": str(args.build),
+            "benchmark": bench().name, "key_fn": bench().key_fn,
+            "stepgame_train": args.stepgame_train,
+            "stepgame_test": args.stepgame_test,
+            "key_variant": args.key_variant,
             "distill_max_tokens": args.distill_max_tokens,
             "temperature": args.temperature, "top_p": args.top_p,
             "top_k": args.top_k, "seed": args.seed,
         }
         stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-        out = args.out or f"results/json/memp_bank_{stamp}.json"
+        tag = "" if bench().name == "sparc" else f"{bench().name}_"
+        out = args.out or f"results/json/memp_bank_{tag}{stamp}.json"
     cfg["concurrency"] = args.concurrency
 
     build = json.loads(pathlib.Path(cfg["build"]).read_text())
@@ -302,11 +321,8 @@ async def run_distill(args) -> None:
         raise SystemExit(f"--build expects a {BUILD_SCHEMA} file; "
                          f"{cfg['build']} is {build['config'].get('schema')!r}")
 
-    df = load_dataset("lkaesberg/SPaRC", "all", split="train").to_pandas()
-    row_of = {str(df["id"][i]): i for i in range(len(df))}
-
     if args.verify_gold:
-        verify_gold_paths(df, n=args.verify_gold)
+        bench().verify_gold("train", args.verify_gold)
 
     todo = sorted(pid for pid in build["puzzles"] if pid not in memory)
     if not todo:
@@ -322,27 +338,25 @@ async def run_distill(args) -> None:
 
     async def distill_one(distiller, sem, pid):
         rec = build["puzzles"][pid]
-        row = df.iloc[row_of[pid]]
-        key_text = puzzle_key_text(row)
+        row = bench().record("train", pid)
+        key_text = bench().key_text(row)
         # Route on provenance. A crashed episode has no episode_context, which is
-        # exactly why the gold prompt reads dataset fields only.
+        # exactly why the gold prompt reads the item's record only.
         from_agent = bool(rec["success"] and rec.get("episode_context"))
-        polyshapes = polyshapes_of(row)
         async with sem:
             if from_agent:
                 episode = EpisodeResult.from_reflection_context(
                     rec["episode_context"], pid)
                 text, resp = await distiller.distill_from_trajectory(
-                    episode, key_text, polyshapes)
+                    episode, key_text, row)
             else:
-                gold_actions = path_to_actions(list(row["solutions"][0]["path"]))
-                text, resp = await distiller.distill_from_gold(
-                    key_text, row["text_visualization"], gold_actions, polyshapes)
+                text, resp = await distiller.distill_from_gold(key_text, row)
         return pid, from_agent, text, resp
 
     async def distill_pass(pids, seed):
         """One pass over `pids`; returns the pids whose reply came back empty."""
-        distiller = Distiller(make_client(cfg, cfg["distill_max_tokens"], seed))
+        distiller = Distiller(make_client(cfg, cfg["distill_max_tokens"], seed),
+                              benchmark=bench())
         cfg.setdefault("model", distiller.client.model)
         cfg.setdefault("model_id",
                        os.environ.get("LLM_MODEL_ID") or distiller.client.model)
@@ -366,13 +380,13 @@ async def run_distill(args) -> None:
                         empties.append(pid)
                         continue
                     rec = build["puzzles"][pid]
-                    row = df.iloc[row_of[pid]]
+                    row = bench().record("train", pid)
                     memory.write(pid, {
                         "provenance": "agent" if from_agent else "gold",
                         # From the dataset, not the build record: a crashed
                         # episode reports difficulty -1.
-                        "difficulty": int(row["difficulty_level"]),
-                        "key_text": puzzle_key_text(row),
+                        "difficulty": bench().difficulty(row),
+                        "key_text": bench().key_text(row),
                         "script": text,
                         "exemplar": (agent_exemplar(row, rec["episode_context"])
                                      if from_agent else gold_exemplar(row)),
@@ -404,10 +418,12 @@ async def run_distill(args) -> None:
     print(f"[distill] wrote {out}", flush=True)
 
 
-def verify_gold_paths(df, n: int) -> None:
+def verify_gold_paths(df, n: int) -> None:   # SPaRC only; StepGame uses
+    # StepGameBenchmark.verify_gold, which re-derives stored chains instead.
     """Replay the first n gold action sequences through a real env and assert
     success -- proves the (dx,dy)->action table against the live env once, with
     no LLM in the loop. Cheap enough to run on every distill job."""
+    from memory_agents.envs.sparc import path_to_actions
     from memory_agents.envs.sparc import SparcEnv, is_success
 
     env = SparcEnv(split="train")
@@ -425,7 +441,8 @@ def verify_gold_paths(df, n: int) -> None:
         print(f"[verify-gold] {min(n, len(df))} gold paths replayed successfully",
               flush=True)
     finally:
-        env.close()
+        if env is not None:
+            env.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -441,25 +458,35 @@ def run_upgrade(args) -> None:
     the handful of agent successes) keeps granularity from being confounded with
     bank size when the arms are compared.
 
-    Pure env replay -- no model, no GPU. Runs on the login node in a minute.
-    """
-    from memory_agents.envs.sparc import SparcEnv, replay_path
+    Pure replay -- no model, no GPU. Runs on the login node in a minute.
 
+    On a single-turn benchmark there is no env and no action sequence to replay:
+    the verbatim record is the item's question plus its worked derivation, which
+    the benchmark builds directly. Same output field, same granularity contract.
+    """
     src = pathlib.Path(args.bank)
     data = json.loads(src.read_text())
     memory = MempMemory.from_dict(data)
     out = pathlib.Path(args.out or src.with_name(src.stem + "_traj.json"))
 
-    env = SparcEnv(split="train")
+    interactive = bench().interactive
+    env = None
+    if interactive:
+        from memory_agents.envs.sparc import SparcEnv, replay_path
+        env = SparcEnv(split="train")
     upgraded = failed = solved = 0
     try:
         for e in memory.entries:
-            actions = (e.get("exemplar") or {}).get("actions") or []
-            if not actions:
-                failed += 1
-                continue
             try:
-                traj = replay_path(env, e["source_pid"], actions)
+                if interactive:
+                    actions = (e.get("exemplar") or {}).get("actions") or []
+                    if not actions:
+                        failed += 1
+                        continue
+                    traj = replay_path(env, e["source_pid"], actions)
+                else:
+                    traj = bench().gold_trajectory(
+                        bench().record("train", e["source_pid"]))
             except Exception as exc:            # a bad exemplar must not kill the run
                 print(f"[upgrade] {e['id']} ({e['source_pid']}): {exc!r}", flush=True)
                 failed += 1
@@ -468,7 +495,8 @@ def run_upgrade(args) -> None:
             upgraded += 1
             solved += traj["terminal_reason"] == "solved"
     finally:
-        env.close()
+        if env is not None:
+            env.close()
 
     save_state(out, {**memory.to_dict(), "config": data.get("config", {})})
     print(f"[upgrade] {upgraded}/{len(memory)} entries now carry a trajectory "
@@ -486,14 +514,21 @@ def run_upgrade(args) -> None:
 # phase keywords: AveFact key construction (LLM), then embed-keywords (embeddings)
 # --------------------------------------------------------------------------- #
 async def run_keywords(args) -> None:
-    """Extract per-puzzle keywords for the AveFact retriever (one LLM call each)."""
+    """Extract per-puzzle keywords for the AveFact retriever (one LLM call each).
+
+    The item set and key text come from the active benchmark, but the extraction
+    prompt itself (prompts.memp_keywords_prompt) is still SPaRC-shaped -- AveFact
+    is a SPaRC replication ablation and has no StepGame arm in the plan. Running
+    it on another benchmark would work mechanically and prompt badly, so the
+    key_fn recorded below names the benchmark actually used.
+    """
     cfg = {"temperature": args.temperature, "top_p": args.top_p,
            "top_k": args.top_k}
     distiller = Distiller(make_client(cfg, args.distill_max_tokens, args.seed))
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
     out = pathlib.Path(args.out or f"results/json/memp_keywords_{stamp}.json")
     result = {"model_id": os.environ.get("LLM_MODEL_ID") or distiller.client.model,
-              "key_fn": KEY_FN, "keywords": {}}
+              "key_fn": bench().key_fn, "benchmark": bench().name, "keywords": {}}
     if out.exists():                      # resume: keyword extraction is 1000 calls
         result = json.loads(out.read_text())
     sem = asyncio.Semaphore(args.concurrency)
@@ -504,10 +539,10 @@ async def run_keywords(args) -> None:
 
     try:
         for split in ("train", "test"):
-            df = load_dataset("lkaesberg/SPaRC", "all", split=split).to_pandas()
-            n = min(args.limit, len(df)) if args.limit else len(df)
-            todo = [(str(df["id"][i]), puzzle_key_text(df.iloc[i]))
-                    for i in range(n) if str(df["id"][i]) not in result["keywords"]]
+            n = None if not args.limit else args.limit
+            todo = [(pid, bench().key_text(bench().record(split, pid)))
+                    for pid in bench().ids(split, n)
+                    if pid not in result["keywords"]]
             for lo in range(0, len(todo), args.chunk):
                 outcomes = await asyncio.gather(
                     *(one(p, t) for p, t in todo[lo:lo + args.chunk]),
@@ -584,20 +619,22 @@ async def run_embed(args) -> None:
     print(f"[embed] {embed_model}: dim={dim}", flush=True)
 
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-    out = pathlib.Path(args.out or f"results/json/memp_embeddings_{stamp}.npz")
+    tag = "" if bench().name == "sparc" else f"{bench().name}_"
+    if bench().name != "sparc" and getattr(args, "key_variant", "") == "lexical":
+        tag += "lex_"
+    out = pathlib.Path(args.out or f"results/json/memp_embeddings_{tag}{stamp}.npz")
     arrays: dict[str, np.ndarray] = {}
     try:
         for split in ("train", "test"):
-            df = load_dataset("lkaesberg/SPaRC", "all", split=split).to_pandas()
-            n = min(args.limit, len(df)) if args.limit else len(df)
-            texts = [puzzle_key_text(df.iloc[i]) for i in range(n)]
+            ids = bench().ids(split, args.limit or None)
+            n = len(ids)
+            texts = [bench().key_text(bench().record(split, pid)) for pid in ids]
             vecs: list[list[float]] = []
             for lo in range(0, n, args.batch):
                 vecs.extend(await client.embed(texts[lo:lo + args.batch]))
             mat = np.asarray(vecs, dtype=np.float32)
             mat /= np.linalg.norm(mat, axis=1, keepdims=True)
-            arrays[f"{split}_ids"] = np.asarray(
-                [str(pid) for pid in df["id"][:n]])
+            arrays[f"{split}_ids"] = np.asarray([str(pid) for pid in ids])
             arrays[f"{split}_vecs"] = mat
             print(f"[embed] {split}: {mat.shape[0]} x {mat.shape[1]}", flush=True)
     finally:
@@ -610,7 +647,7 @@ async def run_embed(args) -> None:
     np.savez(tmp, **arrays)
     os.replace(tmp, out)
     meta = {"embed_model": embed_model, "dim": dim, "normalized": True,
-            "key_fn": KEY_FN,
+            "key_fn": bench().key_fn, "benchmark": bench().name,
             "n_train": int(arrays["train_ids"].shape[0]),
             "n_test": int(arrays["test_ids"].shape[0])}
     # .meta.json, not .json: results/json/*.json is what summarize_results globs,
@@ -618,13 +655,33 @@ async def run_embed(args) -> None:
     meta_path = out.with_name(out.stem + ".meta.json")
     save_state(meta_path, meta)
 
-    # Sanity: a key must be its own nearest neighbour (cosine 1.0 with itself is
-    # trivial; this checks the matrix rows line up with the ids).
+    # Sanity: nothing may be strictly more similar to a key than the key itself.
+    # That is the property which actually catches misaligned id/vector rows.
+    #
+    # Deliberately NOT "argmax == own row": distinct items can share a byte-identical
+    # key text, so their vectors are identical and the argmax legitimately lands on
+    # whichever row comes first. StepGame's structural key does this a lot -- every
+    # one-hop, one-sentence item with the same relation renders the same key, which
+    # is 130 of 500 train items in the k-stratified split. Requiring a unique argmax
+    # would fail a correctly-built embedding file.
     tv = arrays["train_vecs"]
-    self_top1 = (tv[:5] @ tv.T).argmax(axis=1)
-    if not (self_top1 == np.arange(len(self_top1))).all():
-        raise SystemExit("[embed] sanity failed: a train key is not its own "
-                         "top-1 neighbour; id/vector rows are misaligned")
+    probe = min(64, tv.shape[0])
+    sims = tv[:probe] @ tv.T
+    rows = np.arange(probe)
+    if not np.all(sims[rows, sims.argmax(axis=1)] <= sims[rows, rows] + 1e-5):
+        raise SystemExit("[embed] sanity failed: some train key is strictly closer "
+                         "to another key than to itself; id/vector rows are "
+                         "misaligned")
+    for split in ("train", "test"):
+        ids_ = arrays[f"{split}_ids"]
+        distinct = len({tuple(np.round(v, 6)) for v in arrays[f"{split}_vecs"]})
+        if distinct < len(ids_):
+            # Not an error: items with identical structure are interchangeable for
+            # retrieval, and the id tie-break keeps the choice reproducible. But it
+            # bounds how much retrieval can discriminate, so it belongs in the log.
+            print(f"[embed] note: {split} has {distinct} distinct vectors for "
+                  f"{len(ids_)} items ({len(ids_) - distinct} share a key text "
+                  f"with another item)", flush=True)
     print(f"[embed] wrote {out} + {meta_path}", flush=True)
 
 
@@ -636,9 +693,11 @@ def load_embeddings(path) -> tuple[dict, dict]:
     path = pathlib.Path(path)
     meta_path = path.with_name(path.stem + ".meta.json")
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    if meta.get("key_fn") not in (None, KEY_FN):
+    expected = bench().key_fn
+    if meta.get("key_fn") not in (None, expected):
         raise SystemExit(f"{path} was embedded with key_fn={meta.get('key_fn')!r} "
-                         f"but this code renders {KEY_FN}; re-run the embed phase")
+                         f"but this run renders {expected}; re-run the embed phase "
+                         f"(or pass the matching --benchmark/--key-variant)")
     return {k: npz[k] for k in npz.files}, meta
 
 
@@ -672,8 +731,8 @@ def build_blocks(memory, arrays, cfg, test_ids, keyword_queries=None):
             picks = memory.fixed_retrieve(k)
         else:
             picks = memory.random_retrieve(k, seed_key=f"{seed}:{pid}")
-        blocks[pid] = format_procedures([entry for entry, _sim in picks],
-                                        granularity=granularity)
+        blocks[pid] = bench().format_procedures(
+            [entry for entry, _sim in picks], granularity=granularity)
         retrieved_log[pid] = [
             {"id": entry["id"], "source_pid": entry["source_pid"],
              "provenance": entry["provenance"],
@@ -697,6 +756,7 @@ async def update_pass(policy, memory, arrays, group_results, retrieved_log,
     Returns counters for the run record. New entries carry the *test* puzzle's own
     embedding (already in the sidecar), so retrieval for later groups sees them.
     """
+    from memory_agents.envs.sparc import puzzle_key_text   # SPaRC-only ablation
     stats = collections.Counter()
     qrow = {str(pid): i for i, pid in enumerate(arrays["test_ids"])}
     sem = asyncio.Semaphore(args.concurrency)
@@ -800,6 +860,9 @@ async def run_eval(args) -> None:
             "limit": args.limit or 0, "temperature": args.temperature,
             "top_p": args.top_p, "top_k": args.top_k,
             "max_tokens": args.max_tokens, "seed": args.seed,
+            "benchmark": bench().name, "key_variant": args.key_variant,
+            "stepgame_train": args.stepgame_train,
+            "stepgame_test": args.stepgame_test,
             "granularity": args.granularity, "provenance": args.provenance,
             "update": args.update, "groups": args.groups,
             "keywords": str(args.keywords) if args.keywords else None,
@@ -807,7 +870,8 @@ async def run_eval(args) -> None:
         }
         state = {"config": cfg, "puzzles": {}}
         stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-        out = args.out or (f"results/json/memp_eval_{cfg['arm']}_"
+        tag = "" if bench().name == "sparc" else f"{bench().name}_"
+        out = args.out or (f"results/json/memp_eval_{tag}{cfg['arm']}_"
                            f"{cfg['split']}_{stamp}.json")
     cfg["concurrency"] = args.concurrency
 
@@ -853,6 +917,11 @@ async def run_eval(args) -> None:
     # A frozen bank can precompute every block once. The Update policies rewrite
     # the bank between groups, so those recompute per group instead.
     online = cfg.get("update", "none") != "none"
+    if online and bench().name != "sparc":
+        raise SystemExit(
+            f"--update {cfg['update']} is implemented for SPaRC only (it revises "
+            f"procedures against replayed env trajectories); use --update none "
+            f"on {bench().name}")
     blocks, retrieved_log = blocks_for(test_ids)
 
     longest = max(blocks.values(), key=len)
@@ -878,8 +947,14 @@ async def run_eval(args) -> None:
     group_size = max(1, math.ceil(len(test_ids) / cfg["groups"])) if online \
         else args.chunk
 
-    df_test = load_dataset("lkaesberg/SPaRC", "all", split=cfg["split"]).to_pandas()
-    row_of = {str(df_test["id"][i]): i for i in range(len(df_test))}
+    # Only the Update policies need per-item records at eval time, and they are a
+    # SPaRC-only ablation, so a frozen run never touches the dataset here.
+    df_test = row_of = None
+    if online:
+        from datasets import load_dataset
+        df_test = load_dataset("lkaesberg/SPaRC", "all",
+                               split=cfg["split"]).to_pandas()
+        row_of = {str(df_test["id"][i]): i for i in range(len(df_test))}
 
     set_failure_log(f"eval_{cfg['arm']}")
     client = make_client(cfg, cfg["max_tokens"], cfg["seed"])
@@ -889,7 +964,7 @@ async def run_eval(args) -> None:
         for lo in range(0, len(todo), group_size):
             chunk = todo[lo:lo + group_size]
             t0 = time.time()
-            results = await run_sparc_suite_memory_pass(
+            results = await bench().run_memory_pass(
                 client, chunk, lambda pid: blocks[pid],
                 split=cfg["split"], concurrency=args.concurrency)
             for r in results:
@@ -1135,6 +1210,26 @@ def run_compare(args) -> None:
 
 
 # --------------------------------------------------------------------------- #
+def _resumed_config(args) -> dict | None:
+    """The stored config of whatever file this invocation continues, or None.
+
+    --resume covers build/distill/eval; --bank covers the upgrade phase, whose
+    bank was written under one benchmark and must be re-read under the same one.
+    """
+    for attr in ("resume", "bank"):
+        path = getattr(args, attr, None)
+        if not path or not pathlib.Path(path).exists():
+            continue
+        try:
+            data = json.loads(pathlib.Path(path).read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        cfg = data.get("config")
+        if isinstance(cfg, dict) and cfg.get("benchmark"):
+            return cfg
+    return None
+
+
 async def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1190,6 +1285,7 @@ async def main() -> None:
     ap.add_argument("--retrieved", default=None, help="retrieved-arm JSON (compare)")
     ap.add_argument("--random", default=None, help="random-arm JSON (compare)")
     ap.add_argument("--out", default=None, help="output path")
+    add_benchmark_args(ap)
     args = ap.parse_args()
 
     # Which frozen knobs the user actually typed, so a resume can tell "left at
@@ -1198,6 +1294,17 @@ async def main() -> None:
              for a in sys.argv[1:] if a.startswith("--")}
     args.explicit = {k: k in typed for keys in FROZEN.values() for k in keys}
     args.limit = args.limit if args.limit > 0 else None
+
+    # Resolve the benchmark once, for the whole process. On --resume it comes
+    # from the state file, not the CLI: a resumed distill or eval has to keep
+    # rendering the key-fn and prompts its partial output was written with.
+    global BENCH
+    stored = _resumed_config(args)
+    BENCH = build_benchmark(stored if stored else args)
+    if stored and stored.get("benchmark", "sparc") != getattr(args, "benchmark",
+                                                             "sparc"):
+        print(f"[memp] resuming a {stored.get('benchmark', 'sparc')} run; "
+              f"ignoring --benchmark {args.benchmark}", flush=True)
 
     if args.phase == "build":
         await run_build(args)

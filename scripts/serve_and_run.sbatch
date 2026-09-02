@@ -63,6 +63,22 @@
 #   sbatch -J mb-dist --export=ALL,DRIVER=memorybank,PHASE=distill,RULES_PREAMBLE=on,BUILD=results/json/memp_build_train_<stamp>.json scripts/serve_and_run.sbatch
 #   sbatch -J mb-ret  --export=ALL,DRIVER=memorybank,PHASE=eval,ARM=retrieved,LIMIT=0,BANK=<memorybank_bank_*.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
 #   sbatch -J mb-rnd  --export=ALL,DRIVER=memorybank,PHASE=eval,ARM=random,LIMIT=0,BANK=<memorybank_bank_*.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#
+# StepGame (BENCHMARK=stepgame on any of the above; the splits are frozen files,
+# so LIMIT is only for smoke tests). Full campaign, in dependency order:
+#
+#   sbatch -J sg-base  --export=ALL,BENCHMARK=stepgame,DRIVER=baseline,SPLIT=test scripts/serve_and_run.sbatch
+#   sbatch -J sg-refl  --export=ALL,BENCHMARK=stepgame,DRIVER=reflexion,PHASE=root,SPLIT=test scripts/serve_and_run.sbatch
+#   sbatch -J sg-mem   --export=ALL,DRIVER=reflexion,PHASE=arm,ARM=memory,TRIALS=10,ROOT=<reflexion_root_stepgame_*.json> scripts/serve_and_run.sbatch
+#   sbatch -J sg-ctl   --export=ALL,DRIVER=reflexion,PHASE=arm,ARM=control,TRIALS=10,ROOT=<reflexion_root_stepgame_*.json> scripts/serve_and_run.sbatch
+#   sbatch -J sg-build --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=build,SPLIT=train scripts/serve_and_run.sbatch
+#   sbatch -J sg-dist  --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=distill,BUILD=<memp_build_stepgame_train_*.json> scripts/serve_and_run.sbatch
+#   sbatch -J sg-emb   -G A100:1 -t 01:00:00 --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=embed,TP=1 scripts/serve_and_run.sbatch
+#   sbatch -J sg-up    --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=upgrade,BANK=<memp_bank_stepgame_*.json> scripts/serve_and_run.sbatch
+#   sbatch -J sg-ret   --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=eval,ARM=retrieved,BANK=<bank_traj.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   sbatch -J sg-fix   --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=eval,ARM=fixed,BANK=<bank_traj.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   sbatch -J sg-mbd   --export=ALL,BENCHMARK=stepgame,DRIVER=memorybank,PHASE=distill,RULES_PREAMBLE=on,BUILD=<memp_build_stepgame_train_*.json> scripts/serve_and_run.sbatch
+#   sbatch -J sg-mbr   --export=ALL,BENCHMARK=stepgame,DRIVER=memorybank,PHASE=eval,ARM=retrieved,BANK=<memorybank_bank_stepgame_*.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
 #   python scripts/run_memorybank.py --phase compare --baseline <root.json> --retrieved <ret.json> --random <rnd.json> --memp <memp_eval_retrieved_*.json>
 #
 # Some nodes SIGILL the Apptainer launcher (see PREFLIGHT below). The job detects that
@@ -112,6 +128,18 @@ SMOKE="${SMOKE:-1}"                       # 0 skips the 2-prompt smoke check
 # memory methods slot in here as extra DRIVER cases -- the serve block above is
 # method-agnostic, so nothing else changes.
 DRIVER="${DRIVER:-baseline}"              # baseline | reflexion | memp | memorybank
+
+# ---- Benchmark selection (all drivers) --------------------------------------
+# Which task the arms run on. `stepgame` reads the frozen splits under
+# data/stepgame/splits (built by scripts/build_stepgame_splits.py); leaving the
+# two split knobs empty picks the standard k-stratified pair, and pointing
+# STEPGAME_TEST at the *_byhops_* file switches the eval to the hop-stratified
+# difficulty split. KEY_VARIANT selects StepGame's retrieval-key ablation and
+# must match between the embed job and the evals that read its .npz.
+BENCHMARK="${BENCHMARK:-sparc}"           # sparc | stepgame
+STEPGAME_TRAIN="${STEPGAME_TRAIN:-}"      # split JSONL; empty = the standard one
+STEPGAME_TEST="${STEPGAME_TEST:-}"        # split JSONL; empty = the standard one
+KEY_VARIANT="${KEY_VARIANT:-structural}"  # structural | lexical
 PHASE="${PHASE:-root}"                    # reflexion: root | arm    memp: build | distill | embed | eval    memorybank: distill | eval
 ARM="${ARM:-}"                            # reflexion arm: memory | control    memp/memorybank eval: retrieved | random
 ROOT="${ROOT:-}"                          # start an arm from this root file
@@ -395,9 +423,21 @@ fi
 
 # Sampling/budget flags shared by every driver; --limit is added per-driver since
 # a reflexion arm runs over the puzzle set stored in its state file, not a fresh --limit slice.
+# Benchmark flags, needed by every phase that constructs a fresh config. A
+# --resume path deliberately does NOT pass them: the benchmark and its split
+# files are frozen in the state file, and a resubmit line must not be able to
+# continue a StepGame curve as a SPaRC one.
+BENCH_ARGS=(--benchmark "$BENCHMARK")
+if [[ "$BENCHMARK" == "stepgame" ]]; then
+    BENCH_ARGS+=(--key-variant "$KEY_VARIANT")
+    [[ -n "$STEPGAME_TRAIN" ]] && BENCH_ARGS+=(--stepgame-train "$STEPGAME_TRAIN")
+    [[ -n "$STEPGAME_TEST"  ]] && BENCH_ARGS+=(--stepgame-test  "$STEPGAME_TEST")
+fi
+
 COMMON_ARGS=(--split "$SPLIT" --concurrency "$CONCURRENCY" \
     --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" \
-    --top-p "$TOP_P" --seed "$SEED" ${TOP_K:+--top-k "$TOP_K"})
+    --top-p "$TOP_P" --seed "$SEED" ${TOP_K:+--top-k "$TOP_K"} \
+    "${BENCH_ARGS[@]}")
 
 case "$DRIVER" in
   baseline)
@@ -470,7 +510,8 @@ case "$DRIVER" in
         # Always the full dataset (minutes of work): a limited .npz would poison
         # every later eval with missing vectors.
         echo "[$(date +%T)] memp embed: all train keys + test queries via $MODEL"
-        python -u scripts/run_memp.py --phase embed ${OUT:+--out "$OUT"}
+        python -u scripts/run_memp.py --phase embed "${BENCH_ARGS[@]}" \
+            ${OUT:+--out "$OUT"}
         ;;
       keywords)
         # AveFact key construction: one short LLM call per puzzle, resumable.
