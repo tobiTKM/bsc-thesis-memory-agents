@@ -168,6 +168,46 @@ def main() -> int:
             bm.case_gold_prompt(key, rec),
             bm.case_trajectory_prompt(replayed, key, rec))))
 
+    print("\n[6b] prompt protocols")
+    # The calibration protocols reproduce Li et al.'s actor prompt so our numbers
+    # can be quoted beside their published table. Two things have to stay true:
+    # every protocol must be graded by the SAME contract (or the comparison is not
+    # a comparison), and `ours` must stay the default everywhere -- an accidental
+    # flip to `upstream` would silently put ten worked examples into the
+    # "memoryless" baseline and quietly destroy the control arm.
+    from memory_agents.prompts_stepgame_upstream import (
+        PROTOCOLS, system_prompt_for, upstream_examples, format_item_upstream)
+
+    check("default protocol is ours", get_benchmark("stepgame").prompt_protocol == "ours")
+    check("upstream prompt parses 10 exemplars", len(upstream_examples()) == 10,
+          f"got {len(upstream_examples())}")
+
+    for proto in PROTOCOLS:
+        sp = system_prompt_for(proto)
+        check(f"{proto}: same Final contract", "Final: <label>" in sp)
+        check(f"{proto}: lists all nine labels",
+              all(l in sp for l in solver.LABELS))
+    hdr, shots = system_prompt_for("upstream-header"), system_prompt_for("upstream")
+    check("upstream-header carries the clock decoder", "12 denotes above" in hdr)
+    check("upstream-header carries the cardinal decoder",
+          "north denotes above" in hdr)
+    check("upstream-header is still zero-shot", "Answer:" not in hdr)
+    check("upstream is 10-shot", shots.count("Answer:") == 10,
+          f"{shots.count('Answer:')} exemplars")
+    # The leak rule applies to the calibration protocols too. Tested the way [3]
+    # tests ours -- "does the rendered item parse as an answer?" -- and NOT by
+    # searching for the gold string, which occurs legitimately in story text
+    # ("X is to the left of K" on an item whose answer is `left`).
+    up_leaks = [i.id for i in items
+                if stepgame.parse_answer(format_item_upstream(i)) is not None]
+    check("upstream item render leaks no answer", not up_leaks,
+          f"{len(up_leaks)} leak: {up_leaks[:3]}")
+    check("upstream item render omits a worked chain",
+          all("Answer:" not in format_item_upstream(i) for i in items))
+    check("upstream benchmark renders items their way",
+          get_benchmark("stepgame", prompt_protocol="upstream")
+          .format_item(rec).startswith("Story:\n"))
+
     print("\n[7] injected blocks")
     entry = {"id": "e1", "script": "1. anchor the reference object",
              "case_note": "It was a two-hop chain.",

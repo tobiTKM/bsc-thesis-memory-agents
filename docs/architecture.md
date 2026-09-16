@@ -417,3 +417,85 @@ from MemP. The verbatim record is attached inside `distill` by a pure-CPU env re
 (`replay_path`), not in a separate `upgrade` phase, because for MemoryBank it is not an
 optional granularity but half of what the paper stores; the eval refuses to run at
 `case-record` if any entry lacks one.
+
+---
+
+## 6. Contrastive memory (ours, not a port)
+
+Full design, arms and pre-registered predictions: [contrastive.md](contrastive.md).
+This section is only what a reader of the architecture needs: which seams it reuses,
+which pieces are its own, and the one place it departs from the other two cross-task
+methods.
+
+### Core idea
+
+A cross-task bank like MemP's and MemoryBank's, but the *sign* of an entry is decided
+by the outcome of the train task it came from:
+
+    solved  ->  `strategy`   what to do    (MemP's distill prompt, verbatim)
+    failed  ->  `avoid`      what NOT to do (the one new model call)
+                `hindsight`  a procedure from the gold path -- MemP's policy, verbatim
+
+MemP and MemoryBank throw the failure away and distil the **gold path** instead, so
+nothing in either bank is derived from a mistake. This keeps it. `--granularity avoid`
+against `--granularity hindsight` is therefore a single-factor test over one bank:
+same 500 entries, same retriever, same *k*, same positive half, matched on tokens to
+within 2%, and the only thing that moves is what a non-solved train task says.
+
+### What it reuses, unchanged
+
+| Reused | From | Why it must be shared |
+|---|---|---|
+| the train build pass (`memp_build_train_*.json`) | MemP | method-agnostic, ~8 h/model, already paid for — and it already retains `episode_context` for **failures**, which is this method's entire data source |
+| the embeddings (`memp_embeddings_*.npz`) | MemP | identical `puzzle_key_text`, so the key is unchanged |
+| `retrieve` / `random_retrieve` / `filtered` / the `(-similarity, id)` tie-break | `MempMemory` | `ContrastiveMemory` subclasses it, as `MemoryBankMemory` does; the cross-method contrast is only interpretable if retrieval is identical |
+| `Distiller.distill_from_trajectory` and `.distill_from_gold` | MemP | they write the positive half and the control text. Keeping them **verbatim** is what makes the headline test single-factor |
+| `MemoryAgent`, `run_*_suite`, `Benchmark`, the state/checkpoint discipline | the harness | as for every other method |
+| `save_state`, `make_client`, `episode_record`, `accuracy_block`, `compare_row`, `mcnemar_exact`, `baseline_outcomes`, `eval_outcomes` | `run_memp` | imported by `run_contrastive.py`, not mirrored |
+
+### Its own pieces
+
+| Piece | File | Role |
+|---|---|---|
+| `ContrastiveMemory` | [memory/contrastive.py](../src/memory_agents/memory/contrastive.py) | the store; adds `polarity()`, `balanced_retrieve`, `stratified_random_retrieve` |
+| `broken_rules()` | same | the env's own per-rule verdict on a failed attempt, in code — grounding for the avoid prompt |
+| `AvoidDistiller` | same | the **only** model call this method introduces |
+| `format_contrastive` / `contrastive_avoid_prompt` | [prompts.py](../src/memory_agents/prompts.py), [prompts_stepgame.py](../src/memory_agents/prompts_stepgame.py) | the four arms' renderer and the new prompt, appended after existing code so `regress_sparc.py` still proves the old path unmoved |
+| `format_contrastive` / `avoid_prompt` | [benchmarks.py](../src/memory_agents/benchmarks.py) | the two new seams; `failed_trajectory()` has a working default because the build file is already in `reflection_context` shape |
+| the driver | [scripts/run_contrastive.py](../scripts/run_contrastive.py) | `distill` / `eval` / `compare` |
+
+### The one genuinely new retrieval concern: polarity
+
+This is the place the method departs from MemP and MemoryBank, and it is not a detail.
+
+**A bank's mix of DOs and DON'Ts is the actor's train accuracy**, not a knob. On SPaRC
+that is 9–71 solved out of 500, so the bank is 1.8–14.2% positive and a plain cosine
+top-3 injects ~0.05–0.4 DO entries per item — most items see **no worked positive
+example at all**, which `docs/memp.md` §3.10 identifies as the only ingredient that
+demonstrably moves this benchmark. A null under plain retrieval could not distinguish
+"negative advice does not help" from "negative advice crowded out the thing that does".
+
+`balanced_retrieve` is the answer: cosine top-*k*, but with at least `min_positive` DO
+entries. It is run **alongside** `retrieved`, never instead of it, and
+`stratified_random_retrieve` is its matched relevance ablation — a random arm drawn
+uniformly against a balanced arm would move polarity and relevance at once and measure
+neither. Every eval file records `injected_positive_share` and `items_with_a_positive`,
+and both the driver's `compare` and `scripts/contrastive_report.py` print them in
+their own table, because no effect size here is readable without them.
+
+### Why all three texts are written in one distill pass
+
+`avoid` and `hindsight` are the two sides of the headline test. If the control text
+came from a second job they could silently be built from different banks — different
+seed, different model revision, different prompt version — and the single-factor claim
+would be false while every file stayed internally consistent. So `run_distill` writes
+`strategy`, `avoid` and `hindsight` in the same pass and freezes them in one bank.
+
+### Withheld text degrades to a placeholder, never to another arm
+
+An arm that renders nothing for an entry would quietly become `positive-only`. Instead
+the entry renders one explicit line, so bank size, retrieval and the Item count in the
+block stay identical across arms and only the content varies. The eval phase refuses
+outright if *every* entry of the relevant sign lacks the text the arm needs.
+`scripts/smoke_contrastive.py` pins all of this, including that a DON'T can never
+render without its `DO NOT` label — an unlabelled warning reads as an instruction.

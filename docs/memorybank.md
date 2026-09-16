@@ -274,6 +274,10 @@ deliberate: the thesis proposal defines this arm operationally as *"a declarativ
 agent that retrieves similar solved cases via dense embedding search"*, which is
 what is built here.
 
+> The same argument is why the contrastive method's retrieval is also Memp's, verbatim
+> ([contrastive.md](contrastive.md) §3) — three cross-task methods, one retriever, so
+> every cross-method contrast isolates content.
+
 ### Why retrieval is Memp's, verbatim
 
 MemoryBank entries are retrieved by cosine similarity over `puzzle_key_text`
@@ -721,6 +725,16 @@ accuracy for roughly 40–60% more tokens per solve than the procedural method d
    outright even though the two tie on accuracy. Campaign cost 76 GPU-h.
 
 ### Threats to validity
+
+- **Retrieved and random differ in presentation ORDER as well as in content**
+  (found 2026-09-16). `MempMemory.retrieve` returns entries in similarity order —
+  `(-similarity, id)`, the id only a tie-break — while `random_retrieve` sorts by
+  entry id. A comment asserted the two shared a convention; they do not. The two draws
+  share almost no entries, so order is the smaller of the two differences here and it
+  adds variance to a contrast that already reports a null — i.e. it cuts toward the
+  reported result, not against it. Left unchanged on purpose: altering the retriever
+  now would make future runs incomparable with this completed campaign. See
+  `docs/contrastive.md` §6.3, where the same defect was load-bearing.
 
 - **`case-record` is not a clean test of the memory *type*.** It bundles the case note
   with a verbatim trajectory that §4.8 shows is shared byte-for-byte with Memp and that

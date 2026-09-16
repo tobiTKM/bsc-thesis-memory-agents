@@ -251,8 +251,20 @@ def trial_curve(state: dict) -> list:
     return out
 
 
+# The three cross-task methods write the same {config, puzzles, summary} shape and
+# differ only in their schema prefix, so every reader below is shared. Adding a
+# fourth method means adding its prefix here, not a fourth branch.
+BANK_FAMILY = ("memp-bank-v1", "memorybank-bank-v1", "contrastive-bank-v1")
+STATE_FAMILY = ("memp", "memorybank", "contrastive")
+
+
+def method_of(schema: str) -> str:
+    """"memorybank-eval-v1" -> "memorybank". The render branch keys on this."""
+    return schema.split("-", 1)[0] if schema else ""
+
+
 def episodes_from_memp_state(state: dict) -> list:
-    """Flatten a memp build/eval state to one record per puzzle.
+    """Flatten a memp/memorybank/contrastive build or eval state, one record per item.
 
     The records are already in run_baseline's shape; only the build pass's
     episode_context (the compact trajectory kept for the distill phase) is
@@ -278,13 +290,23 @@ def summary_from_memp_state(state: dict) -> dict:
         "seed": cfg.get("seed"),
         "concurrency": cfg.get("concurrency"),
         "arm": cfg.get("arm"),
-        "method": "memp",
+        # Was hardcoded "memp", which silently mis-rendered MemoryBank and would
+        # have done the same to contrastive: both write the identical state shape
+        # but their schema does not start with "memp".
+        "method": method_of(cfg.get("schema", "")),
         "phase": cfg.get("phase"),
         "top_k_memories": cfg.get("top_k_memories"),
         "bank": cfg.get("bank"),
         "embed_model": cfg.get("embed_model"),
         "bank_entries": cfg.get("bank_entries"),
     })
+    # Knobs that finalize_eval copies into the summary when a pass completes, but
+    # which the config carries from the start -- so a run summarized WHILE it is
+    # still going reports what it is actually running rather than a default.
+    for key in ("granularity", "provenance", "failure_coverage_bank",
+                "mean_block_chars"):
+        if s.get(key) is None and cfg.get(key) is not None:
+            s[key] = cfg[key]
     if "errors" not in s:   # pass still running; the summary is written at the end
         s["errors"] = sum(1 for p in state.get("puzzles", {}).values()
                           if p.get("terminal_reason") == "error")
@@ -295,15 +317,16 @@ def analyse(path: pathlib.Path) -> dict:
     data = json.loads(path.read_text())
     # Three on-disk shapes: single-pass runs ({summary, episodes}), multi-trial
     # Reflexion state files ({config, trials, puzzles, memory}) and memp state
-    # files ({config: {schema: memp-*}, puzzles}). A memp *bank* is none of these
-    # -- it holds procedures, not episodes -- so name it rather than render junk.
+    # files ({config: {schema: <method>-*}, puzzles}). A *bank* is none of these
+    # -- it holds memories, not episodes -- so name it rather than render junk.
     schema = data.get("config", {}).get("schema", "")
-    if data.get("schema") == "memp-bank-v1" or "entries" in data:
+    if data.get("schema") in BANK_FAMILY or "entries" in data:
         stats = data.get("stats", {})
         raise ValueError(
-            f"a memp bank ({len(data.get('entries', []))} entries, "
-            f"stats={stats}), not a run; nothing to summarize")
-    if schema.startswith("memp"):
+            f"a {data.get('schema', 'memory')} bank "
+            f"({len(data.get('entries', []))} entries, stats={stats}), not a run; "
+            f"nothing to summarize")
+    if method_of(schema) in STATE_FAMILY:
         episodes = episodes_from_memp_state(data)
         summary = summary_from_memp_state(data)
         state = None
@@ -378,16 +401,42 @@ def render(a: dict, top: int) -> str:
     if s.get("arm"):
         note = {"memory": "   [Reflexion: reflections injected]",
                 "control": "   [CONTROL: same trials, no memory]",
-                "retrieved": "   [Memp: cosine top-k procedures injected]",
-                "random": "   [Memp ABLATION: random procedures injected]"}
+                "retrieved": "   [cosine top-k memories injected]",
+                "random": "   [ABLATION: randomly chosen memories injected]",
+                "fixed": "   [ABLATION: the same k memories for every item]",
+                "avefact": "   [Memp AveFact: keyword-averaged retrieval]"}
         w(f"  {'arm:':<20} {s['arm']}{note.get(s['arm'], '')}")
-    if s.get("method") == "memp":
+    if s.get("method") in STATE_FAMILY:
         if s.get("phase") == "build":
             w(f"  {'phase:':<20} build   [memoryless pass over train; feeds distill]")
         else:
             w(f"  {'top-k memories:':<20} {s.get('top_k_memories', '?')}")
-            w(f"  {'granularity:':<20} {s.get('granularity', 'script')}"
-              "   [paper's Build policy: script | trajectory | proceduralization]")
+            scale = {
+                "memp": "   [paper's Build policy: script | trajectory | "
+                        "proceduralization]",
+                "memorybank": "   [the paper's two storage layers: "
+                              "case-record | case]",
+                "contrastive": "   [WHICH HALVES ARE SHOWN -- this is the "
+                               "independent variable]",
+            }.get(s.get("method"), "")
+            # Each driver's own argparse default, so an old file with no
+            # granularity recorded still reports what it must have run under.
+            gran = s.get("granularity") or {
+                "memp": "script", "memorybank": "case-record",
+                "contrastive": "contrastive"}.get(s.get("method"), "(not recorded)")
+            w(f"  {'granularity:':<20} {gran}{scale}")
+            # Contrastive only: what share of the entries the actor actually saw
+            # carried a failed attempt. It bounds what the failure half could
+            # have done, so it belongs beside the accuracy, not in a file only.
+            if s.get("failure_coverage_injected") is not None:
+                w(f"  {'failure coverage:':<20} "
+                  f"{s['failure_coverage_injected']:.1%} of injected entries "
+                  f"carried a failed attempt"
+                  + (f" (bank: {s['failure_coverage_bank']:.1%})"
+                     if s.get("failure_coverage_bank") is not None else ""))
+            if s.get("mean_block_chars"):
+                w(f"  {'injected block:':<20} "
+                  f"~{s['mean_block_chars'] // 4} tokens mean")
             if s.get("provenance") and s["provenance"] != "all":
                 w(f"  {'bank provenance:':<20} {s['provenance']}"
                   "   [agent = paper-faithful successes-only build]")

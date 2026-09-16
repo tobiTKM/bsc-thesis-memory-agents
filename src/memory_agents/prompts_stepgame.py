@@ -416,3 +416,133 @@ def format_cases(entries, granularity: str = "case-record") -> str:
         label="Case", field="case_note",
         abstract_at=("case-record", "case"),
         exemplar_at=("case",))
+
+
+
+# --------------------------------------------------------------------------- #
+# Contrastive memory (docs/contrastive.md) -- StepGame renderers.
+#
+# StepGame is single-turn, so a failure is one wrong answer plus the reasoning that
+# produced it, and there is no rule_status to quote -- broken_rules() returns []
+# and the prompt falls back to the answer the attempt gave. Everything else is the
+# SPaRC design unchanged.
+# --------------------------------------------------------------------------- #
+_CONTRASTIVE_HEADER = (
+    "\n\nMemory from previous questions with a similar structure. Each item is "
+    "either something that WORKED on a question you answered correctly, or "
+    "something that FAILED on one you got wrong. Read the label before the text: "
+    "the failures are there to be avoided, not followed. They come from OTHER "
+    "questions -- never use one as a source for this question's answer."
+)
+_POSITIVE_ONLY_HEADER = (
+    "\n\nMemory from previous questions with a similar structure: strategies that "
+    "WORKED on questions you answered correctly. They come from OTHER questions -- "
+    "never use one as a source for this question's answer."
+)
+_AVOID_ONLY_HEADER = (
+    "\n\nMemory from previous questions with a similar structure: mistakes that made "
+    "attempts FAIL. They are there to be avoided, not followed. They come from "
+    "OTHER questions -- never use one as a source for this question's answer."
+)
+
+# See the note on prompts._ALL_DO_HEADER: `hindsight` renders every item as a DO, so
+# the mixed-sign header promises failures its block never contains.
+_ALL_DO_HEADER = (
+    "\n\nMemory from previous questions with a similar structure: strategies for "
+    "answering questions of this kind. They come from OTHER questions -- never use one "
+    "as a source for this question's answer."
+)
+
+_DO = "DO -- this worked on a question like this one:"
+_DONT = "DO NOT -- this is how an attempt at a question like this one failed:"
+_WITHHELD = "  (nothing recorded for this question under this arm)"
+
+
+def format_failed_exemplar(exemplar: dict) -> str:
+    """The concrete artifact of a DON'T on a single-turn task.
+
+    StepGame has no move sequence, so what a failed attempt leaves is its shape and
+    the label it produced. The correct answer is deliberately absent -- it lives in
+    the `hindsight` half, and a DON'T that carried it would stop being a warning.
+    """
+    return (f"That attempt faced a {exemplar.get('hops', '?')}-hop chain over "
+            f"{exemplar.get('sentences', '?')} sentences "
+            f"({exemplar.get('unused', 0)} not needed); "
+            f"relations {', '.join(exemplar.get('relations', [])) or 'none'}")
+
+
+def format_contrastive(entries, granularity: str = "avoid", exemplars: bool = False,
+                       framing: str = "mixed") -> str:
+    """The injected block at contrastive eval time. Arms as on SPaRC."""
+    from .memory.contrastive import AGENT, GRANULARITIES
+    if granularity not in GRANULARITIES:
+        raise ValueError(f"unknown granularity {granularity!r}")
+    if framing not in ("mixed", "matched"):
+        raise ValueError(f"unknown framing {framing!r}")
+    headers = {"positive-only": _POSITIVE_ONLY_HEADER,
+               "avoid-only": _AVOID_ONLY_HEADER}
+    if framing == "matched":
+        headers["hindsight"] = _ALL_DO_HEADER
+    parts = [headers.get(granularity, _CONTRASTIVE_HEADER)]
+    for i, entry in enumerate(entries, 1):
+        positive = entry.get("provenance") == AGENT
+        if positive:
+            text = "" if granularity == "avoid-only" else (
+                entry.get("strategy") or "")
+        else:
+            field = "hindsight" if granularity == "hindsight" else "avoid"
+            text = "" if granularity == "positive-only" else (
+                entry.get(field) or "")
+        body = [f"\nItem {i}:"]
+        if not text.strip():
+            body.append(_WITHHELD)
+        else:
+            shown_as_do = positive or granularity == "hindsight"
+            body.append(_DO if shown_as_do else _DONT)
+            body.append(text.strip())
+            if exemplars:
+                ex = entry.get("exemplar" if shown_as_do else "failed_exemplar")
+                if ex:
+                    body.append(format_exemplar(ex) if shown_as_do
+                                else format_failed_exemplar(ex))
+        parts.append("\n".join(body))
+    return "\n".join(parts)
+
+
+def stepgame_avoid_prompt(episode, key_text: str, record, rules=()) -> str:
+    """Distil ONE reusable DON'T from one wrong answer.
+
+    **The distiller never sees the gold label.** It gets the story, the question,
+    the attempt's own answer and reasoning, and the fact that it was wrong -- the
+    same signal the Reflexion reflector gets here (docs/stepgame.md section 4.1).
+    Nothing forbids using gold on a TRAIN item -- Memp's hindsight prompt does, and
+    that is exactly what the `hindsight` control arm is -- but a DON'T written with
+    the answer in hand becomes a statement about the answer rather than about the
+    error, and the two arms would then differ in more than one thing.
+
+    `rules` is always empty here: a single-turn benchmark has no per-rule verdict.
+    The parameter is kept so the benchmark seam has one signature.
+    """
+    answered = (episode.transitions[0].action if episode.transitions else None)
+    return f"""{relations_preamble(artifact="warning")}
+    You are an expert spatial-reasoning agent building a memory of MISTAKES:
+    reusable, high-level warnings distilled from attempts that got the answer wrong.
+
+    The attempt below answered {answered or 'nothing parseable'} and that was
+    INCORRECT. Distil what its reasoning got wrong into ONE reusable warning for
+    questions with this structure. Give 2-3 numbered points, each naming a mistake
+    to avoid and what to do instead. At most 80 words.
+
+    Do not state or guess what the correct answer to this question is -- you have
+    not been told it, and a guess would poison the memory. Do not output an answer
+    line. Describe the error, not the answer.
+
+    Question structure:
+    {key_text}
+
+{_story_block(record)}
+
+    What the attempt said:
+    {episode.last_obs}
+
+    Warning:"""

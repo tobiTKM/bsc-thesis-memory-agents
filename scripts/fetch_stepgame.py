@@ -50,6 +50,13 @@ VARIANT_DIR = {"clean": "correct_clean", "noise": "correct_noise"}
 
 TEMPLATE_FILE = "sentence_to_relation.py"
 
+# Li et al.'s own actor prompt, mirrored for the `upstream` calibration protocol
+# (see src/memory_agents/prompts_stepgame_upstream.py). Fetched rather than
+# vendored for exactly the reason the corpus is: no LICENSE upstream. It is the
+# k=1-10 base prompt, which is the one their headline per-k table was produced
+# with, so it is the right one to put beside our zero-shot numbers.
+PROMPT_FILES = ["prompts/baseline_clean1_10.txt"]
+
 DEFAULT_KS = list(range(1, 11))
 DEFAULT_SPLITS = ["train", "test"]      # `valid` exists upstream; no arm uses it
 DEFAULT_VARIANTS = ["clean", "noise"]
@@ -119,6 +126,16 @@ def main() -> int:
     total_bytes += size
     files[TEMPLATE_FILE] = {"sha256": sha256(dest), "bytes": size}
     print(f"[fetch] {'GET ' if got else 'have'} {TEMPLATE_FILE} ({size:,} B)")
+
+    # Their actor prompt, for the calibration protocol. Small, and fetched with
+    # the corpus so the two can never drift to different commits.
+    for rel in PROMPT_FILES:
+        dest = out / rel
+        got, size = download(f"{RAW}/{rel}", dest, args.force)
+        fetched, cached = (fetched + 1, cached) if got else (fetched, cached + 1)
+        total_bytes += size
+        files[rel] = {"sha256": sha256(dest), "bytes": size}
+        print(f"[fetch] {'GET ' if got else 'have'} {rel} ({size:,} B)")
 
     for variant in args.variants:
         for split in args.splits:

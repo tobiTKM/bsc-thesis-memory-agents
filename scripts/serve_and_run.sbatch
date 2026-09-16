@@ -64,6 +64,19 @@
 #   sbatch -J mb-ret  --export=ALL,DRIVER=memorybank,PHASE=eval,ARM=retrieved,LIMIT=0,BANK=<memorybank_bank_*.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
 #   sbatch -J mb-rnd  --export=ALL,DRIVER=memorybank,PHASE=eval,ARM=random,LIMIT=0,BANK=<memorybank_bank_*.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
 #
+# Contrastive (docs/contrastive.md) -- DOs distilled from the actor's successes,
+# DON'Ts from its failures. CO_GRANULARITY=hindsight is the CONTROL arm (the same
+# bank with Memp's gold-derived text on the failed entries), so run it every time.
+#   sbatch -J co-dist --export=ALL,DRIVER=contrastive,PHASE=distill,BUILD=<memp_build_train_*.json> scripts/serve_and_run.sbatch
+#   sbatch -J co-avo  --export=ALL,DRIVER=contrastive,PHASE=eval,ARM=retrieved,CO_GRANULARITY=avoid,LIMIT=0,BANK=<contrastive_bank_*.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   sbatch -J co-hin  --export=ALL,DRIVER=contrastive,PHASE=eval,ARM=retrieved,CO_GRANULARITY=hindsight,LIMIT=0,BANK=<bank>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   sbatch -J co-pos  --export=ALL,DRIVER=contrastive,PHASE=eval,ARM=retrieved,CO_GRANULARITY=positive-only,LIMIT=0,BANK=<bank>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   # the arm that makes a null readable: a weak actor's bank is ~86% DON'Ts, so a
+#   # plain top-k injects almost no worked example (docs/contrastive.md section 2).
+#   sbatch -J co-bal  --export=ALL,DRIVER=contrastive,PHASE=eval,CO_ARM=balanced,MIN_POSITIVE=1,CO_GRANULARITY=avoid,LIMIT=0,BANK=<bank>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   sbatch -J co-rnd  --export=ALL,DRIVER=contrastive,PHASE=eval,ARM=random,CO_GRANULARITY=avoid,LIMIT=0,BANK=<bank>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
+#   python scripts/run_contrastive.py --phase compare --baseline <root.json> --retrieved <avoid.json> --hindsight <hin.json> --positive <pos.json> --random <rnd.json>
+#
 # StepGame (BENCHMARK=stepgame on any of the above; the splits are frozen files,
 # so LIMIT is only for smoke tests). Full campaign, in dependency order:
 #
@@ -74,7 +87,13 @@
 #   sbatch -J sg-build --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=build,SPLIT=train scripts/serve_and_run.sbatch
 #   sbatch -J sg-dist  --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=distill,BUILD=<memp_build_stepgame_train_*.json> scripts/serve_and_run.sbatch
 #   sbatch -J sg-emb   -G A100:1 -t 01:00:00 --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=embed,TP=1 scripts/serve_and_run.sbatch
-#   sbatch -J sg-up    --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=upgrade,BANK=<memp_bank_stepgame_*.json> scripts/serve_and_run.sbatch
+# PHASE=upgrade is NOT a job: run_upgrade() takes no model and no GPU (on a
+# single-turn benchmark it just attaches question + worked derivation, built by
+# the benchmark), and this dispatcher has no `upgrade` branch -- submitting it
+# allocates GPUs, waits out the model load and then dies on `unknown PHASE`.
+# Run it on the login node, between the distill and the eval arms:
+#   python scripts/run_memp.py --phase upgrade --benchmark stepgame \
+#       --bank results/json/memp_bank_stepgame_<tag>.json
 #   sbatch -J sg-ret   --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=eval,ARM=retrieved,BANK=<bank_traj.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
 #   sbatch -J sg-fix   --export=ALL,BENCHMARK=stepgame,DRIVER=memp,PHASE=eval,ARM=fixed,BANK=<bank_traj.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
 #   sbatch -J sg-mbd   --export=ALL,BENCHMARK=stepgame,DRIVER=memorybank,PHASE=distill,RULES_PREAMBLE=on,BUILD=<memp_build_stepgame_train_*.json> scripts/serve_and_run.sbatch
@@ -127,7 +146,7 @@ SMOKE="${SMOKE:-1}"                       # 0 skips the 2-prompt smoke check
 # `reflexion` is the two-phase memory method (see scripts/run_reflexion.py). New
 # memory methods slot in here as extra DRIVER cases -- the serve block above is
 # method-agnostic, so nothing else changes.
-DRIVER="${DRIVER:-baseline}"              # baseline | reflexion | memp | memorybank
+DRIVER="${DRIVER:-baseline}"              # baseline | reflexion | memp | memorybank | contrastive
 
 # ---- Benchmark selection (all drivers) --------------------------------------
 # Which task the arms run on. `stepgame` reads the frozen splits under
@@ -140,7 +159,13 @@ BENCHMARK="${BENCHMARK:-sparc}"           # sparc | stepgame
 STEPGAME_TRAIN="${STEPGAME_TRAIN:-}"      # split JSONL; empty = the standard one
 STEPGAME_TEST="${STEPGAME_TEST:-}"        # split JSONL; empty = the standard one
 KEY_VARIANT="${KEY_VARIANT:-structural}"  # structural | lexical
-PHASE="${PHASE:-root}"                    # reflexion: root | arm    memp: build | distill | embed | eval    memorybank: distill | eval
+# PROMPT_PROTOCOL selects the StepGame actor prompt. `ours` is zero-shot and the
+# thesis protocol; `upstream-header` adds Li et al.'s clock/cardinal decoders and
+# stays zero-shot; `upstream` is their full 10-shot prompt and is a CALIBRATION
+# point only -- its exemplars are injected memory, so it is not a memoryless
+# baseline and must never be used as a control arm.
+PROMPT_PROTOCOL="${PROMPT_PROTOCOL:-ours}"  # ours | upstream-header | upstream
+PHASE="${PHASE:-root}"                    # reflexion: root | arm    memp: build | distill | embed | eval    memorybank: distill | eval    contrastive: eval (distill needs no GPU)
 ARM="${ARM:-}"                            # reflexion arm: memory | control    memp/memorybank eval: retrieved | random
 ROOT="${ROOT:-}"                          # start an arm from this root file
 RESUME="${RESUME:-}"                      # ...or continue this arm file where it stopped
@@ -184,6 +209,29 @@ RULES_PREAMBLE="${RULES_PREAMBLE:-on}"    # on | off -- the rulebook ablation, f
 # size"): a bank silently truncated to 50 of 500 entries would still run, still
 # retrieve, and quietly measure the wrong thing. 0 = the whole build file.
 DISTILL_LIMIT="${DISTILL_LIMIT:-0}"       # smoke-test knob for PHASE=distill
+
+# ---- Contrastive knobs (DRIVER=contrastive; ignored otherwise) ---------------
+# Its own granularity scale (correct | failure | contrastive | contrastive-marked
+# | contrastive-lesson), so it cannot share GRANULARITY or MB_GRANULARITY -- a
+# typo'd value must fail the driver's choices check, not silently select another
+# method's arm. See docs/contrastive.md section 3.
+# Its own granularity scale (avoid | hindsight | positive-only | avoid-only), so it
+# cannot share GRANULARITY or MB_GRANULARITY -- a typo'd value must fail the driver's
+# choices check, not silently select another method's arm. See docs/contrastive.md
+# section 3; `hindsight` is the control, not an afterthought.
+CO_GRANULARITY="${CO_GRANULARITY:-avoid}"
+# retrieved | balanced | random | random-balanced. `balanced` guarantees MIN_POSITIVE
+# DO entries per block; on a weak actor the bank is ~86% DON'Ts and a plain top-k
+# injects almost no worked example, which is what makes a null unreadable.
+CO_ARM="${CO_ARM:-}"                      # defaults to ARM when unset
+MIN_POSITIVE="${MIN_POSITIVE:-1}"
+# on = append the concrete artifact to each item (a winning line to a DO, the losing
+# line to a DON'T). Needs a bank run through `--phase exemplars` (CPU, login node).
+# Memp's `script` granularity does this; the 2026-09-14 campaign did not.
+CO_EXEMPLARS="${CO_EXEMPLARS:-off}"
+# mixed = the two-sign header on every arm (what that campaign ran, and a mismatch
+# for `hindsight`, whose items are all DO); matched = a header per arm.
+CO_FRAMING="${CO_FRAMING:-mixed}"
 # Extra args spliced verbatim into the vLLM serve command. Empty by default, so
 # existing drivers are untouched; PHASE=embed defaults it below.
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
@@ -430,6 +478,7 @@ fi
 BENCH_ARGS=(--benchmark "$BENCHMARK")
 if [[ "$BENCHMARK" == "stepgame" ]]; then
     BENCH_ARGS+=(--key-variant "$KEY_VARIANT")
+    BENCH_ARGS+=(--prompt-protocol "$PROMPT_PROTOCOL")
     [[ -n "$STEPGAME_TRAIN" ]] && BENCH_ARGS+=(--stepgame-train "$STEPGAME_TRAIN")
     [[ -n "$STEPGAME_TEST"  ]] && BENCH_ARGS+=(--stepgame-test  "$STEPGAME_TEST")
 fi
@@ -442,7 +491,24 @@ COMMON_ARGS=(--split "$SPLIT" --concurrency "$CONCURRENCY" \
 case "$DRIVER" in
   baseline)
     echo "[$(date +%T)] baseline: split=$SPLIT concurrency=$CONCURRENCY limit=$LIMIT"
-    python -u scripts/run_baseline.py "${COMMON_ARGS[@]}" --limit "$LIMIT"
+    # OUT, as every other driver already honours it. The auto-name carries the
+    # served model and the split *name*, but StepGame has two `test` splits (the
+    # k-stratified one and the by-hops one), so auto-named runs of the two differ
+    # only by timestamp -- and the later compare phases reference baselines by a
+    # fixed path, the same way memp_build_train_<tag>.json is referenced.
+    python -u scripts/run_baseline.py "${COMMON_ARGS[@]}" --limit "$LIMIT" \
+        ${OUT:+--out "$OUT"}
+    ;;
+  probe)
+    # Adversarial probe on the StepGame baseline (scripts/probe_stepgame.py):
+    # four arms over one sample -- production prompt, bare prompt, entity-renamed,
+    # and a scrambled-story control that must fall to the ~11% chance floor. Not
+    # part of the campaign; it exists to show the near-ceiling gpt-oss number is
+    # reasoning rather than a leak. PER_K sets the sample size per file-k.
+    echo "[$(date +%T)] probe: per_k=${PER_K:-20} arms=${ARMS:-full,bare,renamed,scrambled}"
+    python -u scripts/probe_stepgame.py "${COMMON_ARGS[@]}" \
+        --per-k "${PER_K:-20}" --arms "${ARMS:-full,bare,renamed,scrambled}" \
+        ${OUT:+--out "$OUT"}
     ;;
   reflexion)
     case "$PHASE" in
@@ -589,8 +655,55 @@ case "$DRIVER" in
         echo "unknown PHASE=$PHASE for DRIVER=memorybank (expected: distill | eval)" >&2; exit 1 ;;
     esac
     ;;
+  contrastive)
+    # Two phases. The train build pass and the embeddings are Memp's, reused verbatim
+    # (this method keys on the identical puzzle_key_text), so there is nothing here to
+    # re-run for them. distill writes all three texts -- strategy, avoid, hindsight --
+    # in ONE pass, so the method arm and its control can never come from different
+    # banks.
+    case "$PHASE" in
+      distill)
+        if [[ -n "$RESUME" ]]; then
+            echo "[$(date +%T)] contrastive distill: resuming $RESUME"
+            python -u scripts/run_contrastive.py --phase distill --resume "$RESUME" \
+                --concurrency "$CONCURRENCY" --chunk "$CHUNK"
+        else
+            [[ -n "$BUILD" ]] || { echo "PHASE=distill needs BUILD=<memp_build_*.json> or RESUME=<bank file>" >&2; exit 1; }
+            echo "[$(date +%T)] contrastive distill: $BUILD -> DOs from successes, DON'Ts from failures"
+            python -u scripts/run_contrastive.py --phase distill "${COMMON_ARGS[@]}" \
+                --build "$BUILD" --distill-max-tokens "$DISTILL_MAX_TOKENS" \
+                --chunk "$CHUNK" --limit "$DISTILL_LIMIT" ${OUT:+--out "$OUT"}
+        fi
+        ;;
+      eval)
+        if [[ -n "$RESUME" ]]; then
+            echo "[$(date +%T)] contrastive eval: resuming $RESUME"
+            python -u scripts/run_contrastive.py --phase eval --resume "$RESUME" \
+                --concurrency "$CONCURRENCY" --chunk "$CHUNK"
+        else
+            [[ -n "$BANK" && -n "$EMBEDDINGS" ]] || { echo "PHASE=eval needs BANK=<contrastive_bank_*.json> and EMBEDDINGS=<memp_embeddings_*.npz>" >&2; exit 1; }
+            # CO_ARM exists because this driver's ARM scale is wider than the other
+            # methods' (it adds `balanced` and `random-balanced`); ARM still works for
+            # the two values they share, so existing submit habits keep working.
+            EFFECTIVE_ARM="${CO_ARM:-$ARM}"
+            [[ -n "$EFFECTIVE_ARM" ]] || { echo "PHASE=eval needs ARM or CO_ARM (retrieved | balanced | random | random-balanced)" >&2; exit 1; }
+            echo "[$(date +%T)] contrastive eval: arm=$EFFECTIVE_ARM k=$TOP_K_MEMORIES limit=$LIMIT " \
+                 "granularity=$CO_GRANULARITY min_positive=$MIN_POSITIVE exemplars=$CO_EXEMPLARS" \
+                 "framing=$CO_FRAMING provenance=$PROVENANCE"
+            python -u scripts/run_contrastive.py --phase eval "${COMMON_ARGS[@]}" \
+                --limit "$LIMIT" --chunk "$CHUNK" --arm "$EFFECTIVE_ARM" --bank "$BANK" \
+                --embeddings "$EMBEDDINGS" --top-k-memories "$TOP_K_MEMORIES" \
+                --granularity "$CO_GRANULARITY" --min-positive "$MIN_POSITIVE" \
+                --exemplars "$CO_EXEMPLARS" --framing "$CO_FRAMING" \
+                --provenance "$PROVENANCE" ${OUT:+--out "$OUT"}
+        fi
+        ;;
+      *)
+        echo "unknown PHASE=$PHASE for DRIVER=contrastive (expected: distill | eval; --phase exemplars takes no GPU, run it on the login node)" >&2; exit 1 ;;
+    esac
+    ;;
   *)
-    echo "unknown DRIVER=$DRIVER (expected: baseline | reflexion | memp | memorybank)" >&2; exit 1 ;;
+    echo "unknown DRIVER=$DRIVER (expected: baseline | reflexion | memp | memorybank | contrastive)" >&2; exit 1 ;;
 esac
 
 echo "[$(date +%T)] done; the cleanup trap stops vLLM and frees the GPUs."

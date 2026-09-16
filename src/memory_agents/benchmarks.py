@@ -37,6 +37,10 @@ class Benchmark(ABC):
     # Granularities the injected block supports, first one the default.
     granularities: tuple = ("script", "trajectory", "proceduralization")
     case_granularities: tuple = ("case-record", "case")
+    # Contrastive memory's content arms (docs/contrastive.md section 3); the tuple
+    # lives in memory/contrastive.py so a driver and a renderer cannot disagree.
+    contrastive_granularities: tuple = (
+        "avoid", "hindsight", "positive-only", "avoid-only")
 
     # ---- dataset ---------------------------------------------------------
     @abstractmethod
@@ -88,6 +92,18 @@ class Benchmark(ABC):
     def gold_trajectory(self, record) -> dict:
         """The verbatim record for a gold entry, in `reflection_context` shape."""
 
+    def failed_trajectory(self, record, episode_ctx: dict) -> dict:
+        """The verbatim record of a FAILED attempt, in `reflection_context` shape.
+
+        What contrastive memory distils its DON'Ts from. Already in that shape in
+        the build file -- `episode_record()` keeps `episode_context` for failures
+        as well as successes, which is why this method needs no new build pass --
+        so the default hands it back untouched. A benchmark overrides only if it
+        has to normalise something. Returns {} when there is nothing usable (a
+        crashed episode has no context at all).
+        """
+        return dict(episode_ctx) if episode_ctx else {}
+
     def verify_gold(self, split: str, n: int) -> None:
         """Optional self-check that the gold source is sound. Runs per distill job."""
 
@@ -113,6 +129,11 @@ class Benchmark(ABC):
     def format_procedures(self, entries, granularity: str) -> str: ...
     @abstractmethod
     def format_cases(self, entries, granularity: str) -> str: ...
+    @abstractmethod
+    def format_contrastive(self, entries, granularity: str, exemplars: bool = False,
+                           framing: str = "mixed") -> str: ...
+    @abstractmethod
+    def avoid_prompt(self, episode, key_text, record, rules=()) -> str: ...
 
 
 # =========================================================================== #
@@ -251,6 +272,17 @@ class SparcBenchmark(Benchmark):
         from .prompts import format_cases
         return format_cases(entries, granularity=granularity)
 
+    def format_contrastive(self, entries, granularity, exemplars=False,
+                           framing="mixed"):
+        from .prompts import format_contrastive
+        return format_contrastive(entries, granularity=granularity,
+                                  exemplars=exemplars, framing=framing)
+
+    def avoid_prompt(self, episode, key_text, record, rules=()):
+        from .prompts import contrastive_avoid_prompt
+        return contrastive_avoid_prompt(
+            episode, key_text, self.polyshapes(record), rules=rules)
+
 
 # =========================================================================== #
 # StepGame -- single-turn
@@ -267,10 +299,19 @@ class StepGameBenchmark(Benchmark):
     interactive = False
 
     def __init__(self, train_split=None, test_split=None, variant: str = "clean",
-                 key_variant: str = "structural"):
+                 key_variant: str = "structural", prompt_protocol: str = "ours"):
         from .envs import stepgame
+        from .prompts_stepgame_upstream import PROTOCOLS
         self._sg = stepgame
         self.variant = variant
+        # Which actor prompt the arm runs under. "ours" is the thesis protocol;
+        # the two "upstream*" values reproduce Li et al.'s prompt so our numbers
+        # can be put beside their published table. See prompts_stepgame_upstream.
+        if prompt_protocol not in PROTOCOLS:
+            raise SystemExit(
+                f"unknown --prompt-protocol {prompt_protocol!r} "
+                f"(expected one of {', '.join(PROTOCOLS)})")
+        self.prompt_protocol = prompt_protocol
         # "structural" keys on the reasoning shape, "lexical" on the phrasing --
         # the ablation of docs/stepgame.md section 4.2.
         if key_variant not in ("structural", "lexical"):
@@ -342,6 +383,9 @@ class StepGameBenchmark(Benchmark):
         return self._sg.is_success(predicted, record.gold)
 
     def format_item(self, record) -> str:
+        if self.prompt_protocol != "ours":
+            from .prompts_stepgame_upstream import format_item_upstream
+            return format_item_upstream(record)
         return self._sg.format_item(record)
 
     # ---- running ---------------------------------------------------------
@@ -414,8 +458,8 @@ class StepGameBenchmark(Benchmark):
 
     # ---- prompts ---------------------------------------------------------
     def system_prompt(self, record=None) -> str:
-        from .prompts_stepgame import stepgame_system_prompt
-        return stepgame_system_prompt()
+        from .prompts_stepgame_upstream import system_prompt_for
+        return system_prompt_for(self.prompt_protocol)
 
     def reflection_prompt(self, episode, previous=()):
         from .prompts_stepgame import stepgame_reflection_prompt
@@ -452,6 +496,22 @@ class StepGameBenchmark(Benchmark):
         from .prompts_stepgame import format_cases
         return format_cases(entries, granularity=granularity)
 
+    def format_contrastive(self, entries, granularity, exemplars=False,
+                           framing="mixed"):
+        from .prompts_stepgame import format_contrastive
+        return format_contrastive(entries, granularity=granularity,
+                                  exemplars=exemplars, framing=framing)
+
+    def avoid_prompt(self, episode, key_text, record, rules=()):
+        from .prompts_stepgame import stepgame_avoid_prompt
+        return stepgame_avoid_prompt(episode, key_text, record, rules=rules)
+
+    # ---- contrastive memory ----------------------------------------------
+    # failed_trajectory falls through to the base implementation:
+    # run_single_turn_episode already stores the question as first_obs, the reply
+    # as last_obs and the parsed label as the single move, which is exactly the
+    # shape prompts_stepgame.format_failed_attempt reads.
+
 
 # =========================================================================== #
 BENCHMARKS = {"sparc": SparcBenchmark, "stepgame": StepGameBenchmark}
@@ -474,6 +534,14 @@ def add_benchmark_args(ap) -> None:
     ap.add_argument("--key-variant", default="structural",
                     choices=["structural", "lexical"],
                     help="StepGame retrieval key: reasoning shape, or phrasing")
+    ap.add_argument("--prompt-protocol", default="ours",
+                    choices=["ours", "upstream-header", "upstream"],
+                    help="StepGame actor prompt. `ours` is zero-shot and the "
+                         "thesis protocol. `upstream-header` adds Li et al.'s "
+                         "clock/cardinal decoders, still zero-shot. `upstream` "
+                         "is their full 10-shot prompt -- a calibration point "
+                         "only: its exemplars are injected memory, so it is NOT "
+                         "a memoryless baseline.")
 
 
 def build_benchmark(args) -> Benchmark:
@@ -490,7 +558,8 @@ def build_benchmark(args) -> Benchmark:
             "stepgame",
             train_split=get("stepgame_train"),
             test_split=get("stepgame_test"),
-            key_variant=get("key_variant", "structural") or "structural")
+            key_variant=get("key_variant", "structural") or "structural",
+            prompt_protocol=get("prompt_protocol", "ours") or "ours")
     return get_benchmark("sparc")
 
 

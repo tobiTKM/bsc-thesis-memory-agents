@@ -223,8 +223,17 @@ class MempMemory(Memory):
         """
         rng = random.Random(seed_key)
         picked = rng.sample(range(len(self.entries)), k=min(k, len(self.entries)))
-        # Same presentation order convention as retrieve() (stable by entry id):
-        # the arms must differ in WHICH entries appear, not in how they are laid out.
+        # Sorted by entry id so the draw is stable across resumes.
+        #
+        # NOTE (2026-09-16): this comment used to claim id order was "the same
+        # presentation order convention as retrieve()". It is not -- retrieve()
+        # orders by (-similarity, id), with the id only as a tie-break. So every
+        # retrieved-vs-random contrast in this repo differs in presentation ORDER as
+        # well as in which entries appear. For those arms it is second-order (the two
+        # draws share almost no entries anyway), but it is a real confound and it is
+        # not "handled" the way this comment used to assert. It is left UNCHANGED on
+        # purpose: altering it now would make future runs incomparable with the
+        # completed SPaRC campaign. See docs/memp.md threats-to-validity.
         picked.sort(key=lambda i: self.entries[i]["id"])
         return [(self.entries[i], None) for i in picked]
 

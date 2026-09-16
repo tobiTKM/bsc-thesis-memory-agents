@@ -166,6 +166,11 @@ async def main():
     # job, so a report can name what was actually run.
     summary["model_id"] = os.environ.get("LLM_MODEL_ID") or model
     summary["split"] = args.split
+    # Which actor prompt produced this number. Without it a results file is
+    # ambiguous the moment a second protocol exists, and the two are not
+    # comparable: `upstream` is 10-shot and therefore not memoryless.
+    if args.benchmark == "stepgame":
+        summary["prompt_protocol"] = args.prompt_protocol
     summary["max_tokens"] = args.max_tokens
     summary["temperature"] = args.temperature
     summary["top_p"] = args.top_p
