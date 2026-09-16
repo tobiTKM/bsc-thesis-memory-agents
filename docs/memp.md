@@ -800,6 +800,16 @@ for how many comparisons were run.
 
 ### Threats to validity
 
+- **Retrieved and random differ in presentation ORDER as well as in content**
+  (found 2026-09-16). `MempMemory.retrieve` returns entries in similarity order —
+  `(-similarity, id)`, the id only a tie-break — while `random_retrieve` sorts by
+  entry id. A comment asserted the two shared a convention; they do not. The two draws
+  share almost no entries, so order is the smaller of the two differences here and it
+  adds variance to a contrast that already reports a null — i.e. it cuts toward the
+  reported result, not against it. Left unchanged on purpose: altering the retriever
+  now would make future runs incomparable with this completed campaign. See
+  `docs/contrastive.md` §6.3, where the same defect was load-bearing.
+
 - **Single seed, single attempt per puzzle**, so no variance estimate exists across
   repeats — several of the surviving results (e.g. AveFact just missing the Holm
   threshold) are close enough that a repeat run could move them across the line either
@@ -823,6 +833,17 @@ for how many comparisons were run.
   not yet run.** Adjustment was motivated as the only mechanism that could repair a
   rule-wrong procedure once identified — but §3.9 removes rule-wrongness at the source
   and shows it was not the binding constraint, so this is now paper-completeness rather
-  than a live hypothesis.
+  than a live hypothesis. Two of the three are largely subsumed by the contrastive
+  method ([contrastive.md](contrastive.md)), which consolidates failed trajectories
+  alongside successful ones (Vanilla's definition) and whose `contrastive-lesson` arm
+  writes prose from a failure (Adjustment's), so closing them is now a side effect of
+  running that campaign rather than a separate one.
+
+- **§3.9's mechanism is the hypothesis a fourth method was built to test.** The
+  trajectory buys navigation and *costs* rule compliance (wrong +37, dead −71); nothing
+  in this campaign ever put a **concrete, verified** artifact against the
+  wrong-solution pool, only LLM prose, which the same section shows gets drowned out.
+  [contrastive.md](contrastive.md) is that test, with its predictions written down
+  before the arms were submitted.
 - **Transfer was tested at script granularity only** (§3.7), which §3.6 shows to be
   the inert component; a trajectory-granularity transfer test has not been run.

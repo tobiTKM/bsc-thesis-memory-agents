@@ -672,3 +672,238 @@ def sparc_system_prompt(polyshapes) -> str:
     large shared KV prefix. Do not move the variable part earlier.
     """
     return sparc_rules(polyshapes) + _SPARC_IO_CONTRACT
+
+
+
+# --------------------------------------------------------------------------- #
+# Contrastive memory (docs/contrastive.md) -- SPaRC renderers.
+#
+# Appended rather than folded into format_procedures/format_cases on purpose:
+# scripts/regress_sparc.py proves the pre-existing SPaRC path renders byte-
+# identical text, and every accuracy in docs/memp.md and docs/memorybank.md rests
+# on that. Nothing above this line is touched by this method.
+# --------------------------------------------------------------------------- #
+# The block mixes advice of two signs, so the framing has to make the sign of each
+# entry impossible to miss: an unlabelled "the path was sealed off along the top
+# edge" reads as an instruction to do exactly that. Each entry is therefore headed
+# DO or DO NOT, and the header says the bank contains both.
+_CONTRASTIVE_HEADER = (
+    "\n\nMemory from previous puzzles with similar rule combinations. Each item is "
+    "either something that WORKED on a puzzle you solved, or something that FAILED "
+    "on a puzzle you did not. Read the label before the text: the failures are "
+    "there to be avoided, not followed. They come from OTHER puzzles -- adapt the "
+    "advice to this grid, and never copy a move sequence."
+)
+_POSITIVE_ONLY_HEADER = (
+    "\n\nMemory from previous puzzles with similar rule combinations: strategies "
+    "that WORKED on puzzles you solved. They come from OTHER puzzles -- adapt the "
+    "advice to this grid, and never copy a move sequence."
+)
+_AVOID_ONLY_HEADER = (
+    "\n\nMemory from previous puzzles with similar rule combinations: mistakes that "
+    "made attempts FAIL. They are there to be avoided, not followed. They come from "
+    "OTHER puzzles -- adapt the advice to this grid, and never copy a move sequence."
+)
+
+def format_broken_rules(rules) -> str:
+    """The env's own verdict on a failed attempt, compactly, for the avoid prompt.
+
+    `rule_status` details are not uniform: some are counts a reader can act on
+    ("total=3, collected=1"), some are short flat lists naming which region
+    offended ("violations=[0]"), and some are nested tables that run to a whole
+    grid. Dumping the raw dict into the prompt would bury the first two under the
+    third, so this keeps the first two and drops nested values and empty containers
+    -- `mismatches=[]` on a rule that FAILED says nothing at all.
+    """
+    if not rules:
+        return "  Rules it broke: none recorded"
+    parts = []
+    for item in rules:
+        detail = item.get("detail")
+        summary = ""
+        if isinstance(detail, dict):
+            bits = []
+            for k, v in detail.items():
+                if isinstance(v, dict):
+                    continue
+                if isinstance(v, list):
+                    if v and len(v) <= 5 and all(
+                            not isinstance(x, (dict, list)) for x in v):
+                        bits.append(f"{k}={v}")
+                elif v is not None and v != {}:
+                    bits.append(f"{k}={v}")
+            summary = f" ({', '.join(bits)[:90]})" if bits else ""
+        parts.append(f"{item.get('rule', '?')}{summary}")
+    return "  Rules it broke: " + "; ".join(parts)
+
+
+# `hindsight` renders EVERY item as a DO, so the mixed-sign header above promises
+# failures its block never contains. The 12 jobs of 2026-09-14 ran with that mismatch
+# (--framing mixed); --framing matched gives each arm a header describing its own
+# content. Deliberately does not say "puzzles you solved": 429 of the entries are
+# distilled from the dataset's gold path, not from anything the actor solved.
+_ALL_DO_HEADER = (
+    "\n\nMemory from previous puzzles with similar rule combinations: strategies for "
+    "solving puzzles of this kind. They come from OTHER puzzles -- adapt the advice to "
+    "this grid, and never copy a move sequence."
+)
+
+_DO = "DO -- this worked on a puzzle like this one:"
+_DONT = "DO NOT -- this is how an attempt at a puzzle like this one failed:"
+# An entry whose side the arm does not render. Kept as one explicit line rather
+# than dropped, so bank size, retrieval and the number of Items in the block stay
+# identical across arms and only the CONTENT varies.
+_WITHHELD = "  (nothing recorded for this puzzle under this arm)"
+
+
+def format_failed_exemplar(exemplar: dict) -> str:
+    """The concrete artifact of a DON'T: the move sequence the attempt actually played.
+
+    The mirror of format_exemplar, and deliberately NOT that function: a failed
+    attempt never reached the end node, so rendering it as "start -> end, N moves"
+    would assert something untrue. It also must not carry the gold path -- a DON'T
+    that shows the correct solution is no longer learning from the failure, which is
+    the whole distinction between this and the `hindsight` arm.
+    """
+    actions = " ".join(str(a) for a in exemplar.get("actions", []))
+    return (f"What that attempt played ({exemplar.get('n_moves')} moves on a "
+            f"{exemplar.get('width')}x{exemplar.get('height')} grid, from "
+            f"{tuple(exemplar.get('start', ()))}): {actions}; "
+            f"0=right,1=up,2=left,3=down\n"
+            f"  its grid had: {exemplar.get('grid_summary', '?')}")
+
+
+def format_contrastive(entries, granularity: str = "avoid", exemplars: bool = False,
+                       framing: str = "mixed") -> str:
+    """The block injected into the actor's system prompt at contrastive eval time.
+
+    Same seam as format_procedures/format_cases: MemoryAgent.reset appends it AFTER
+    the full system prompt, so the shared KV prefix survives; similarity scores are
+    logged in the results and never rendered, so arms differ only in which entries
+    appear and what those entries are allowed to say.
+
+    The four arms (docs/contrastive.md section 3). Every one of them renders an
+    `agent` entry as its `strategy` -- the positive half is held fixed, and is
+    Memp's own distillation verbatim -- so the arms differ ONLY in what a `failed`
+    entry contributes:
+
+      avoid          -- its `avoid` text (the method)
+      hindsight      -- its `hindsight` text: a procedure distilled from the gold
+                        path, i.e. exactly what Memp banks for this puzzle. THE
+                        CONTROL: same bank, same retriever, same positives.
+      positive-only  -- nothing; isolates what the failed entries contribute at all
+      avoid-only     -- its `avoid` text, and the `agent` entries contribute
+                        nothing; the pure-negative arm
+    """
+    from .memory.contrastive import AGENT, GRANULARITIES
+    if granularity not in GRANULARITIES:
+        raise ValueError(f"unknown granularity {granularity!r}")
+    if framing not in ("mixed", "matched"):
+        raise ValueError(f"unknown framing {framing!r}")
+    headers = {"positive-only": _POSITIVE_ONLY_HEADER,
+               "avoid-only": _AVOID_ONLY_HEADER}
+    if framing == "matched":
+        headers["hindsight"] = _ALL_DO_HEADER
+    parts = [headers.get(granularity, _CONTRASTIVE_HEADER)]
+    for i, entry in enumerate(entries, 1):
+        positive = entry.get("provenance") == AGENT
+        if positive:
+            text = "" if granularity == "avoid-only" else (
+                entry.get("strategy") or "")
+        else:
+            field = "hindsight" if granularity == "hindsight" else "avoid"
+            text = "" if granularity == "positive-only" else (
+                entry.get(field) or "")
+        body = [f"\nItem {i}:"]
+        if not text.strip():
+            body.append(_WITHHELD)
+        else:
+            # `hindsight` is a procedure for solving the puzzle, not a mistake, so
+            # it is labelled DO even though the entry came from a failure. That is
+            # the point of the control: it is Memp's positive framing of the same
+            # 429 puzzles.
+            shown_as_do = positive or granularity == "hindsight"
+            body.append(_DO if shown_as_do else _DONT)
+            body.append(text.strip())
+            if exemplars:
+                # The concrete artifact matching what was just said. A DO carries a
+                # winning line (the actor's own, or the gold path for an entry it
+                # failed -- which is exactly what Memp's `script` granularity
+                # attaches); a DON'T carries the losing line the warning came from.
+                # Keyed on how the item is RENDERED, not on its provenance, or the
+                # `hindsight` arm would show a failed attempt beside a procedure.
+                ex = entry.get("exemplar" if shown_as_do else "failed_exemplar")
+                if ex:
+                    body.append(format_exemplar(ex) if shown_as_do
+                                else format_failed_exemplar(ex))
+        parts.append("\n".join(body))
+    return "\n".join(parts)
+
+
+def contrastive_avoid_prompt(episode, key_text: str, polyshapes, rules=()) -> str:
+    """Distil ONE reusable DON'T from one failed trajectory. The method's only new
+    model call -- the positive half of the bank is written by Memp's own
+    memp_distill_trajectory_prompt, unchanged, and the `hindsight` control arm by
+    memp_distill_gold_prompt, unchanged.
+
+    Two deliberate choices, both from docs/memp.md section 3.9:
+
+    * The rulebook is prepended. Without it the v1 banks misstated SPaRC's rules in
+      33-51% of entries, because the distiller had to guess the mechanics from cell
+      labels. A wrong DON'T is worse than a wrong procedure: it tells the actor to
+      avoid something legal.
+    * The env's own per-rule verdict is quoted in. `rules` is what
+      memory/contrastive.py broken_rules() read out of rule_status, so the prompt
+      can say which rule was ACTUALLY broken instead of letting the model infer it
+      from a grid. Empty for a dead-end, where nothing was submitted to judge.
+
+    The output is scoped to the rule combination, not the instance, for the same
+    reason Memp's is: a memory that says "do not go to (4,2)" is useless on every
+    other puzzle.
+    """
+    reasons = {
+        "wrong-solution": "it reached the end node but broke one or more rules",
+        "dead-end": "it painted the path into a corner with no legal move left",
+        "format-failure": "it never produced a parseable move",
+    }
+    why = reasons.get(getattr(episode, "terminal_reason", ""),
+                      "it did not solve the puzzle")
+    # The one part of a DON'T that cannot be wrong: not a claim about what the rule
+    # says, but the env's judgement on what this attempt did. Rendered through
+    # format_broken_rules so a nested region table cannot bury the counts.
+    verdict = ("\n    The environment's own verdict on this attempt:\n"
+               f"  {format_broken_rules(rules)}"
+               if rules else
+               "\n    The environment recorded no rule verdict: the attempt never "
+               "reached a\n    submission, so it stalled rather than breaking a "
+               "stated rule.")
+    return f"""{distill_rules_preamble(polyshapes, artifact="warning")}
+    You are an expert puzzle-solving agent building a memory of MISTAKES: reusable,
+    high-level warnings distilled from attempts that failed.
+
+    The attempt below did NOT solve the puzzle: {why}. Distil what went wrong into
+    ONE reusable warning for puzzles with this combination of rules. Start with a
+    line "Applies to: <the rule combination>", then give 2-4 numbered points, each
+    naming a mistake to avoid and what to do instead. At most 120 words.
+
+    The warning must transfer to OTHER puzzles with similar rules: never mention
+    absolute coordinates, this grid's size, or specific moves, and do not output a
+    move. Every mechanic you appeal to must be one of the rules above -- do not
+    invent constraints, and say nothing about a rule type you are unsure of. Do not
+    speculate about what the correct path was; you were not shown one. Describe the
+    error, not the puzzle.
+
+    Puzzle description:
+    {key_text}
+
+    Starting grid:
+    {episode.first_obs}
+
+    The moves the attempt made, in order (0=right, 1=up, 2=left, 3=down):
+{format_trajectory(episode)}
+
+    The grid where it failed (V=visited, L=its last position):
+    {episode.last_obs}
+{verdict}
+
+    Warning:"""

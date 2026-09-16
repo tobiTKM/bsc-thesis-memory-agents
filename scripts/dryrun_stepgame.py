@@ -2,9 +2,10 @@
 """Run the whole StepGame pipeline end to end against a mock model. No GPU.
 
 Every phase of every arm -- baseline, Reflexion root/arm/compare, MemP
-build/distill/embed/upgrade/eval, MemoryBank distill/eval -- exercised on a small
-slice with a fake LLM and fake embeddings, so a plumbing error surfaces here in
-seconds instead of an hour into a SLURM job. It checks that the pipeline RUNS and
+build/distill/embed/upgrade/eval, MemoryBank distill/eval, Contrastive
+distill/eval/compare -- exercised on a small slice with a fake LLM and fake
+embeddings, so a plumbing error surfaces here in seconds instead of an hour into a
+SLURM job. It checks that the pipeline RUNS and
 that its files chain together; it says nothing about whether memory helps.
 
 The mock answers a configurable fraction of items correctly (by reading the gold
@@ -191,7 +192,8 @@ class _MC(D.MockClient):
                          seed=k.get("seed", 0) or 0)
 _c.LLMClient = _MC
 _c.EmbeddingClient = D.MockEmbeddingClient
-for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank"):
+for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank",
+           "run_contrastive"):
     try:
         _mod = __import__(_m)
         if hasattr(_mod, "LLMClient"):
@@ -264,8 +266,57 @@ for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank"):
     run(["scripts/run_memorybank.py", "--phase", "compare", "--baseline", baseline,
          "--retrieved", mb_ret, "--random", mb_rnd], env, tmp)
 
+    print("\n" + "=" * 70 + "\n  5. CONTRASTIVE\n" + "=" * 70)
+    run(["scripts/run_contrastive.py", "--phase", "distill", *common,
+         "--build", build, "--chunk", "8", "--verify-gold", "5"], env, tmp)
+    co_bank = newest("contrastive_bank_stepgame_*.json", tmp)
+    # Every arm, because the granularity IS the experiment: a renderer that raises
+    # on one of them, or an arm guard that refuses a bank it should accept, must
+    # not be discovered on the GPU.
+    for gran in ("avoid", "hindsight", "positive-only", "avoid-only"):
+        run(["scripts/run_contrastive.py", "--phase", "eval", *common,
+             "--arm", "retrieved", "--granularity", gran, "--split", "test",
+             "--bank", co_bank, "--embeddings", emb, "--chunk", "8"], env, tmp)
+    # And every retrieval arm, including the two balanced ones -- their whole point
+    # is a bank whose polarity is lopsided, which is exactly what the mock produces.
+    for a in ("balanced", "random", "random-balanced"):
+        run(["scripts/run_contrastive.py", "--phase", "eval", *common,
+             "--arm", a, "--granularity", "avoid", "--split", "test",
+             "--bank", co_bank, "--embeddings", emb, "--chunk", "8"], env, tmp)
+    # Wave 2: the artifacts are attached by a CPU pass over the SAME bank, so the
+    # arms it enables differ from the ones above in the exemplar and nothing else.
+    run(["scripts/run_contrastive.py", "--phase", "exemplars", *common,
+         "--bank", co_bank, "--build", build], env, tmp)
+    co_ex = pathlib.Path(str(co_bank).replace(".json", "_ex.json"))
+    for gran, ex, fr in (("hindsight", "on", "mixed"), ("hindsight", "off", "matched"),
+                         ("hindsight", "on", "matched"), ("avoid", "on", "mixed"),
+                         ("avoid-only", "on", "mixed")):
+        run(["scripts/run_contrastive.py", "--phase", "eval", *common,
+             "--arm", "retrieved", "--granularity", gran, "--exemplars", ex,
+             "--framing", fr, "--split", "test", "--bank", str(co_ex),
+             "--embeddings", emb, "--chunk", "8"], env, tmp)
+    # An exemplar arm pointed at a bank WITHOUT artifacts must refuse, not silently
+    # reproduce the non-exemplar arm.
+    import subprocess as _sp
+    r = _sp.run([sys.executable, str(REPO / "scripts/run_contrastive.py"),
+                 "--phase", "eval", *[str(c) for c in common],
+                 "--arm", "retrieved", "--granularity", "avoid", "--exemplars", "on",
+                 "--split", "test", "--bank", str(co_bank), "--embeddings", str(emb)],
+                cwd=tmp, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "phase exemplars" in (r.stdout + r.stderr), \
+        "an exemplar arm on a bank with no artifacts must refuse"
+    print("  ok: --exemplars on refuses a bank that has none")
+
+    run(["scripts/run_contrastive.py", "--phase", "compare",
+         "--baseline", baseline,
+         "--retrieved", newest("contrastive_eval_stepgame_avoid_retrieved_*.json", tmp),
+         "--hindsight", newest("contrastive_eval_stepgame_hindsight_retrieved_*.json", tmp),
+         "--positive", newest("contrastive_eval_stepgame_positive-only_retrieved_*.json", tmp),
+         "--random", newest("contrastive_eval_stepgame_avoid_random_*.json", tmp),
+         "--memp", retrieved], env, tmp)
+
     print("\n" + "=" * 70)
-    print("  ALL PHASES OF ALL THREE MEMORY ARMS RAN END TO END")
+    print("  ALL PHASES OF ALL FOUR MEMORY ARMS RAN END TO END")
     print("=" * 70)
     if not args.keep:
         shutil.rmtree(tmp, ignore_errors=True)

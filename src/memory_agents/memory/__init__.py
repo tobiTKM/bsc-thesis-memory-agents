@@ -8,9 +8,11 @@ not in how it is retrieved.
 """
 
 from .base import Memory
+from .contrastive import AvoidDistiller, ContrastiveMemory
 from .memorybank import CaseDistiller, MemoryBankMemory
 from .memp import Distiller, MempMemory
 from .reflexion import Reflector, ReflexionMemory
 
-__all__ = ["Memory", "CaseDistiller", "MemoryBankMemory", "Distiller",
+__all__ = ["Memory", "AvoidDistiller", "CaseDistiller", "ContrastiveMemory",
+           "MemoryBankMemory", "Distiller",
            "MempMemory", "Reflector", "ReflexionMemory"]
