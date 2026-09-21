@@ -65,6 +65,12 @@ RUNS = [
     ("MemoryBank retrieved k=3",       "qwen32b", f"memorybank_eval_stepgame_retrieved_test_qwen32b{PTAG}_rp.json"),
     ("MemoryBank random k=3",          "qwen32b", f"memorybank_eval_stepgame_random_test_qwen32b{PTAG}_rp.json"),
     # --- Contrastive (this project's 4th method) ---
+    ("Contrastive positive-only, retrieved", "qwen06b", f"contrastive_eval_stepgame_positive-only_retrieved_test_qwen06b{PTAG}.json"),
+    ("Contrastive avoid, retrieved",         "qwen06b", f"contrastive_eval_stepgame_avoid_retrieved_test_qwen06b{PTAG}.json"),
+    ("Contrastive avoid, random",            "qwen06b", f"contrastive_eval_stepgame_avoid_random_test_qwen06b{PTAG}.json"),
+    ("Contrastive avoid, balanced",          "qwen06b", f"contrastive_eval_stepgame_avoid_balanced_test_qwen06b{PTAG}.json"),
+    ("Contrastive hindsight, retrieved",     "qwen06b", f"contrastive_eval_stepgame_hindsight_retrieved_test_qwen06b{PTAG}.json"),
+
     ("Contrastive positive-only, retrieved", "qwen32b", f"contrastive_eval_stepgame_positive-only_retrieved_test_qwen32b{PTAG}.json"),
     ("Contrastive avoid, retrieved",         "qwen32b", f"contrastive_eval_stepgame_avoid_retrieved_test_qwen32b{PTAG}.json"),
     ("Contrastive avoid, random",            "qwen32b", f"contrastive_eval_stepgame_avoid_random_test_qwen32b{PTAG}.json"),

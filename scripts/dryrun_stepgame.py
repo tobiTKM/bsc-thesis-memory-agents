@@ -19,6 +19,7 @@ solved and the failed paths through distillation get taken.
 import argparse
 import asyncio
 import hashlib
+import json
 import pathlib
 import random
 import shutil
@@ -296,16 +297,27 @@ for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank",
              "--framing", fr, "--split", "test", "--bank", str(co_ex),
              "--embeddings", emb, "--chunk", "8"], env, tmp)
     # An exemplar arm pointed at a bank WITHOUT artifacts must refuse, not silently
-    # reproduce the non-exemplar arm.
+    # reproduce the non-exemplar arm. `distill` now attaches them, so a bank that
+    # lacks them has to be built on purpose -- which is exactly the shape of a bank
+    # distilled before 2026-09-21, the case this guard exists for.
     import subprocess as _sp
+    stripped = tmp / "results" / "json" / "bank_no_artifacts.json"
+    _d = json.loads(pathlib.Path(co_bank).read_text())
+    for _e in _d["entries"]:
+        _e.pop("exemplar", None); _e.pop("failed_exemplar", None)
+    stripped.write_text(json.dumps(_d))
     r = _sp.run([sys.executable, str(REPO / "scripts/run_contrastive.py"),
                  "--phase", "eval", *[str(c) for c in common],
                  "--arm", "retrieved", "--granularity", "avoid", "--exemplars", "on",
-                 "--split", "test", "--bank", str(co_bank), "--embeddings", str(emb)],
+                 "--split", "test", "--bank", str(stripped), "--embeddings", str(emb)],
                 cwd=tmp, env=env, capture_output=True, text=True)
     assert r.returncode != 0 and "phase exemplars" in (r.stdout + r.stderr), \
         "an exemplar arm on a bank with no artifacts must refuse"
     print("  ok: --exemplars on refuses a bank that has none")
+    _b = json.loads(pathlib.Path(co_bank).read_text())["entries"]
+    assert all("exemplar" in e for e in _b), "distill must attach the winning lines"
+    assert any("failed_exemplar" in e for e in _b), "…and the losing ones"
+    print("  ok: distill attaches the concrete artifacts itself")
 
     run(["scripts/run_contrastive.py", "--phase", "compare",
          "--baseline", baseline,

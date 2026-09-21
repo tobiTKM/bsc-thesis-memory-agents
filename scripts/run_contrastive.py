@@ -258,6 +258,14 @@ async def run_distill(args) -> None:
         stats["empty"] = len(empties)
         save_state(out, {**memory.to_dict(), "config": cfg})
 
+    # Born with the concrete artifacts, so `--exemplars on` (the reported
+    # configuration, docs/contrastive.md section 3) needs no separate CPU pass and a
+    # new actor is one chained submission. Retrofitting an OLDER bank still goes
+    # through `--phase exemplars`, which is the same code and touches no text.
+    n_win, n_fail, _m = attach_exemplars(memory, build)
+    cfg["exemplars_attached"] = True
+    print(f"[distill] attached {n_win} winning lines and {n_fail} losing lines "
+          f"(no model; --exemplars on can read this bank directly)", flush=True)
     pol = memory.polarity()
     cfg["positive_share"] = round(memory.positive_share(), 4)
     save_state(out, {**memory.to_dict(), "config": cfg})
@@ -288,6 +296,36 @@ async def run_distill(args) -> None:
 # --------------------------------------------------------------------------- #
 # phase exemplars: attach the concrete artifacts to an existing bank (CPU, no model)
 # --------------------------------------------------------------------------- #
+def attach_exemplars(memory, build) -> tuple[int, int, int]:
+    """Write `exemplar` and `failed_exemplar` onto every entry. Pure code, no model.
+
+    Shared by `--phase exemplars` (which retrofits a bank built before these fields
+    existed, leaving its texts byte-identical) and by `--phase distill` (so a bank
+    born after 2026-09-21 already carries them and a new actor is one chained
+    submission rather than distill -> CPU step -> evals).
+    """
+    n_win = n_fail = missing = 0
+    for e in memory.entries:
+        rec = build["puzzles"].get(e["source_pid"])
+        if not rec:
+            missing += 1
+            continue
+        row = bench().record("train", e["source_pid"])
+        ctx = rec.get("episode_context") or {}
+        solved = bool(rec["success"] and ctx)
+        # The winning line, routed exactly as distill routes provenance, so the two
+        # can never disagree.
+        e["exemplar"] = agent_exemplar(row, ctx) if solved else gold_exemplar(row)
+        n_win += 1
+        # The losing line a DON'T was distilled from. NOT the gold path: a warning
+        # carrying the correct solution has stopped being a warning, and `avoid`
+        # would silently become `hindsight`.
+        if not solved and ctx.get("moves"):
+            e["failed_exemplar"] = agent_exemplar(row, ctx)
+            n_fail += 1
+    return n_win, n_fail, missing
+
+
 def run_exemplars(args) -> None:
     """Add `exemplar` and `failed_exemplar` to a bank that was built without them.
 
@@ -320,23 +358,7 @@ def run_exemplars(args) -> None:
     build = json.loads(pathlib.Path(build_path).read_text())
     out = pathlib.Path(args.out or src.with_name(src.stem + "_ex.json"))
 
-    n_win = n_fail = missing = 0
-    for e in memory.entries:
-        pid = e["source_pid"]
-        rec = build["puzzles"].get(pid)
-        if not rec:
-            missing += 1
-            continue
-        row = bench().record("train", pid)
-        ctx = rec.get("episode_context") or {}
-        solved = bool(rec["success"] and ctx)
-        # The winning line, by the same routing distill used, so provenance and
-        # artifact can never disagree.
-        e["exemplar"] = agent_exemplar(row, ctx) if solved else gold_exemplar(row)
-        n_win += 1
-        if not solved and ctx.get("moves"):
-            e["failed_exemplar"] = agent_exemplar(row, ctx)
-            n_fail += 1
+    n_win, n_fail, missing = attach_exemplars(memory, build)
     save_state(out, {**memory.to_dict(), "config": {**cfg, "exemplars_attached": True}})
     print(f"[exemplars] {n_win} winning lines, {n_fail} failed lines attached"
           + (f", {missing} entries had no build record" if missing else ""), flush=True)

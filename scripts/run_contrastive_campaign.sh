@@ -10,6 +10,7 @@
 #   BENCH=sparc    bash scripts/run_contrastive_campaign.sh distill   # 1 job
 #   BENCH=sparc    bash scripts/run_contrastive_campaign.sh exemplars # NO GPU (login node)
 #   BENCH=sparc    bash scripts/run_contrastive_campaign.sh wave2     # 4 jobs
+#   BENCH=sparc    bash scripts/run_contrastive_campaign.sh standard  # the reported config
 #   BENCH=sparc    bash scripts/run_contrastive_campaign.sh eval      # 5 jobs
 #   BENCH=stepgame bash scripts/run_contrastive_campaign.sh distill   # 1 job
 #   BENCH=stepgame bash scripts/run_contrastive_campaign.sh eval      # 5 jobs
@@ -91,17 +92,21 @@ done
 [[ ${#keep[@]} -gt 0 ]] || { echo "MODELS matched no known tag" >&2; exit 1; }
 ALL_MODELS=("${keep[@]}")
 
-# Per-stage walltimes. distill is ~2x Memp's: it writes a strategy for every solved
-# train task AND both an avoid and a hindsight text for every failed one (~930 calls
-# on gpt-oss/SPaRC against Memp's 500). eval times are the SPaRC campaign's, which
-# are generous here -- this method's block is ~834 tokens against MemoryBank's ~1.8k.
+# Per-stage walltimes, sized from what the completed SPaRC campaign actually took
+# rather than from its limits -- an oversized limit blocks backfill on a saturated
+# partition, and every phase checkpoints so an overrun resumes with RESUME=<file>.
+# Observed on Qwen3-32B/SPaRC: memp distill 0:15-0:24, memorybank distill 0:34-0:37,
+# evals 9:01-12:52. This method's distill is ~2x Memp's (a strategy for every solved
+# train task AND both an avoid and a hindsight text for every failed one -- 959 calls
+# on qwen32b against Memp's 500) and its block is ~800 tokens, between Memp's script
+# and MemoryBank's ~1.8k case-record.
 t_of() {   # t_of <stage> <tag>
   case "$BENCH:$1:$2" in
     sparc:distill:qwen06b)       echo 03:00:00 ;;
-    sparc:distill:qwen32b)       echo 08:00:00 ;;
+    sparc:distill:qwen32b)       echo 03:00:00 ;;
     sparc:distill:gptoss120b)    echo 05:00:00 ;;
     sparc:eval:qwen06b)          echo 03:00:00 ;;
-    sparc:eval:qwen32b)          echo 16:00:00 ;;
+    sparc:eval:qwen32b)          echo 14:00:00 ;;
     sparc:eval:gptoss120b)       echo 06:00:00 ;;
     stepgame:distill:qwen06b)    echo 02:00:00 ;;
     stepgame:distill:qwen32b)    echo 04:00:00 ;;
@@ -122,8 +127,13 @@ bank_of() { printf 'results/json/contrastive_bank_%s%s%s%s.json' "$BM" "$1" "$PT
 EXCL=""
 [[ -n "${EXCLUDE:-}" ]] && EXCL="--exclude=$(echo "$EXCLUDE" | tr ' ' ',')"
 
-sub() {   # sub <jobname> <gpus> <time> <dep-or-empty> <exports...>
-  local name=$1 gpus=$2 tlimit=$3 dep=$4; shift 4
+# Job names carry the benchmark: both benchmarks run the same arms on the same actor
+# tags, so without this `squeue` shows two identical `co-sret-qwen06b` rows that write
+# to entirely different files.
+JPFX="co"; [[ "$BENCH" == "stepgame" ]] && JPFX="cosg"
+
+sub() {   # sub <jobname-suffix> <gpus> <time> <dep-or-empty> <exports...>
+  local name="$JPFX-$1" gpus=$2 tlimit=$3 dep=$4; shift 4
   if [[ "${DRYRUN:-0}" == "1" ]]; then
     printf 'sbatch -J %s -G %s -t %s %s%s--export=ALL,%s scripts/serve_and_run.sbatch\n' \
            "$name" "$gpus" "$tlimit" "${dep:+--dependency=afterok:$dep }" \
@@ -184,7 +194,7 @@ case "$STAGE" in
       IFS='|' read -r tag model tp gpus extra <<< "$spec"
       build=$(printf "$BUILD_FMT" "$tag")
       [[ -f "$build" ]] || { echo "skipping $tag: no $build" >&2; continue; }
-      sub "co-dist-$tag" "$gpus" "$(t_of distill "$tag")" "" \
+      sub "dist-$tag" "$gpus" "$(t_of distill "$tag")" "" \
         "$ENVX,$BENCHX,$KEYX,DRIVER=contrastive,PHASE=distill,BUILD=$build,MODEL=$model,TP=$tp,${extra:+$extra,}OUT=$(bank_of "$tag")"
     done
     ;;
@@ -201,7 +211,7 @@ case "$STAGE" in
       for a in "${ARMS[@]}"; do
         IFS='|' read -r gran arm infix <<< "$a"
         out="results/json/contrastive_eval_${BM}${gran}_${arm}_test_${tag}${PTAG}.json"
-        sub "co-$infix-$tag" "$gpus" "$(t_of eval "$tag")" "$dep" \
+        sub "$infix-$tag" "$gpus" "$(t_of eval "$tag")" "$dep" \
           "$ENVX,$BENCHX,$KEYX,DRIVER=contrastive,PHASE=eval,CO_ARM=$arm,CO_GRANULARITY=$gran,MIN_POSITIVE=${MIN_POSITIVE:-1},LIMIT=0,BANK=$bank,EMBEDDINGS=$EMB,MODEL=$model,TP=$tp,${extra:+$extra,}OUT=$out"
       done
     done
@@ -232,8 +242,45 @@ case "$STAGE" in
         sfx=""; [[ "$ex" == "on" ]] && sfx="${sfx}_ex"
         [[ "$fr" == "matched" ]] && sfx="${sfx}_mf"
         out="results/json/contrastive_eval_${BM}${gran}_${arm}_test_${tag}${PTAG}${sfx}.json"
-        sub "co-$infix-$tag" "$gpus" "$(t_of eval "$tag")" "" \
+        sub "$infix-$tag" "$gpus" "$(t_of eval "$tag")" "" \
           "$ENVX,$BENCHX,$KEYX,DRIVER=contrastive,PHASE=eval,CO_ARM=$arm,CO_GRANULARITY=$gran,CO_EXEMPLARS=$ex,CO_FRAMING=$fr,MIN_POSITIVE=${MIN_POSITIVE:-1},LIMIT=0,BANK=$bank,EMBEDDINGS=$EMB,MODEL=$model,TP=$tp,${extra:+$extra,}OUT=$out"
+      done
+    done
+    ;;
+
+  standard)
+    # The method's standard configuration, fixed 2026-09-21: `avoid` with the worked
+    # exemplar attached (docs/contrastive.md 6.6 -- omitting it cost ~20 puzzles on
+    # gpt-oss). Runs the retrieval arms the wave-1 set had, now all at that config, so
+    # the relevance and polarity ablations test the arm the thesis actually reports
+    # rather than a superseded one. `positive-only` comes along because it is the
+    # "what do the failed entries contribute at all" contrast and has to match.
+    #
+    # `hindsight` is NOT re-run here: it is already on disk at its own best config, and
+    # framing=matched is a no-op for every arm except hindsight, so these all carry the
+    # plain `_ex` suffix.
+    #
+    # ONLY="bal rnd" restricts it, as in wave2.
+    for spec in "${ALL_MODELS[@]}"; do
+      IFS='|' read -r tag model tp gpus extra <<< "$spec"
+      # Banks distilled from 2026-09-21 carry the artifacts already; older ones were
+      # retrofitted by `--phase exemplars` into a sibling `_ex` file.
+      bank=$(bank_of "$tag" _ex); [[ -f "$bank" ]] || bank=$(bank_of "$tag")
+      depvar="DEP_DISTILL_$(echo "$tag" | tr '[:lower:]-' '[:upper:]_')"; dep="${!depvar:-}"
+      [[ -f "$bank" || -n "$dep" ]] || { echo "skipping $tag: no bank and no $depvar=<jobid>" >&2; continue; }
+      for a in "avoid|retrieved|ret" "avoid|balanced|bal" "avoid|random|rnd" \
+               "positive-only|retrieved|pos" "hindsight|retrieved|hin"; do
+        IFS='|' read -r gran arm infix <<< "$a"
+        if [[ -n "${ONLY:-}" ]] && [[ " ${ONLY} " != *" $infix "* ]]; then continue; fi
+        fr=mixed; sfx=_ex
+        # framing=matched is a no-op for every arm except `hindsight`, whose items are
+        # all DO and whose two-sign header would otherwise promise failures it has none
+        # of (docs/contrastive.md 6.6).
+        [[ "$gran" == "hindsight" ]] && { fr=matched; sfx=_ex_mf; }
+        out="results/json/contrastive_eval_${BM}${gran}_${arm}_test_${tag}${PTAG}${sfx}.json"
+        [[ -f "$out" && "${FORCE:-0}" != "1" ]] && { echo "skipping $infix-$tag: $out exists (FORCE=1 to redo)" >&2; continue; }
+        sub "s${infix}-$tag" "$gpus" "$(t_of eval "$tag")" "$dep" \
+          "$ENVX,$BENCHX,$KEYX,DRIVER=contrastive,PHASE=eval,CO_ARM=$arm,CO_GRANULARITY=$gran,CO_EXEMPLARS=on,CO_FRAMING=$fr,MIN_POSITIVE=${MIN_POSITIVE:-1},LIMIT=0,BANK=$bank,EMBEDDINGS=$EMB,MODEL=$model,TP=$tp,${extra:+$extra,}OUT=$out"
       done
     done
     ;;
@@ -250,7 +297,7 @@ case "$STAGE" in
       bank=$(bank_of "$tag")
       [[ -f "$bank" ]] || { echo "skipping $tag: no $bank" >&2; continue; }
       out="results/json/contrastive_eval_${BM}avoid_balanced_test_${tag}${PTAG}_v2.json"
-      sub "co-bal2-$tag" "$gpus" "$(t_of eval "$tag")" "" \
+      sub "bal2-$tag" "$gpus" "$(t_of eval "$tag")" "" \
         "$ENVX,$BENCHX,$KEYX,DRIVER=contrastive,PHASE=eval,CO_ARM=balanced,CO_GRANULARITY=avoid,MIN_POSITIVE=${MIN_POSITIVE:-1},LIMIT=0,BANK=$bank,EMBEDDINGS=$EMB,MODEL=$model,TP=$tp,${extra:+$extra,}OUT=$out"
     done
     ;;

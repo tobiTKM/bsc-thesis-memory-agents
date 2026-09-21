@@ -52,7 +52,11 @@ BENCH = os.environ.get("BENCH", "sparc")
 
 if BENCH == "sparc":
     PREFIX, PTAG = "", ""
-    ACTORS = [("gptoss120b", "gpt-oss-120b")]
+    # Weakest first, as docs/memp.md section 0 orders them. An actor with no
+    # contrastive arm on disk yet is skipped entirely rather than shown as a lone
+    # baseline row, so this section grows on its own as jobs land.
+    ACTORS = [("qwen06b", "Qwen3-0.6B"), ("qwen32b", "Qwen3-32B"),
+              ("gptoss120b", "gpt-oss-120b")]
     BASELINE = "reflexion_root_{tag}_test.json"
     MEMP = "memp_eval_retrieved_test_{tag}_v2.json"
 elif BENCH == "stepgame":
@@ -71,13 +75,13 @@ else:
 # read as one block (main / relevance ablation / polarity ablation / repaired), then
 # its control, then the arm that withholds the failed entries entirely.
 ARMS = [
-    ("avoid, retrieved",                   "avoid",         "retrieved", 0, 0),
-    ("avoid, random",                      "avoid",         "random",    0, 0),
-    ("avoid, BALANCED",                    "avoid",         "balanced",  0, 0),
-    ("avoid + exemplar  [@ best]",         "avoid",         "retrieved", 1, 0),
-    ("hindsight, retrieved",               "hindsight",     "retrieved", 0, 0),
-    ("hindsight + both  [@ best]",         "hindsight",     "retrieved", 1, 1),
-    ("positive-only, retrieved",           "positive-only", "retrieved", 0, 0),
+    ("avoid, retrieved",                   "avoid",         "retrieved", ""),
+    ("avoid, random",                      "avoid",         "random",    ""),
+    ("avoid, BALANCED",                    "avoid",         "balanced",  "_v2"),
+    ("avoid + exemplar  [@ best]",         "avoid",         "retrieved", "_ex"),
+    ("hindsight, retrieved",               "hindsight",     "retrieved", ""),
+    ("hindsight + both  [@ best]",         "hindsight",     "retrieved", "_ex_mf"),
+    ("positive-only, retrieved",           "positive-only", "retrieved", ""),
 ]
 # The two single-factor wave-2 arms -- `hindsight` with only the exemplar, and with
 # only the matched header -- are deliberately NOT here. They exist to decompose the
@@ -90,42 +94,51 @@ DIAGNOSTIC_ARMS = [
 ]
 
 
-def fname(gran: str, arm: str, tag: str, ex: int = 0, mf: int = 0) -> str:
-    sfx = ("_ex" if ex else "") + ("_mf" if mf else "")
-    return f"contrastive_eval_{PREFIX}{gran}_{arm}_test_{tag}{PTAG}{sfx}.json"
-
-
-RUNS = [(label, tag, fname(g, a, tag, ex, mf))
-        for tag, _name in ACTORS for label, g, a, ex, mf in ARMS]
-# One arm of each ported cross-task method, for scale. Both at the granularity their
-# own doc treats as the main one and on the retrieved arm, so the comparison is
-# like-for-like across benchmarks. They are NOT contrastive arms: they use their own
-# renderer (Memp's `script`/`trajectory` block, MemoryBank's case block), so a row-to-row
-# gap is a method comparison and not a controlled contrast -- the controlled one is
-# `avoid` against `hindsight`, made in section 6.1.
-# Memp's reference is its `script` arm, not its trajectory one: every contrastive arm
-# is prose only, so script granularity is the like-for-like comparison. `v2` is the
-# rule-correct bank (docs/memp.md 3.9). StepGame has no script arm to point at -- that
-# campaign ran Memp at trajectory granularity only, deliberately (run_stepgame_campaign.sh
-# memp-eval says why), so the two benchmarks' Memp rows are different granularities and
-# are labelled as such rather than silently equated.
-REFERENCE = ([("*Memp — script v2, retrieved*", "gptoss120b",
-               "memp_eval_retrieved_test_gptoss120b_v2.json"),
-              ("*MemoryBank — case-record, retrieved*", "gptoss120b",
-               "memorybank_eval_retrieved_test_gptoss120b_norp.json")]
-             if BENCH == "sparc" else
-             [("*Memp — trajectory, retrieved*", "qwen32b",
-               f"memp_eval_stepgame_retrieved_test_qwen32b{PTAG}.json"),
-              ("*MemoryBank — case-record, retrieved*", "qwen32b",
-               f"memorybank_eval_stepgame_retrieved_test_qwen32b{PTAG}_rp.json")])
+def fname(gran: str, arm: str, tag: str, sfx: str = "") -> str:
+    """`_ex` = worked exemplars on, `_mf` = header matched to the arm, `_v2` = the
+    balanced arm re-run after its ordering fix (section 6.3). The suffix is the
+    configuration, so a row here cannot name a file the campaign would not write."""
+    f = J / f"contrastive_eval_{PREFIX}{gran}_{arm}_test_{tag}{PTAG}{sfx}.json"
+    # `balanced` only has a _v2 on benchmarks where it was re-run; fall back so the
+    # row still appears rather than silently vanishing.
+    if sfx == "_v2" and not f.exists():
+        return f"contrastive_eval_{PREFIX}{gran}_{arm}_test_{tag}{PTAG}.json"
+    return f.name
+RUNS = [(label, tag, fname(g, a, tag, sfx))
+        for tag, _name in ACTORS for label, g, a, sfx in ARMS]
 
 # Which granularity each result file came from, for views that apply to only some arms.
-GRAN_OF = {fname(g, a, tag, ex, mf): g
-           for tag, _name in ACTORS for _l, g, a, ex, mf in ARMS}
+GRAN_OF = {fname(g, a, tag, sfx): g
+           for tag, _name in ACTORS for _l, g, a, sfx in ARMS}
+
+# One arm of each ported cross-task method per actor, for scale. They are NOT
+# contrastive arms -- they render through their own method's block -- so a row-to-row
+# gap is a method comparison, not a controlled contrast; the controlled one is `avoid`
+# against `hindsight`, made in section 6.1.
+#
+# Memp's reference is its `script` arm, not its trajectory one: every contrastive arm
+# is prose only, so script granularity is the like-for-like comparison, and `v2` is the
+# rule-correct bank (docs/memp.md 3.9). StepGame has no script arm to point at -- that
+# campaign ran Memp at trajectory granularity only, deliberately
+# (run_stepgame_campaign.sh memp-eval says why) -- so the two benchmarks' Memp rows are
+# different granularities and are labelled as such rather than silently equated.
+if BENCH == "sparc":
+    REFERENCE = [(lab, tag, fn.format(tag=tag))
+                 for tag, _n in ACTORS
+                 for lab, fn in (
+                     ("*Memp — script v2, retrieved*",
+                      "memp_eval_retrieved_test_{tag}_v2.json"),
+                     ("*MemoryBank — case-record, retrieved*",
+                      "memorybank_eval_retrieved_test_{tag}_norp.json"))]
+else:
+    REFERENCE = [("*Memp — trajectory, retrieved*", "qwen32b",
+                  f"memp_eval_stepgame_retrieved_test_qwen32b{PTAG}.json"),
+                 ("*MemoryBank — case-record, retrieved*", "qwen32b",
+                  f"memorybank_eval_stepgame_retrieved_test_qwen32b{PTAG}_rp.json")]
 
 # The arm every other one is really tested against -- "does learning from the failure
 # beat learning from the gold path?" is a contrast with `hindsight`, not with the
-# memoryless run. Section 0 no longer tabulates it (one number per row reads better at
+# memoryless run. Section 0 does not tabulate it (one number per row reads better at
 # a glance); the contrast is made, with its p, in section 6.1.
 REASONS = ["solved", "wrong-solution", "dead-end", "wrong-answer",
            "format-failure", "error"]
@@ -185,6 +198,12 @@ def bold(text: str, cond: bool) -> str:
     return f"**{text}**" if cond else text
 
 
+def has_arms(tag: str) -> bool:
+    """Does this actor have any contrastive arm on disk? Actors still queued are
+    skipped rather than rendered as a lone baseline row."""
+    return any(t == tag and (J / fn).exists() for _l, t, fn in RUNS)
+
+
 def rows_for(tag: str):
     """(label, records) for one actor: its baseline first, then every arm on disk."""
     base = load(BASELINE.format(tag=tag))
@@ -232,6 +251,8 @@ def table_success():
     print(f"| Actor | Arm | Solved /{n} | Accuracy | vs baseline |")
     print("|---|---|---|---|---|")
     for tag, name in ACTORS:
+        if not has_arms(tag):
+            continue
         base, rows = rows_for(tag)
         for i, (label, r) in enumerate(rows):
             keys = sorted(set(r) & set(base))
@@ -257,6 +278,8 @@ def table_difficulty():
     print(f"| Actor | Arm {hdr}")
     print("|---|---|" + "---|" * len(list(bands)))
     for tag, name in ACTORS:
+        if not has_arms(tag):
+            continue
         base, rows = rows_for(tag)
         diff = {k: v.get("difficulty", -1) for k, v in base.items()}
         for i, (label, r) in enumerate(rows):
@@ -292,6 +315,8 @@ def table_hops():
           + " | **h≥4** | all |")
     print("|---|---|" + "---|" * 12)
     for tag, name in ACTORS:
+        if not has_arms(tag):
+            continue
         _b, rows = rows_for(tag)
         for i, (label, r) in enumerate(rows):
             ks = [k for k in r if k in hops]
@@ -323,6 +348,8 @@ def table_failure():
     print("| Actor | Arm | " + " | ".join(cols) + " |")
     print("|---|---|" + "---|" * len(cols))
     for tag, name in ACTORS:
+        if not has_arms(tag):
+            continue
         _b, rows = rows_for(tag)
         for i, (label, r) in enumerate(rows):
             c = {x: 0 for x in cols}
@@ -392,6 +419,8 @@ def table_polarity():
     print("| Actor | Arm | items with ≥1 DO |")
     print("|---|---|---|")
     for tag, name in ACTORS:
+        if not has_arms(tag):
+            continue
         first = True
         for label, t, fn in RUNS:
             # Only the arms that actually carry DON'Ts. `hindsight` shows a DO on
@@ -419,6 +448,8 @@ def table_tokens():
     print(f"| Actor | Arm | Total | ktok/{unit} | Solved | ktok/solve | vs baseline |")
     print("|---|---|---|---|---|---|---|")
     for tag, name in ACTORS:
+        if not has_arms(tag):
+            continue
         base, rows = rows_for(tag)
         bp = sum(toks(v) for v in base.values()) / max(
             sum(v["success"] for v in base.values()), 1)
@@ -444,6 +475,8 @@ def table_breakdown():
     print("| Actor | Arm | Prompt | Completion | Retry | Prompt share |" + tail)
     print("|---|---|---|---|---|" + ("---|---|" if INTERACTIVE else "---|"))
     for tag, name in ACTORS:
+        if not has_arms(tag):
+            continue
         _b, rows = rows_for(tag)
         for i, (label, r) in enumerate(rows):
             pr = sum(v.get("prompt_tokens") or 0 for v in r.values())
@@ -467,6 +500,8 @@ def table_steps():
     print("| Actor | Arm | Mean (all) | Mean (solved) | Mean (failed) |")
     print("|---|---|---|---|---|")
     for tag, name in ACTORS:
+        if not has_arms(tag):
+            continue
         _b, rows = rows_for(tag)
         for i, (label, r) in enumerate(rows):
             g = lambda f: [v.get("steps") or 0 for v in r.values() if f(v)]

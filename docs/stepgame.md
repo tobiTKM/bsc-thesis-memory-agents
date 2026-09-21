@@ -52,12 +52,21 @@ procedure, is the only one that *hurts*.
 |  | MemP retrieved k=3, trajectory | 310 | 31.0% | **+64** |
 |  | MemP random k=3, trajectory | 287 | 28.7% | **+41** |
 |  | MemP fixed (same 3 entries, every item) | 267 | 26.7% | +21 |
+|  | MemP retrieved k=3, SCRIPT | 295 | 29.5% | **+49** |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 299 | 29.9% | **+53** |
 |  | MemoryBank retrieved k=3 | 308 | 30.8% | **+62** |
 |  | MemoryBank random k=3 | 298 | 29.8% | **+52** |
+|  | Contrastive positive-only, retrieved | 308 | 30.8% | **+62** |
+|  | Contrastive avoid, retrieved | 280 | 28.0% | **+34** |
+|  | Contrastive avoid, random | 293 | 29.3% | **+47** |
+|  | Contrastive avoid, balanced | 297 | 29.7% | **+51** |
+|  | Contrastive hindsight, retrieved | 291 | 29.1% | **+45** |
 | Qwen3-32B | baseline (memoryless) | 733 | 73.3% | — |
 |  | MemP retrieved k=3, trajectory | 895 | 89.5% | **+162** |
 |  | MemP random k=3, trajectory | 901 | 90.1% | **+168** |
 |  | MemP fixed (same 3 entries, every item) | 867 | 86.7% | **+134** |
+|  | MemP retrieved k=3, SCRIPT | 888 | 88.8% | **+155** |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 933 | 93.3% | **+200** |
 |  | MemoryBank retrieved k=3 | 900 | 90.0% | **+167** |
 |  | MemoryBank random k=3 | 897 | 89.7% | **+164** |
 |  | Contrastive positive-only, retrieved | 871 | 87.1% | **+138** |
@@ -76,12 +85,21 @@ Accuracy within each band, as a percentage. 100 items per band, so a rate and a 
 |  | MemP retrieved k=3, trajectory | 70% | 44% | 28% | 33% | 24% | 20% | 22% | 23% | 24% | 22% |
 |  | MemP random k=3, trajectory | 56% | 30% | 28% | 31% | 25% | 20% | 24% | 28% | 23% | 22% |
 |  | MemP fixed (same 3 entries, every item) | 59% | 30% | 21% | 35% | 21% | 16% | 29% | 24% | 16% | 16% |
+|  | MemP retrieved k=3, SCRIPT | 60% | 39% | 26% | 30% | 25% | 23% | 27% | 25% | 23% | 17% |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 63% | 38% | 28% | 36% | 17% | 14% | 27% | 29% | 31% | 16% |
 |  | MemoryBank retrieved k=3 | 68% | 40% | 31% | 32% | 22% | 23% | 23% | 26% | 22% | 21% |
 |  | MemoryBank random k=3 | 59% | 43% | 26% | 28% | 28% | 22% | 30% | 23% | 23% | 16% |
+|  | Contrastive positive-only, retrieved | 58% | 41% | 30% | 32% | 19% | 26% | 27% | 31% | 24% | 20% |
+|  | Contrastive avoid, retrieved | 56% | 38% | 30% | 26% | 22% | 20% | 21% | 24% | 23% | 20% |
+|  | Contrastive avoid, random | 56% | 36% | 33% | 35% | 28% | 21% | 24% | 25% | 20% | 15% |
+|  | Contrastive avoid, balanced | 65% | 39% | 24% | 31% | 27% | 22% | 24% | 21% | 27% | 17% |
+|  | Contrastive hindsight, retrieved | 58% | 39% | 30% | 22% | 24% | 22% | 24% | 27% | 24% | 21% |
 | Qwen3-32B | baseline (memoryless) | 96% | 78% | 81% | 80% | 71% | 69% | 71% | 64% | 59% | 64% |
 |  | MemP retrieved k=3, trajectory | 98% | 95% | 91% | 89% | 90% | 88% | 91% | 87% | 84% | 82% |
 |  | MemP random k=3, trajectory | 100% | 94% | 93% | 88% | 85% | 92% | 91% | 87% | 88% | 83% |
 |  | MemP fixed (same 3 entries, every item) | 99% | 89% | 91% | 83% | 88% | 87% | 89% | 78% | 86% | 77% |
+|  | MemP retrieved k=3, SCRIPT | 100% | 92% | 92% | 86% | 86% | 86% | 92% | 87% | 85% | 82% |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 99% | 98% | 97% | 92% | 93% | 91% | 97% | 93% | 86% | 87% |
 |  | MemoryBank retrieved k=3 | 99% | 93% | 92% | 90% | 91% | 92% | 93% | 85% | 83% | 82% |
 |  | MemoryBank random k=3 | 100% | 94% | 91% | 89% | 90% | 92% | 91% | 85% | 84% | 81% |
 |  | Contrastive positive-only, retrieved | 100% | 94% | 94% | 87% | 85% | 87% | 88% | 81% | 77% | 78% |
@@ -100,12 +118,21 @@ The honest difficulty axis. Bucket sizes are uneven on the k-stratified split (4
 |  | MemP retrieved k=3, trajectory | 56% | 17% | 14% | 12% | 15% | 6% | 37% | 11% |
 |  | MemP random k=3, trajectory | 49% | 15% | 16% | 16% | 13% | 12% | 33% | 14% |
 |  | MemP fixed (same 3 entries, every item) | 49% | 12% | 12% | 15% | 7% | 7% | 32% | 10% |
+|  | MemP retrieved k=3, SCRIPT | 49% | 15% | 20% | 16% | 15% | 14% | 34% | 15% |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 51% | 13% | 18% | 13% | 16% | 18% | 34% | 16% |
 |  | MemoryBank retrieved k=3 | 54% | 16% | 18% | 20% | 8% | 8% | 36% | 13% |
 |  | MemoryBank random k=3 | 51% | 18% | 19% | 12% | 8% | 8% | 36% | 10% |
+|  | Contrastive positive-only, retrieved | 55% | 13% | 20% | 14% | 10% | 12% | 37% | 12% |
+|  | Contrastive avoid, retrieved | 49% | 12% | 17% | 13% | 13% | 14% | 32% | 14% |
+|  | Contrastive avoid, random | 52% | 15% | 15% | 15% | 10% | 11% | 35% | 12% |
+|  | Contrastive avoid, balanced | 52% | 14% | 18% | 12% | 15% | 13% | 35% | 13% |
+|  | Contrastive hindsight, retrieved | 51% | 15% | 17% | 14% | 11% | 10% | 34% | 12% |
 | Qwen3-32B | baseline (memoryless) | 94% | 63% | 66% | 58% | 56% | 42% | 80% | 52% |
 |  | MemP retrieved k=3, trajectory | 98% | 85% | 90% | 88% | 70% | 79% | 92% | 80% |
 |  | MemP random k=3, trajectory | 99% | 85% | 89% | 81% | 84% | 79% | 93% | 81% |
 |  | MemP fixed (same 3 entries, every item) | 98% | 76% | 89% | 77% | 82% | 75% | 90% | 78% |
+|  | MemP retrieved k=3, SCRIPT | 98% | 80% | 92% | 84% | 85% | 74% | 91% | 81% |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 98% | 90% | 94% | 90% | 87% | 85% | 95% | 87% |
 |  | MemoryBank retrieved k=3 | 97% | 85% | 90% | 84% | 77% | 86% | 92% | 83% |
 |  | MemoryBank random k=3 | 98% | 84% | 91% | 80% | 87% | 76% | 93% | 81% |
 |  | Contrastive positive-only, retrieved | 98% | 78% | 90% | 78% | 75% | 74% | 91% | 76% |
@@ -124,12 +151,21 @@ Terminal reason for all 1000 episodes. `format-failure` = never produced a parse
 |  | MemP retrieved k=3, trajectory | 310 | 690 | 0 | 0 |
 |  | MemP random k=3, trajectory | 287 | 713 | 0 | 0 |
 |  | MemP fixed (same 3 entries, every item) | 267 | 732 | 1 | 0 |
+|  | MemP retrieved k=3, SCRIPT | 295 | 705 | 0 | 0 |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 299 | 701 | 0 | 0 |
 |  | MemoryBank retrieved k=3 | 308 | 692 | 0 | 0 |
 |  | MemoryBank random k=3 | 298 | 702 | 0 | 0 |
+|  | Contrastive positive-only, retrieved | 308 | 692 | 0 | 0 |
+|  | Contrastive avoid, retrieved | 280 | 720 | 0 | 0 |
+|  | Contrastive avoid, random | 293 | 707 | 0 | 0 |
+|  | Contrastive avoid, balanced | 297 | 703 | 0 | 0 |
+|  | Contrastive hindsight, retrieved | 291 | 709 | 0 | 0 |
 | Qwen3-32B | baseline (memoryless) | 733 | 267 | 0 | 0 |
 |  | MemP retrieved k=3, trajectory | 895 | 105 | 0 | 0 |
 |  | MemP random k=3, trajectory | 901 | 99 | 0 | 0 |
 |  | MemP fixed (same 3 entries, every item) | 867 | 133 | 0 | 0 |
+|  | MemP retrieved k=3, SCRIPT | 888 | 112 | 0 | 0 |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 933 | 67 | 0 | 0 |
 |  | MemoryBank retrieved k=3 | 900 | 100 | 0 | 0 |
 |  | MemoryBank random k=3 | 897 | 103 | 0 | 0 |
 |  | Contrastive positive-only, retrieved | 871 | 129 | 0 | 0 |
@@ -148,12 +184,21 @@ Prompt + completion + retry over all 1000 episodes. **ktok/solve** is the effici
 |  | MemP retrieved k=3, trajectory | 2.80M | 2.8 | 310 | 9.0 | +33% |
 |  | MemP random k=3, trajectory | 2.87M | 2.9 | 287 | 10.0 | +47% |
 |  | MemP fixed (same 3 entries, every item) | 2.62M | 2.6 | 267 | 9.8 | +44% |
+|  | MemP retrieved k=3, SCRIPT | 2.59M | 2.6 | 295 | 8.8 | +29% |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 3.25M | 3.3 | 299 | 10.9 | +60% |
 |  | MemoryBank retrieved k=3 | 3.01M | 3.0 | 308 | 9.8 | +43% |
 |  | MemoryBank random k=3 | 3.07M | 3.1 | 298 | 10.3 | +52% |
+|  | Contrastive positive-only, retrieved | 2.03M | 2.0 | 308 | 6.6 | -3% |
+|  | Contrastive avoid, retrieved | 2.24M | 2.2 | 280 | 8.0 | +17% |
+|  | Contrastive avoid, random | 2.24M | 2.2 | 293 | 7.7 | +13% |
+|  | Contrastive avoid, balanced | 2.40M | 2.4 | 297 | 8.1 | +19% |
+|  | Contrastive hindsight, retrieved | 2.47M | 2.5 | 291 | 8.5 | +25% |
 | Qwen3-32B | baseline (memoryless) | 2.32M | 2.3 | 733 | 3.2 | — |
 |  | MemP retrieved k=3, trajectory | 3.19M | 3.2 | 895 | 3.6 | +12% |
 |  | MemP random k=3, trajectory | 3.37M | 3.4 | 901 | 3.7 | +18% |
 |  | MemP fixed (same 3 entries, every item) | 3.14M | 3.1 | 867 | 3.6 | +14% |
+|  | MemP retrieved k=3, SCRIPT | 3.24M | 3.2 | 888 | 3.7 | +15% |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 3.50M | 3.5 | 933 | 3.8 | +18% |
 |  | MemoryBank retrieved k=3 | 3.60M | 3.6 | 900 | 4.0 | +26% |
 |  | MemoryBank random k=3 | 3.67M | 3.7 | 897 | 4.1 | +29% |
 |  | Contrastive positive-only, retrieved | 3.13M | 3.1 | 871 | 3.6 | +14% |
@@ -172,12 +217,21 @@ The same tokens split by kind. On a single-turn benchmark the memory block is se
 |  | MemP retrieved k=3, trajectory | 1.34M | 1.45M | 0.01M | 48% | 1337 |
 |  | MemP random k=3, trajectory | 1.40M | 1.45M | 0.02M | 49% | 1403 |
 |  | MemP fixed (same 3 entries, every item) | 1.00M | 1.59M | 0.03M | 38% | 1001 |
+|  | MemP retrieved k=3, SCRIPT | 1.07M | 1.50M | 0.02M | 41% | 1066 |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 1.75M | 1.49M | 0.01M | 54% | 1747 |
 |  | MemoryBank retrieved k=3 | 1.56M | 1.42M | 0.02M | 52% | 1560 |
 |  | MemoryBank random k=3 | 1.63M | 1.43M | 0.02M | 53% | 1631 |
+|  | Contrastive positive-only, retrieved | 0.68M | 1.31M | 0.04M | 33% | 680 |
+|  | Contrastive avoid, retrieved | 0.87M | 1.36M | 0.01M | 39% | 866 |
+|  | Contrastive avoid, random | 0.86M | 1.37M | 0.01M | 38% | 861 |
+|  | Contrastive avoid, balanced | 0.93M | 1.43M | 0.04M | 39% | 928 |
+|  | Contrastive hindsight, retrieved | 1.04M | 1.41M | 0.01M | 42% | 1045 |
 | Qwen3-32B | baseline (memoryless) | 0.30M | 1.95M | 0.06M | 13% | 305 |
 |  | MemP retrieved k=3, trajectory | 1.33M | 1.85M | 0.00M | 42% | 1333 |
 |  | MemP random k=3, trajectory | 1.40M | 1.93M | 0.04M | 41% | 1399 |
 |  | MemP fixed (same 3 entries, every item) | 0.99M | 2.14M | 0.01M | 32% | 992 |
+|  | MemP retrieved k=3, SCRIPT | 1.14M | 2.07M | 0.04M | 35% | 1137 |
+|  | MemP retrieved k=3, PROCEDURALIZATION | 1.81M | 1.69M | 0.00M | 52% | 1814 |
 |  | MemoryBank retrieved k=3 | 1.68M | 1.89M | 0.03M | 47% | 1683 |
 |  | MemoryBank random k=3 | 1.75M | 1.92M | 0.00M | 48% | 1750 |
 |  | Contrastive positive-only, retrieved | 0.91M | 2.19M | 0.03M | 29% | 912 |

@@ -778,6 +778,17 @@ almost exactly. A T=2 design across all three models would have cost on the orde
 
 ### Threats to validity
 
+- **One generation per item at one seed is worth less than it looks** (measured
+  2026-09-16 on gpt-oss-120b/SPaRC, `docs/contrastive.md` §6.3). Two jobs that injected
+  a **byte-identical** prompt into the same 144 test puzzles — same seed 0, same
+  `temperature 0.6 / top_p 0.95 / top_k 20`, same model and code — produced episodes of
+  a *different length* on 65% of them and flipped the solved/unsolved outcome on 33,
+  46% of the 72 either run solved. The paired test on that pure non-determinism reads
+  p = 0.0351. vLLM's seed does not pin generation across jobs: continuous batching
+  changes the reduction order, so logits and samples differ. **Read any difference
+  below ~15 puzzles in this document as unresolved rather than as an effect**, and
+  treat repeated seeds as the highest-value unspent GPU-hours in the campaign.
+
 - **Single seed per trial index.** One run per arm; no variance estimate across repeats.
 - **`solved` is ground truth** from the environment, so the evaluator is stronger than
   the paper's self-evaluated setup — results are not directly comparable to its AlfWorld
