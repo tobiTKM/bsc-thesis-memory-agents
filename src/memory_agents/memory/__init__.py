@@ -1,10 +1,6 @@
-"""Pluggable memory backends for the memory-augmented agents.
-
-The `Memory` ABC is the seam every method shares: Reflexion writes verbal
-reflections keyed by puzzle id, while Memp (procedural) and MemoryBank
-(declarative) are cross-task banks retrieved by embedding similarity -- the
-latter a subclass of the former, since the two differ in what a memory *says*,
-not in how it is retrieved.
+"""Memory backends: Reflexion (per-puzzle reflections) and the cross-task
+retrieval banks Memp, MemoryBank and Contrastive (the latter two subclass Memp's
+store and share its retrieval).
 """
 
 from .base import Memory

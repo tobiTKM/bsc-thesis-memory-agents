@@ -1,38 +1,30 @@
-#!/usr/bin/env python
 """Run the memoryless baseline over a benchmark split and save results.
 
 Reads the server endpoint from LLM_BASE_URL / LLM_MODEL (set by
 serve_and_run.sbatch). Writes a JSON with a summary (accuracy overall and by
 difficulty, token totals) plus one record per puzzle.
 
-  python scripts/run_baseline.py --split test --concurrency 32 --limit 50
-  python scripts/run_baseline.py --benchmark stepgame --split test
+  python scripts/run.py baseline --split test --concurrency 32 --limit 50
+  python scripts/run.py baseline --benchmark stepgame --split test
 """
 
 import argparse
-import asyncio
 import collections
 import json
 import os
 import pathlib
-import sys
 import time
 from datetime import datetime
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
-
 from memory_agents.agents.base import MAX_FORMAT_RETRIES
-from memory_agents.benchmarks import add_benchmark_args, build_benchmark
+from memory_agents.benchmarks import build_benchmark
 from memory_agents.config import resolve_server
 from memory_agents.llm.client import LLMClient
+from memory_agents.methods.common import add_run_args
 
 
 def summarize_format_failures(path: pathlib.Path) -> dict:
-    """Aggregate the per-reply failure log written by BaselineAgent.
-
-    `finish_reason == "length"` is the one that matters: it means the reply hit
-    max_tokens, so the fix is a bigger budget, not a looser parser.
-    """
+    """Aggregate BaselineAgent's per-reply failure log ("length" = hit max_tokens)."""
     if not path.exists():
         return {}
     reasons, empties, n = collections.Counter(), 0, 0
@@ -66,9 +58,7 @@ def summarize(results) -> dict:
     for r in results:
         by_diff.setdefault(r.difficulty, []).append(r.success)
 
-    # StepGame's second axis: k (above) is the story length, the true hop count is
-    # the reasoning depth, and they are not the same thing. Absent on SPaRC, where
-    # secondary_difficulty is None and nothing lands here.
+    # StepGame only: true hop count (reasoning depth), distinct from k (story length).
     by_hops: dict[int, list] = {}
     for r in results:
         hops = (r.extra or {}).get("hops")
@@ -87,12 +77,9 @@ def summarize(results) -> dict:
            if by_hops else {}),
         "prompt_tokens": sum(r.prompt_tokens() for r in results),
         "completion_tokens": sum(r.completion_tokens() for r in results),
-        # Of the two totals above, what went on replies that never yielded a move.
-        # Pure waste, and it has to be visible: a method that provokes more format
-        # failures must not get to look cheap.
+        # Part of the totals above spent on replies that never yielded a move.
         "retry_tokens": sum(r.retry_tokens() for r in results),
-        # Episodes that crashed rather than failed. Non-zero means the run is
-        # incomplete, not that the model did badly.
+        # Crashed, not failed: non-zero means the run is incomplete.
         "errors": sum(1 for r in results if r.terminal_reason == "error"),
         "total_steps": sum(r.steps() for r in results),
     }
@@ -115,24 +102,17 @@ def to_record(r) -> dict:
     }
 
 
-async def main():
-    ap = argparse.ArgumentParser()
-    add_benchmark_args(ap)
-    ap.add_argument("--split", default="test")
-    ap.add_argument("--concurrency", type=int, default=32)
-    ap.add_argument("--limit", type=int, default=0, help="0 or less = whole split")
-    ap.add_argument("--max-tokens", type=int, default=1024)
-    ap.add_argument("--temperature", type=float, default=0.0,
-                    help="0 = greedy (deterministic). Reasoning models: use ~0.6.")
-    ap.add_argument("--top-p", type=float, default=1.0)
-    ap.add_argument("--top-k", type=int, default=None,
-                    help="vLLM extra param; unset = disabled. Qwen3 thinking: 20.")
-    ap.add_argument("--seed", type=int, default=0,
-                    help="decoding seed. Vary it to resample the same split.")
-    ap.add_argument("--out", default=None, help="output JSON path")
+async def main(argv: list[str], prog: str) -> None:
+    ap = argparse.ArgumentParser(
+        prog=prog, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Greedy and short, unlike common.SAMPLING. Reasoning models want
+    # --temperature 0.6 --top-p 0.95 --top-k 20 --max-tokens 12288.
+    add_run_args(ap, max_tokens=1024, temperature=0.0, top_p=1.0, top_k=None,
+                 seed_help="decoding seed. Vary it to resample the same split.")
     ap.add_argument("--failure-log", default=None,
                     help="JSONL of unparseable replies (default: alongside --out)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     limit = args.limit if args.limit > 0 else None
     benchmark = build_benchmark(args)
@@ -161,14 +141,10 @@ async def main():
     summary = summarize(results)
     summary["elapsed_sec"] = round(elapsed, 1)
     summary["model"] = model
-    # `model` is only the --served-model-name alias ("qwen"), which is stable on
-    # purpose so result filenames are. The real checkpoint comes from the serve
-    # job, so a report can name what was actually run.
+    # `model` is the served alias; LLM_MODEL_ID is the real checkpoint.
     summary["model_id"] = os.environ.get("LLM_MODEL_ID") or model
     summary["split"] = args.split
-    # Which actor prompt produced this number. Without it a results file is
-    # ambiguous the moment a second protocol exists, and the two are not
-    # comparable: `upstream` is 10-shot and therefore not memoryless.
+    # Protocols are not comparable: `upstream` is 10-shot, so not memoryless.
     if args.benchmark == "stepgame":
         summary["prompt_protocol"] = args.prompt_protocol
     summary["max_tokens"] = args.max_tokens
@@ -177,21 +153,16 @@ async def main():
     summary["top_k"] = args.top_k
     summary["seed"] = client.seed
     summary["concurrency"] = args.concurrency
-    # Recorded so summarize_results can tell "retried but recovered" from "aborted
-    # the episode" instead of guessing with a hardcoded default.
+    # Lets summarize_results tell recovered retries from aborted episodes.
     summary["max_format_retries"] = MAX_FORMAT_RETRIES
     summary["benchmark"] = benchmark.name
-    # The env step cap. summarize_results reads a truncation as a dead end rather
-    # than a step-limit cutoff; that only holds while episodes stay well under this.
-    # Single-turn benchmarks have no step cap and no dead ends, so it is omitted
-    # rather than reported as a meaningless 1.
+    # summarize_results reads truncation as a dead end, valid only while episodes
+    # stay well under this cap. Omitted for single-turn benchmarks.
     if benchmark.interactive:
         from memory_agents.envs.sparc import MAX_STEPS
         summary["max_steps"] = MAX_STEPS
     summary["format_failures"] = summarize_format_failures(fail_log)
 
-    # results/json holds the machine-readable run data (this file plus the failure
-    # log); results/txt holds the reports scripts/summarize_results.py writes.
     tag = "" if benchmark.name == "sparc" else f"{benchmark.name}_"
     out = args.out or (
         f"results/json/baseline_{tag}{model.replace('/', '_')}_"
@@ -217,6 +188,3 @@ async def main():
               f"-> {ff['log']}", flush=True)
     print(f"wrote {out_path}", flush=True)
 
-
-if __name__ == "__main__":
-    asyncio.run(main())

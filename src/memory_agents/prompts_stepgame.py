@@ -1,30 +1,19 @@
-"""Every prompt the StepGame arms use.
+"""Every prompt the StepGame arms use; mirrors prompts.py one for one.
 
-Deliberately a separate module from prompts.py rather than more functions inside
-it. prompts.py's strings produced the SPaRC numbers already written up in
-docs/memp.md and docs/memorybank.md; keeping StepGame out of that file makes "the
-SPaRC prompts are byte-identical" true by construction instead of by review, which
-is what scripts/regress_sparc.py then only has to confirm.
-
-The shapes mirror prompts.py one for one -- system prompt, reflection, two Memp
-distill variants, two MemoryBank case variants, and the block renderers -- so the
-two benchmarks stay comparable and a reader of one can read the other.
+Kept separate so the SPaRC prompts in prompts.py stay byte-identical
+(tests/regress_sparc.py).
 """
 
 from .envs.stepgame_solver import LABELS, OFFSETS
 
-# The nine labels, rendered once, in reading order rather than alphabetical.
 _LABEL_LINE = ", ".join(LABELS)
 
 
 # --------------------------------------------------------------------------- #
 # the actor
 # --------------------------------------------------------------------------- #
-# Every byte of the StepGame system prompt is constant -- unlike SPaRC, where the
-# per-puzzle polyshape table has to be interpolated somewhere. So the entire
-# prompt is a shared KV prefix under vLLM's --enable-prefix-caching, and the only
-# per-item text is the user message. Keep it that way: anything item-specific
-# added here would cost that prefix across the whole run.
+# The system prompt is fully constant so vLLM can cache it as a shared prefix;
+# keep item-specific text in the user message.
 _STEPGAME_IO_CONTRACT = f"""
     You MAY think step-by-step, but you MUST end your reply with:
     Final: <label>
@@ -34,14 +23,8 @@ _STEPGAME_IO_CONTRACT = f"""
 
 
 def stepgame_rules() -> str:
-    """The task statement. Zero-shot: no worked example, deliberately.
-
-    Few-shot examples are themselves a form of injected memory, so including them
-    would put a fixed, hand-written memory in *every* arm including the memoryless
-    baseline, and contaminate exactly the contrast this project measures. It also
-    means our numbers are not directly comparable to Li et al.'s, which are 5- and
-    10-shot; that is a stated cost, not an oversight.
-    """
+    """The task statement, zero-shot: few-shot examples would be injected memory
+    in every arm, including the memoryless baseline (Li et al. use 5/10-shot)."""
     return f"""
     You are solving a spatial reasoning problem.
 
@@ -82,18 +65,10 @@ def stepgame_system_prompt() -> str:
 # the method a memory can describe: the coordinate technique
 # --------------------------------------------------------------------------- #
 def relations_preamble(artifact: str = "procedure") -> str:
-    """The relation/offset table, prepended to every prompt that WRITES a memory.
+    """The relation/offset table prepended to every memory-writing prompt, so
+    memories state offsets and the frame of reference correctly.
 
-    The StepGame counterpart of prompts.distill_rules_preamble, and it plays the
-    same role: on SPaRC, §3.5 of docs/memp.md measured that without the rulebook
-    50.7% of distilled procedures misstated a rule. Here the equivalent failure is
-    a memory that asserts the wrong offset for a diagonal or inverts the frame of
-    reference, which would be worse than no memory at all.
-
-    Note the contrast with SPaRC, where the distill prompts *ban* coordinates from
-    a procedure because there they were overfitting to one grid. On StepGame the
-    coordinate frame IS the method -- it generalises across every item -- so the
-    table is supplied rather than forbidden.
+    Unlike SPaRC, coordinates are wanted here: the coordinate frame is the method.
     """
     offsets = "\n".join(f"      {label:12s} ({dx:+d}, {dy:+d})"
                         for label, (dx, dy) in OFFSETS.items())
@@ -124,9 +99,7 @@ _REFLECTION_EXAMPLES = """- I chained the relations in the right order but read 
 
 
 def format_previous_plans(previous) -> str:
-    """The plans earlier trials already tried, so a reflection does not re-propose
-    one that has already been watched to fail. Mirrors prompts.format_previous_plans.
-    """
+    """Plans earlier trials already tried, so a reflection does not repeat one."""
     if not previous:
         return ""
     body = "\n".join(f"    - {p}" for p in previous)
@@ -137,19 +110,9 @@ def format_previous_plans(previous) -> str:
 def stepgame_reflection_prompt(episode, previous=()) -> str:
     """Reflexion's self-reflection step for a single-turn item.
 
-    >>> THE GOLD LABEL IS NOT IN THIS PROMPT AND MUST NEVER BE. <<<
-
-    The reflector sees the story, the question, the answer it gave and its own
-    reasoning, plus the binary fact that the answer was wrong. That is exactly the
-    signal Reflexion's own HotpotQA setting provides (an EM verdict, not the target),
-    and it is the only version of this experiment that measures anything: with nine
-    labels, a reflector shown the gold answer would simply restate it and the arm
-    would score 100% while demonstrating nothing.
-
-    The caller enforces this structurally -- run_reflexion hands over an
-    EpisodeResult rebuilt from `reflection_context()`, which has no gold field to
-    leak -- and scripts/smoke_stepgame.py asserts it. This docstring is the third
-    layer, for whoever edits the prompt next.
+    The gold label must never appear in this prompt: the reflector gets only a
+    binary wrong-answer signal, as in Reflexion's HotpotQA setting.
+    tests/smoke_stepgame.py asserts this.
     """
     reasons = {
         "wrong-answer": "you gave the wrong relation",
@@ -244,13 +207,9 @@ def stepgame_distill_trajectory_prompt(episode, key_text: str, record,
 
 
 def stepgame_distill_gold_prompt(key_text: str, record, gold_chain: str) -> str:
-    """Memp's hindsight variant: a procedure from the worked solution.
+    """Memp's hindsight variant: a procedure from the exact solver's derivation.
 
-    Used for train items the agent got wrong or crashed on. Reads the solver's
-    derivation rather than an agent transcript, so a crashed item distils exactly
-    like a wrong one. The derivation comes from stepgame_solver, which is verified
-    exact over the whole corpus, so this is hindsight from a source that cannot be
-    wrong -- unlike SPaRC's gold fallback, which is only as good as the dataset.
+    Used for train items the agent got wrong or crashed on.
     """
     return f"""{relations_preamble("procedure")}
     Below is a spatial reasoning question together with a correct, worked solution.
@@ -331,11 +290,7 @@ def stepgame_case_gold_prompt(key_text: str, record, gold_chain: str,
 # rendering retrieved memory into the actor's context
 # --------------------------------------------------------------------------- #
 def format_exemplar(exemplar: dict) -> str:
-    """A bank entry's concrete solved example, compactly.
-
-    Assembled in code by the driver, never written by the LLM, so it cannot
-    misstate what the example was.
-    """
+    """A bank entry's compact solved example, assembled in code rather than by the LLM."""
     return (f"Example: {exemplar.get('hops', '?')}-hop chain over "
             f"{exemplar.get('sentences', '?')} sentences "
             f"({exemplar.get('unused', 0)} not needed); "
@@ -353,14 +308,8 @@ def _render(entries, granularity: str, header: str, label: str, field: str,
             abstract_at: tuple, exemplar_at: tuple) -> str:
     """Shared renderer for the procedure and case blocks.
 
-    Appended AFTER the full system prompt by MemoryAgent.reset, exactly like the
-    SPaRC blocks, so the shared KV prefix survives. Similarity scores are logged in
-    the results but never rendered here: every retrieval arm must inject
-    byte-identical *formats* so they differ only in which entries were retrieved.
-
-    `field` is the entry key holding the written text ("script" for a procedure,
-    "case_note" for a case) and `label` is only what the reader sees -- the two are
-    deliberately separate parameters rather than one derived from the other.
+    Similarity scores are never rendered, so retrieval arms differ only in which
+    entries they inject. `field` is the entry key holding the text; `label` is display only.
     """
     parts = [header]
     for i, entry in enumerate(entries, 1):
@@ -378,11 +327,11 @@ def _render(entries, granularity: str, header: str, label: str, field: str,
 
 
 def format_procedures(entries, granularity: str = "script") -> str:
-    """Memp's injected block. Granularities mirror the paper's Build policies:
+    """Memp's injected block. Granularities follow the paper's Build policies:
 
       script            -- the distilled abstraction plus a compact exemplar
       trajectory        -- the stored worked derivation only
-      proceduralization -- both, the paper's best-performing condition on SPaRC
+      proceduralization -- both
     """
     if granularity not in ("script", "trajectory", "proceduralization"):
         raise ValueError(f"unknown granularity {granularity!r}")
@@ -400,10 +349,8 @@ def format_procedures(entries, granularity: str = "script") -> str:
 def format_cases(entries, granularity: str = "case-record") -> str:
     """MemoryBank's injected block: concrete past cases, framed as analogies.
 
-      case-record -- the note plus the verbatim worked record (the paper's two
-                     layers, and the default)
-      case        -- the note plus a compact exemplar, the analogue of Memp's
-                     `script`, kept for that contrast
+      case-record -- the note plus the verbatim worked record (default)
+      case        -- the note plus a compact exemplar, the analogue of Memp's `script`
     """
     if granularity not in ("case-record", "case"):
         raise ValueError(f"unknown granularity {granularity!r}")
@@ -420,12 +367,8 @@ def format_cases(entries, granularity: str = "case-record") -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Contrastive memory (docs/contrastive.md) -- StepGame renderers.
-#
-# StepGame is single-turn, so a failure is one wrong answer plus the reasoning that
-# produced it, and there is no rule_status to quote -- broken_rules() returns []
-# and the prompt falls back to the answer the attempt gave. Everything else is the
-# SPaRC design unchanged.
+# Contrastive memory. Single-turn, so there are no broken rules to quote; a
+# failure is the wrong answer plus its reasoning.
 # --------------------------------------------------------------------------- #
 _CONTRASTIVE_HEADER = (
     "\n\nMemory from previous questions with a similar structure. Each item is "
@@ -445,8 +388,7 @@ _AVOID_ONLY_HEADER = (
     "OTHER questions -- never use one as a source for this question's answer."
 )
 
-# See the note on prompts._ALL_DO_HEADER: `hindsight` renders every item as a DO, so
-# the mixed-sign header promises failures its block never contains.
+# For `hindsight` under matched framing: every item renders as a DO (see prompts._ALL_DO_HEADER).
 _ALL_DO_HEADER = (
     "\n\nMemory from previous questions with a similar structure: strategies for "
     "answering questions of this kind. They come from OTHER questions -- never use one "
@@ -459,12 +401,7 @@ _WITHHELD = "  (nothing recorded for this question under this arm)"
 
 
 def format_failed_exemplar(exemplar: dict) -> str:
-    """The concrete artifact of a DON'T on a single-turn task.
-
-    StepGame has no move sequence, so what a failed attempt leaves is its shape and
-    the label it produced. The correct answer is deliberately absent -- it lives in
-    the `hindsight` half, and a DON'T that carried it would stop being a warning.
-    """
+    """A failed attempt's item shape. The correct answer must stay out of a DON'T."""
     return (f"That attempt faced a {exemplar.get('hops', '?')}-hop chain over "
             f"{exemplar.get('sentences', '?')} sentences "
             f"({exemplar.get('unused', 0)} not needed); "
@@ -473,7 +410,7 @@ def format_failed_exemplar(exemplar: dict) -> str:
 
 def format_contrastive(entries, granularity: str = "avoid", exemplars: bool = False,
                        framing: str = "mixed") -> str:
-    """The injected block at contrastive eval time. Arms as on SPaRC."""
+    """The injected block at contrastive eval time; same arms as on SPaRC."""
     from .memory.contrastive import AGENT, GRANULARITIES
     if granularity not in GRANULARITIES:
         raise ValueError(f"unknown granularity {granularity!r}")
@@ -510,18 +447,10 @@ def format_contrastive(entries, granularity: str = "avoid", exemplars: bool = Fa
 
 
 def stepgame_avoid_prompt(episode, key_text: str, record, rules=()) -> str:
-    """Distil ONE reusable DON'T from one wrong answer.
+    """Distil one reusable DON'T from one wrong answer.
 
-    **The distiller never sees the gold label.** It gets the story, the question,
-    the attempt's own answer and reasoning, and the fact that it was wrong -- the
-    same signal the Reflexion reflector gets here (docs/stepgame.md section 4.1).
-    Nothing forbids using gold on a TRAIN item -- Memp's hindsight prompt does, and
-    that is exactly what the `hindsight` control arm is -- but a DON'T written with
-    the answer in hand becomes a statement about the answer rather than about the
-    error, and the two arms would then differ in more than one thing.
-
-    `rules` is always empty here: a single-turn benchmark has no per-rule verdict.
-    The parameter is kept so the benchmark seam has one signature.
+    The gold label must never appear here (the `hindsight` arm is the one that
+    uses gold). `rules` is always empty; it exists to match the Benchmark signature.
     """
     answered = (episode.transitions[0].action if episode.transitions else None)
     return f"""{relations_preamble(artifact="warning")}

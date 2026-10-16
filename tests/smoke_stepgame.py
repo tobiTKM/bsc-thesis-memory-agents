@@ -6,7 +6,7 @@ corpus gate, this one is the seconds-long check you run after touching any of
 envs/stepgame*.py. Written as a plain script rather than a pytest module because
 the project has no test dependency and this needs none.
 
-    python scripts/smoke_stepgame.py
+    python tests/smoke_stepgame.py
 """
 
 import pathlib

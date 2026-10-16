@@ -1,49 +1,14 @@
 #!/usr/bin/env python3
 """Freeze the StepGame train and test splits every arm runs against.
 
-The corpus is far too large to evaluate on -- 113k clean test items alone -- so
-the experiment runs on a stratified sample, and that sample has to be *frozen*:
-the baseline, both Reflexion arms, and every MemP / MemoryBank eval must score the
-identical items or the paired tests (exact McNemar over the same items) are not
-paired at all. So the sample is drawn once, with a recorded seed, written to JSONL
-and committed. Nothing downstream re-samples.
+The splits are drawn once with a recorded seed and committed, so every arm scores the
+identical items for the paired tests; nothing downstream re-samples. By default the
+bank source is train k=1..5 and the eval set is test k=1..10, 100 items per k.
+k is not the reasoning depth (the queried pair is drawn from the k-relation chain, so
+true hops <= k); `--stratify hops` balances by true hop count instead. Every item is
+solved before it is written and carries both `k` and `hops` plus its gold chain.
 
-Defaults, and why:
-
-* test = 100 items per k, k=1..10 (1000 items). Li et al. showed 30- and
-  100-item evaluations of the *whole* benchmark fluctuate enough to invert the
-  ordering between hop levels, while 1000 gives the clean monotone decay; 100 per
-  k is that budget spread so every hop level is separately reportable. It is also
-  the same order as the 500-puzzle SPaRC split, so per-item costs stay comparable.
-* train = 100 items per k, k=1..5 (500 items), which is exactly SPaRC's bank size.
-
-The train/test asymmetry (k<=5 built, k<=10 evaluated) is deliberate and is the
-original StepGame generalization protocol: it asks whether memory distilled from
-short chains transfers to chains longer than any it was built on. Half the test
-set is out of the bank's range by construction.
-
-**k is not the reasoning depth.** StepGame builds a chain of k relations and then
-picks the two queried entities *at random from that chain*, so the number of hops
-actually separating them is <= k (the original paper says so in passing; nothing
-downstream of it seems to). Measured over the rectified clean test corpus, the
-k=10 file averages 3.7 true hops and 23% of its items are solvable in one. The
-whole published literature reports accuracy per k, which is therefore accuracy
-over a mixture of depths, not a depth.
-
-The solver gives us the true hop count for free, so both axes are available:
-
-* `--stratify k` (default) samples per file, which is what every published
-  StepGame number is stratified by, and is what our results must be comparable to.
-* `--stratify hops` samples per *true* hop count, which is the honest difficulty
-  axis for "does memory help more as reasoning gets deeper?".
-
-Every item carries both `k` and `hops` either way, so a single run can be broken
-down along both; the two splits differ only in which axis is balanced.
-
-Every sampled item is solved before it is written, and its gold chain stored, so
-a bank never has to re-derive one and a mis-parsed item can never reach an arm.
-
-    python scripts/build_stepgame_splits.py                      # both defaults
+    python scripts/build_stepgame_splits.py                      # the standard splits
     python scripts/build_stepgame_splits.py --variant noise --split test
 """
 
@@ -60,13 +25,12 @@ from memory_agents.envs.stepgame_solver import (  # noqa: E402
     SolverError, edges_of, gold_chain, hop_count, solve,
 )
 
-# Sampling is per (variant, split, k) and seeded with the base seed mixed with k,
-# so adding a hop level to a split does not reshuffle the levels already drawn.
+# Each (variant, split, bucket) has its own RNG, so adding a bucket keeps the others.
 DEFAULT_SEED = 0
 
 
 def _pool(variant: str, split: str, ks) -> list[stepgame.StepGameItem]:
-    """Every corpus item across the given files, with hops and chain resolved."""
+    """Every corpus item across the given k files."""
     items = []
     for k in ks:
         path = stepgame.corpus_path(variant, split, k)
@@ -83,9 +47,7 @@ def _verify_and_annotate(item, dropped: list) -> bool:
     try:
         predicted = solve(item.story, item.question)
         if predicted != item.gold:
-            # Cannot happen while verify_stepgame_solver.py passes; if it ever
-            # does, the item is dropped rather than trusted, because we no longer
-            # know which of the two labels is right.
+            # Cannot happen while verify_stepgame_solver.py passes; dropped, not trusted.
             dropped.append((item.id, f"solver={predicted} gold={item.gold}"))
             return False
         item.hops = hop_count(item.story, item.question)
@@ -107,20 +69,16 @@ def build(variant: str, split: str, ks, per_bucket: int, seed: int,
     kept: list[stepgame.StepGameItem] = []
 
     if stratify == "k":
-        # Sample per file. Cheap: only the sampled items need solving.
         for k in ks:
             pool = _pool(variant, split, [k])
             rng = random.Random(f"{seed}:{variant}:{split}:k{k}")
-            # Sample without replacement from the *whole* level rather than
-            # taking a prefix: the corpus is generated in order and a prefix
-            # would correlate with whatever the generator's sampler did first.
+            # Sample the whole level, not a prefix: the corpus is generated in order.
             for item in sorted(rng.sample(pool, min(per_bucket, len(pool))),
                                key=lambda it: it.id):
                 if _verify_and_annotate(item, dropped):
                     kept.append(item)
     else:
-        # Sample per true hop count. Every candidate must be solved to know
-        # which bucket it belongs in, so this reads the whole pool first.
+        # The hop bucket is only known after solving, so the whole pool is solved first.
         pool = _pool(variant, split, ks)
         for item in pool:
             item.hops = hop_count(item.story, item.question)
@@ -206,19 +164,13 @@ def main() -> int:
               stratify=args.stratify, hops=args.hops)
         return 0
 
-    # The standard pair: the bank is built on short chains, the evaluation spans
-    # all of them.
+    # Standard pair: bank built on k<=5, evaluation on k<=10.
     build("clean", "train", list(range(1, 6)), args.per_bucket, args.seed, out_dir)
-    # A hop-balanced bank source. Stratifying the train split by k leaves it 58%
-    # one-hop items, because most queried pairs sit close together on the chain --
-    # a bank distilled from that is mostly worked examples of a task with no
-    # chaining in it at all. This one holds 100 per true hop depth instead.
+    # Hop-balanced bank source: stratifying train by k leaves it mostly one-hop items.
     build("clean", "train", list(range(1, 6)), args.per_bucket, args.seed, out_dir,
           stratify="hops", hops=list(range(1, 6)))
     build("clean", "test", list(stepgame.KS), args.per_bucket, args.seed, out_dir)
-    # The difficulty-analysis split. h=10 is capped at what the corpus holds (78
-    # items over the whole clean test set), so it is excluded rather than
-    # reported as an underpowered bucket.
+    # Hop-balanced test split; hops=10 is excluded, the corpus holds too few such items.
     build("clean", "test", list(stepgame.KS), args.per_bucket, args.seed, out_dir,
           stratify="hops", hops=list(range(1, 10)))
     return 0

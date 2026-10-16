@@ -17,3 +17,5 @@ dist/
 # The frozen splits under data/stepgame/splits/ ARE committed: they are 3 MB and
 # every arm must score the identical items for the paired tests to be paired.
 data/stepgame/raw/
+.claude/
+docs/

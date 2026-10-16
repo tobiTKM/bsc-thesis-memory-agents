@@ -1,15 +1,13 @@
+"""The baseline actor with a retrieved-memory block appended to its system prompt."""
+
 from .base import BaselineAgent
 
 
 class MemoryAgent(BaselineAgent):
-    """The baseline actor plus a persistent block of retrieved memory.
+    """BaselineAgent with a memory block appended to the system message at reset.
 
-    Method-agnostic by design: Reflexion, MemoryBank and MemP all differ in *how*
-    the memory block is produced (see the Memory ABC and each method's writer),
-    not in how it is consumed. The block is folded into the system message once at
-    reset; because BaselineAgent._trim keeps only messages[:1], it survives every
-    step of the episode for free -- exactly like the plain system prompt. With an
-    empty block this behaves identically to the memoryless baseline.
+    _trim keeps messages[:1], so the block lasts the whole episode; an empty block
+    behaves exactly like the baseline.
     """
 
     def reset(self, system_prompt: str, memory_block: str = "", label=None) -> None:

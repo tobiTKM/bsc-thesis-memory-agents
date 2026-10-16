@@ -1,42 +1,22 @@
-#!/usr/bin/env python
 """Contrastive memory over SPaRC / StepGame: one bank holding DOs distilled from the
 actor's successes and DON'Ts distilled from its failures.
 
-The fourth method of the thesis, and the only one not ported from a paper. Every
-ported method learns from one sign: Reflexion learns from failure but only about the
-SAME task, while Memp and MemoryBank learn cross-task but only from success -- a
-train puzzle the actor failed is distilled from the dataset's GOLD path instead, so
-the failure itself is thrown away. This keeps it. Which side an entry carries is
-decided by the outcome, not by a knob:
+The entry's side follows the train outcome: a solved puzzle yields a `strategy`
+(Memp's distill prompt); a failed one yields an `avoid` text distilled from the
+failure plus a `hindsight` text (Memp's gold prompt). --granularity picks what a
+failed entry contributes: avoid (the method), hindsight (the control),
+positive-only (nothing), avoid-only (DON'Ts, DOs withheld). Bank, retriever and k
+are shared, and Memp's build file and embeddings are reused as-is.
 
-    solved  ->  `strategy`   Memp's own distill prompt, verbatim
-    failed  ->  `avoid`      the one new model call this method introduces
-                `hindsight`  Memp's own gold prompt, verbatim -- the CONTROL
-
-so `--granularity avoid` against `--granularity hindsight` is a single-factor test
-over one bank: same 500 entries, same retriever, same k, same positive half, and the
-only thing that moves is what the non-solved entries say. docs/contrastive.md is the
-design and the pre-registered predictions.
-
-Three phases, because the two expensive inputs are Memp's and are NOT re-run:
-
-  distill  memp_build_train_*.json -> contrastive_bank_*.json (chat model, ~1-2 h).
-           Writes all three texts in one pass so the arms can never be built from
-           different banks.
-  eval     (chat model job) top-k entries per test item -> injected block -> one
-           pass over the test split. --granularity picks what a failed entry is
-           allowed to say; --arm picks how entries are chosen, including the
-           `balanced` arm that guarantees at least one DO in the block.
-  compare  no GPU: baseline vs the arms, exact McNemar throughout, plus the
-           polarity of what each arm actually injected.
-
-The embed phase is Memp's: this method keys on the identical puzzle_key_text, so
-memp_embeddings_*.npz is reused verbatim and retrieval is byte-identical to Memp's
-and MemoryBank's by construction.
+  distill    memp_build_train_*.json -> contrastive_bank_*.json, all texts in one pass
+  exemplars  attach winning/losing lines to a bank built without them (CPU, no model)
+  eval       top-k entries per test item -> injected block -> one pass over the split
+  compare    baseline vs the arms (exact McNemar) plus each arm's injected polarity
 
   sbatch -J co-dist --export=ALL,DRIVER=contrastive,PHASE=distill,BUILD=<memp_build_train_*.json> scripts/serve_and_run.sbatch
+  python scripts/run.py contrastive --phase exemplars --bank <bank.json>
   sbatch -J co-avo  --export=ALL,DRIVER=contrastive,PHASE=eval,ARM=retrieved,CO_GRANULARITY=avoid,BANK=<bank.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
-  python scripts/run_contrastive.py --phase compare --baseline <root.json> --avoid <avoid.json> --hindsight <hindsight.json> --positive <pos.json> --random <rnd.json>
+  python scripts/run.py contrastive --phase compare --baseline <root.json> --retrieved <avoid.json> --hindsight <hindsight.json> --positive <pos.json> --random <rnd.json>
 """
 
 import argparse
@@ -48,24 +28,19 @@ import sys
 import time
 from datetime import datetime
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-
-# Same discipline as run_memorybank: the plumbing is IMPORTED from run_memp, not
-# mirrored, so state checkpointing, client construction, the episode record shape,
-# the accuracy block, the exemplar builders and the whole comparison stack are
-# shared verbatim with the other two cross-task methods.
-import run_memp as memp
-from run_memp import (accuracy_block, agent_exemplar, baseline_outcomes, bench,
+# Plumbing is imported from memp, not copied, so all cross-task methods share it.
+from memory_agents.methods import memp
+from memory_agents.methods.memp import (accuracy_block, agent_exemplar, baseline_outcomes, bench,
                       compare_row, episode_record, eval_outcomes, gold_exemplar,
                       load_embeddings, make_client, mcnemar_exact, save_state,
                       split_ids)
 
-from memory_agents.benchmarks import add_benchmark_args, build_benchmark
+from memory_agents.benchmarks import build_benchmark
 from memory_agents.envs.base import EpisodeResult
 from memory_agents.memory import AvoidDistiller, ContrastiveMemory, Distiller
 from memory_agents.memory.contrastive import (AGENT, FAILED, GRANULARITIES,
                                               broken_rules, rendered_as)
+from memory_agents.methods.common import SAMPLING, add_run_args, typed_flags
 
 BANK_SCHEMA = "contrastive-bank-v1"     # == ContrastiveMemory.SCHEMA
 EVAL_SCHEMA = "contrastive-eval-v1"
@@ -130,9 +105,7 @@ async def run_distill(args) -> None:
     if build["config"].get("schema") != BUILD_SCHEMA:
         raise SystemExit(f"--build expects a {BUILD_SCHEMA} file; "
                          f"{cfg['build']} is {build['config'].get('schema')!r}")
-    # The bank inherits the actor that produced the build pass -- and, because the
-    # polarity of this bank IS that actor's train accuracy, the pairing matters more
-    # here than for the other methods. Recorded so an eval can warn about a mismatch.
+    # Bank polarity is the build actor's train accuracy; eval warns on a mismatch.
     cfg.setdefault("build_model", build["config"].get("model_id"))
 
     if args.verify_gold:
@@ -155,21 +128,13 @@ async def run_distill(args) -> None:
               f"(+ a hindsight control text for each of those)", flush=True)
 
     async def distill_one(pos, neg, sem, pid):
-        """All texts for one entry, in one place.
-
-        Both writers are handed the same episode and the same key text, and the
-        positive/negative routing is the episode's own outcome -- never a flag --
-        so an entry cannot end up with the wrong sign. `hindsight` is written for
-        every failed entry in the SAME pass as `avoid`: if the control text came
-        from a second job, the two arms could silently be built from different
-        banks and the single-factor claim would be false.
-        """
+        """All texts for one entry; the sign follows the episode outcome, and
+        `hindsight` is written in the same pass as `avoid` so both arms share a bank."""
         rec = build["puzzles"][pid]
         row = bench().record("train", pid)
         key_text = bench().key_text(row)
         ctx = rec.get("episode_context") or {}
-        # `success and ctx` mirrors Memp's routing exactly: a crashed episode has no
-        # context, so it has no trajectory to distil either sign from.
+        # Mirrors Memp's routing: a crashed episode has no context to distil from.
         solved = bool(rec["success"] and ctx)
         async with sem:
             if solved:
@@ -185,9 +150,7 @@ async def run_distill(args) -> None:
                 episode = EpisodeResult.from_reflection_context(failed, pid)
                 avoid_text, avoid_resp = await neg.distill_from_failure(
                     episode, key_text, row, rules=rules)
-            # The control text, Memp's gold policy verbatim. Written even when the
-            # episode left no trajectory to warn about, so `hindsight` covers the
-            # whole bank exactly as a Memp bank does.
+            # Written even without a trajectory, so `hindsight` covers the whole bank.
             hind_text, hind_resp = await pos.distill_from_gold(key_text, row)
             return pid, FAILED, {
                 "avoid": avoid_text, "hindsight": hind_text,
@@ -221,9 +184,7 @@ async def run_distill(args) -> None:
                     for r in resps:
                         stats["distill_prompt_tokens"] += r.prompt_tokens
                         stats["distill_completion_tokens"] += r.completion_tokens
-                    # The text this entry's DEFAULT arm renders. An entry with none
-                    # would be an Item the actor reads as blank, so it is retried
-                    # rather than banked.
+                    # No default-arm text would render a blank Item: retry, don't bank.
                     primary = fields.get("strategy") or fields.get("avoid")
                     if not primary:
                         empties.append(pid)
@@ -250,18 +211,14 @@ async def run_distill(args) -> None:
     if todo:
         empties = await distill_pass(todo, cfg["seed"])
         if empties:
-            # The same prompt at the same seed replays the same empty reply (usually
-            # a thinking budget spent inside <think>), so the one retry reseeds.
+            # The same seed would replay the same empty reply, so the retry reseeds.
             print(f"[distill] retrying {len(empties)} empty replies at seed+1",
                   flush=True)
             empties = await distill_pass(empties, cfg["seed"] + 1)
         stats["empty"] = len(empties)
         save_state(out, {**memory.to_dict(), "config": cfg})
 
-    # Born with the concrete artifacts, so `--exemplars on` (the reported
-    # configuration, docs/contrastive.md section 3) needs no separate CPU pass and a
-    # new actor is one chained submission. Retrofitting an OLDER bank still goes
-    # through `--phase exemplars`, which is the same code and touches no text.
+    # Attached here so `--exemplars on` needs no separate `--phase exemplars` pass.
     n_win, n_fail, _m = attach_exemplars(memory, build)
     cfg["exemplars_attached"] = True
     print(f"[distill] attached {n_win} winning lines and {n_fail} losing lines "
@@ -275,10 +232,7 @@ async def run_distill(args) -> None:
           f"retry, {stats['failed']} failed. Tokens prompt="
           f"{stats['distill_prompt_tokens']:,} "
           f"completion={stats['distill_completion_tokens']:,}", flush=True)
-    # The polarity problem, stated where it cannot be missed: with a bank this
-    # lopsided an unconstrained top-k injects almost no DOs, and a null on `avoid`
-    # would not distinguish "negative advice does not help" from "it crowded out the
-    # worked example that does". That is what ARM=balanced exists for.
+    # A lopsided bank lets plain top-k inject almost no DOs; ARM=balanced guards this.
     if memory.positive_share() < 0.25 and len(memory):
         exp = memory.positive_share() * args.top_k_memories
         print(f"[distill] NOTE: only {memory.positive_share():.1%} of this bank is "
@@ -297,12 +251,9 @@ async def run_distill(args) -> None:
 # phase exemplars: attach the concrete artifacts to an existing bank (CPU, no model)
 # --------------------------------------------------------------------------- #
 def attach_exemplars(memory, build) -> tuple[int, int, int]:
-    """Write `exemplar` and `failed_exemplar` onto every entry. Pure code, no model.
+    """Write `exemplar` and `failed_exemplar` onto every entry (no model).
 
-    Shared by `--phase exemplars` (which retrofits a bank built before these fields
-    existed, leaving its texts byte-identical) and by `--phase distill` (so a bank
-    born after 2026-09-21 already carries them and a new actor is one chained
-    submission rather than distill -> CPU step -> evals).
+    Returns (winning lines, losing lines, entries without a build record).
     """
     n_win = n_fail = missing = 0
     for e in memory.entries:
@@ -313,13 +264,11 @@ def attach_exemplars(memory, build) -> tuple[int, int, int]:
         row = bench().record("train", e["source_pid"])
         ctx = rec.get("episode_context") or {}
         solved = bool(rec["success"] and ctx)
-        # The winning line, routed exactly as distill routes provenance, so the two
-        # can never disagree.
+        # Routed exactly as distill routes provenance.
         e["exemplar"] = agent_exemplar(row, ctx) if solved else gold_exemplar(row)
         n_win += 1
-        # The losing line a DON'T was distilled from. NOT the gold path: a warning
-        # carrying the correct solution has stopped being a warning, and `avoid`
-        # would silently become `hindsight`.
+        # The losing line, not the gold path: a warning carrying the solution
+        # would turn `avoid` into `hindsight`.
         if not solved and ctx.get("moves"):
             e["failed_exemplar"] = agent_exemplar(row, ctx)
             n_fail += 1
@@ -327,25 +276,11 @@ def attach_exemplars(memory, build) -> tuple[int, int, int]:
 
 
 def run_exemplars(args) -> None:
-    """Add `exemplar` and `failed_exemplar` to a bank that was built without them.
+    """Add `exemplar` and `failed_exemplar` to a bank built without them.
 
-    A SEPARATE phase, not part of distill, for one reason that matters: the arms it
-    enables (`--exemplars on`) must differ from the arms already run in the exemplar
-    and in NOTHING ELSE. Re-running distill would regenerate every `strategy`,
-    `avoid` and `hindsight` text at a different point in the sampling stream, and the
-    comparison would be confounded with the prose. This pass touches no text.
-
-    Both artifacts are assembled in code, and which one an entry gets is decided by
-    how the arms will RENDER it:
-
-      exemplar         the winning line -- the actor's own moves for a train task it
-                       solved, the dataset's gold path otherwise. This is exactly what
-                       Memp's `script` granularity attaches, which is the whole point:
-                       docs/contrastive.md 6.6 suspects its absence is why the
-                       `hindsight` control landed 10 puzzles below Memp's script arm.
-      failed_exemplar  the losing line the DON'T was distilled from. NOT the gold path:
-                       a warning that carries the correct solution has stopped being a
-                       warning, and `avoid` would silently become `hindsight`.
+    Leaves every text byte-identical; re-running distill would resample the prose.
+    exemplar = the winning line (actor's moves if solved, else the gold path, as in
+    Memp's `script`); failed_exemplar = the losing line the DON'T came from.
     """
     src = pathlib.Path(args.bank)
     data = json.loads(src.read_text())
@@ -362,8 +297,6 @@ def run_exemplars(args) -> None:
     save_state(out, {**memory.to_dict(), "config": {**cfg, "exemplars_attached": True}})
     print(f"[exemplars] {n_win} winning lines, {n_fail} failed lines attached"
           + (f", {missing} entries had no build record" if missing else ""), flush=True)
-    # A DON'T arm with no failed_exemplar would fall back to rendering nothing, which
-    # is a silent degradation rather than a different arm -- say so here instead.
     gap = sum(1 for e in memory.entries
               if e["provenance"] == FAILED and not e.get("failed_exemplar"))
     if gap:
@@ -382,10 +315,8 @@ def run_exemplars(args) -> None:
 def build_blocks(memory, arrays, cfg, test_ids):
     """Precompute the injected block + retrieval log for the test split.
 
-    Same construction as MemoryBank's: with a frozen bank, retrieval is a pure
-    function of (bank, embeddings, arm, k, seed), so precomputing makes block_for a
-    dict lookup -- trivially safe under concurrency -- and guarantees that a resumed
-    job injects byte-identical blocks.
+    Retrieval is deterministic over a frozen bank, so a resumed job injects
+    byte-identical blocks.
     """
     arm, k, seed = cfg["arm"], cfg["top_k_memories"], cfg["seed"]
     granularity, min_pos = cfg["granularity"], cfg.get("min_positive", 1)
@@ -401,8 +332,7 @@ def build_blocks(memory, arrays, cfg, test_ids):
             picks = (memory.balanced_retrieve(vec, k, min_pos)
                      if arm == "balanced" else memory.retrieve(vec, k))
         elif arm == "random-balanced":
-            # Matched to `balanced`, not to `retrieved`: an ablation that changed
-            # polarity AND relevance at once would measure neither.
+            # Matched to `balanced`, not `retrieved`, so only relevance changes.
             picks = memory.stratified_random_retrieve(
                 k, seed_key=f"{seed}:{pid}", min_positive=min_pos)
         else:
@@ -413,10 +343,8 @@ def build_blocks(memory, arrays, cfg, test_ids):
         retrieved_log[pid] = [
             {"id": entry["id"], "source_pid": entry["source_pid"],
              "provenance": entry["provenance"],
-             # How this entry was actually SHOWN -- do / dont / withheld -- which is
-             # not the same as its provenance: under `hindsight` a `failed` entry is
-             # rendered as a DO. What the actor SAW is the number that bounds any
-             # conclusion about the negative half (docs/contrastive.md section 2).
+             # How it was rendered (do/dont/withheld), not its provenance: under
+             # `hindsight` a failed entry is shown as a DO.
              "shown": rendered_as(entry, granularity),
              "similarity": None if sim is None else round(float(sim), 4)}
             for entry, sim in picks]
@@ -461,10 +389,9 @@ async def run_eval(args) -> None:
     try:
         memory = ContrastiveMemory.from_dict(bank_data)
     except ValueError as exc:
-        # Overwhelmingly this is a Memp or MemoryBank bank passed on the submit
-        # line: all three live side by side in results/json and differ by a prefix.
+        # Usually a Memp or MemoryBank bank passed by mistake.
         raise SystemExit(f"{cfg['bank']}: {exc}. --phase eval needs a bank built "
-                         f"by run_contrastive.py --phase distill.") from None
+                         f"by `run.py contrastive --phase distill`.") from None
     arrays, meta = load_embeddings(cfg["embeddings"])
     memory.embed_model = cfg["embed_model"] = meta.get("embed_model", "")
     memory = memory.filtered(cfg.get("provenance", "all"))
@@ -475,21 +402,15 @@ async def run_eval(args) -> None:
     cfg["bank_model"] = bank_data.get("config", {}).get("build_model")
     cfg["positive_share_bank"] = round(memory.positive_share(), 4)
     cfg["bank_polarity"] = memory.polarity()
-    # The bank's polarity is the actor's own train accuracy, so a bank built by one
-    # model and evaluated by another is a transfer arm whether or not it was meant
-    # as one -- and its mix of DOs and DON'Ts describes the WRONG actor.
+    # A bank built by another model is a transfer arm; its polarity describes that model.
     if cfg["bank_model"] and cfg["bank_model"] != (
             os.environ.get("LLM_MODEL_ID") or ""):
         print(f"[eval] NOTE: bank was built by {cfg['bank_model']}; its "
               f"{cfg['positive_share_bank']:.1%} positive share is that model's "
               f"train accuracy, not this actor's", flush=True)
 
-    # Arms that render a half the bank does not carry would silently degrade to a
-    # different arm. Refuse instead: a quiet fallback is how two arms end up
-    # measuring the same thing under different names.
-    # An arm whose text the bank does not carry would render blank Items and
-    # silently become `positive-only`. Refuse instead: a quiet degradation is how
-    # two arms end up measuring the same thing under different names.
+    # A granularity whose text the bank lacks would render blank Items and silently
+    # become another arm, so refuse.
     gran = cfg["granularity"]
     need = {"avoid": ("avoid", FAILED), "avoid-only": ("avoid", FAILED),
             "hindsight": ("hindsight", FAILED),
@@ -507,8 +428,7 @@ async def run_eval(args) -> None:
     if not pool:
         print(f"[eval] WARNING: this bank has no {side} entries at all, so "
               f"granularity={gran} injects nothing but placeholders", flush=True)
-    # An exemplar arm on a bank built before --phase exemplars would render exactly
-    # the non-exemplar arm and quietly duplicate a run that already exists.
+    # Without exemplars in the bank this would silently duplicate the non-exemplar arm.
     if cfg.get("exemplars"):
         need = "exemplar" if gran != "avoid-only" else "failed_exemplar"
         if not any(e.get("exemplar") or e.get("failed_exemplar")
@@ -527,8 +447,7 @@ async def run_eval(args) -> None:
     longest = max(blocks.values(), key=len)
     print(f"[eval] sample injected block (for {test_ids[0]}):"
           f"{blocks[test_ids[0]]}\n", flush=True)
-    # The token-budget confound of docs/contrastive.md section 6: this arm's block
-    # is roughly twice Memp's trajectory block, so the size is reported, not buried.
+    # Block size is a token-budget confound against the other methods, so record it.
     cfg["mean_block_chars"] = round(sum(len(b) for b in blocks.values())
                                     / max(len(blocks), 1))
     print(f"[eval] mean block ~{cfg['mean_block_chars'] // 4} tokens, "
@@ -604,10 +523,8 @@ def finalize_eval(state: dict, out) -> None:
         with_positive += pos > 0
     summary["injected_provenance"] = prov
     summary["injected_shown"] = shown
-    # The two numbers every conclusion about the negative half has to be read
-    # against. On a weak actor the bank is almost all DON'Ts, so an unconstrained
-    # top-k can leave most items with NO worked example in context at all -- and a
-    # null on `avoid` would then be about the missing DO, not about the DON'T.
+    # Polarity actually shown: with no DO in context, a null on `avoid` says
+    # nothing about the DON'Ts.
     summary["injected_positive_share"] = (
         round(shown.get("do", prov.get("agent", 0)) / injected, 4)
         if injected else 0.0)
@@ -643,9 +560,6 @@ def run_compare(args) -> None:
     rc = ret["config"]
     arms = [("baseline", base_wins, list(base["episodes"]))]
     extra = {}
-    # Named options rather than a generic list, because which arm is the CONTROL is
-    # the whole point: `hindsight` is the same bank with Memp's gold-derived text on
-    # the failed entries, so avoid-vs-hindsight moves exactly one factor.
     for label, path in (("hindsight", args.hindsight),
                         ("positive-only", args.positive),
                         ("avoid-random", args.random)):
@@ -661,9 +575,7 @@ def run_compare(args) -> None:
     arms.append(("avoid", ret_wins, list(ret["puzzles"].values())))
     mp_wins = None
     if args.memp:
-        # The external reference point: Memp's trajectory arm is the result this
-        # method is trying to improve on. Its renderer differs, so this is a
-        # reference, not a controlled contrast -- `correct-only` is the control.
+        # Reference only: Memp's renderer differs, so not a controlled contrast.
         mp_wins, mp = eval_outcomes(args.memp, schema=memp.EVAL_SCHEMA)
         arms.append(("memp-script", mp_wins, list(mp["puzzles"].values())))
 
@@ -708,10 +620,7 @@ def run_compare(args) -> None:
     for label in ("hindsight", "positive-only", "avoid-random"):
         if label in extra:
             lines.append(pair(label, extra[label], "baseline", base_wins))
-    # The headline test of docs/contrastive.md section 5. Same bank, same retriever,
-    # same k, same positive half -- the only thing that moves is whether a non-solved
-    # train puzzle contributes a DON'T distilled from its failure or a procedure
-    # distilled from its gold path.
+    # avoid vs hindsight differ only in what the failed entries contribute.
     if "hindsight" in extra:
         lines += ["", "  THE HEADLINE TEST: learning from the failure vs from the "
                   "gold path", ""]
@@ -732,9 +641,6 @@ def run_compare(args) -> None:
         lines.append(pair("avoid", ret_wins, "memp-script", mp_wins))
     lines.append("")
 
-    # What each arm actually put in front of the actor. On a weak actor the bank is
-    # overwhelmingly negative, and an arm that injected no DO at all cannot be read
-    # as a verdict on negative advice (docs/contrastive.md section 6).
     lines += ["  injected polarity (read every result above against this)", "",
               f"  {'run':<16} {'DO share':>10} {'items with >=1 DO':>20}",
               "  " + "-" * 50]
@@ -749,9 +655,6 @@ def run_compare(args) -> None:
                      f"{sm.get('items_with_a_positive', 0):>20.1%}")
     lines.append("")
 
-    # The failure-mode decomposition IS the pre-registered prediction (section 5),
-    # so it is printed here rather than left to the report script: H1 predicts
-    # wrong-solutions falling against correct-only without dead-ends returning.
     reasons = ["solved", "wrong-solution", "dead-end", "format-failure", "error"]
     if any(r["terminal_reason"] in ("wrong-solution", "dead-end")
            for _l, _w, recs in arms for r in recs):
@@ -777,27 +680,20 @@ def run_compare(args) -> None:
 
 
 # --------------------------------------------------------------------------- #
-async def main() -> None:
+async def main(argv: list[str], prog: str) -> None:
     ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        prog=prog, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--phase", required=True,
                     choices=["distill", "exemplars", "eval", "compare"])
-    ap.add_argument("--split", default="test",
-                    help="eval split (the bank always comes from train)")
-    ap.add_argument("--concurrency", type=int, default=32)
-    ap.add_argument("--limit", type=int, default=0, help="0 or less = whole split")
+    add_run_args(ap, **SAMPLING,
+                 split_help="eval split (the bank always comes from train)",
+                 seed_help="decoding seed; keep equal to the baseline's for eval")
     ap.add_argument("--chunk", type=int, default=100,
                     help="items per checkpoint in eval, entries per checkpoint "
                          "in distill")
-    ap.add_argument("--max-tokens", type=int, default=12288, help="actor budget")
     ap.add_argument("--distill-max-tokens", type=int, default=12288,
                     help="budget for the strategy / avoid / hindsight texts")
-    ap.add_argument("--temperature", type=float, default=0.6)
-    ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--top-k", type=int, default=20,
-                    help="sampling top-k (NOT the number of memories)")
-    ap.add_argument("--seed", type=int, default=0,
-                    help="decoding seed; keep equal to the baseline's for eval")
     ap.add_argument("--top-k-memories", type=int, default=3,
                     help="entries injected per test item; 3 matches Memp and "
                          "MemoryBank. Use 2 for the token-matched control")
@@ -807,19 +703,18 @@ async def main() -> None:
                          "balanced = top-k but with at least --min-positive DO "
                          "entries, which on a weak actor is the difference between "
                          "testing negative advice and testing its absence; random "
-                         "and random-balanced are the matched relevance ablations"),
+                         "and random-balanced are the matched relevance ablations")
     ap.add_argument("--min-positive", type=int, default=1,
                     help="balanced arms: DO entries guaranteed in each block")
     ap.add_argument("--exemplars", default="off", choices=["on", "off"],
                     help="eval: append the concrete artifact to each item -- a winning "
                          "line to a DO, the losing line to a DON'T. Needs a bank run "
                          "through --phase exemplars. Memp's `script` granularity does "
-                         "this and this method's first campaign did not, which "
-                         "docs/contrastive.md 6.6 suspects cost the control ~10 puzzles")
+                         "the same")
     ap.add_argument("--framing", default="mixed", choices=["mixed", "matched"],
-                    help="eval: `mixed` gives every arm the two-sign header (what the "
-                         "2026-09-14 campaign ran, and a mismatch for `hindsight`, "
-                         "whose items are all DO); `matched` gives each arm a header "
+                    help="eval: `mixed` gives every arm the two-sign header (a mismatch "
+                         "for `hindsight`, whose items are all DO); `matched` gives "
+                         "each arm a header "
                          "describing its own content")
     ap.add_argument("--granularity", default="avoid", choices=list(GRANULARITIES),
                     help="what a NON-SOLVED train puzzle contributes -- this IS the "
@@ -852,12 +747,9 @@ async def main() -> None:
                     help="the random-retrieval ablation (compare)")
     ap.add_argument("--memp", default=None,
                     help="a memp_eval_*.json to reference against (compare)")
-    ap.add_argument("--out", default=None, help="output path")
-    add_benchmark_args(ap)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    typed = {a.lstrip("-").replace("-", "_").split("=")[0]
-             for a in sys.argv[1:] if a.startswith("--")}
+    typed = typed_flags(argv)
     args.explicit = {k: k in typed for keys in FROZEN.values() for k in keys}
     args.limit = args.limit if args.limit > 0 else None
     args.exemplars = args.exemplars == "on"
@@ -883,6 +775,3 @@ async def main() -> None:
                      "(--hindsight is the control and is strongly recommended)")
         run_compare(args)
 
-
-if __name__ == "__main__":
-    asyncio.run(main())

@@ -1,32 +1,14 @@
 #!/usr/bin/env python
-"""Adversarial probe: is the StepGame baseline accuracy real, or an artefact?
+"""Adversarial probe: does StepGame baseline accuracy come from reasoning over the story?
 
-gpt-oss-120b scored 994/1000 on the clean test split -- higher than any *native*
-LLM reasoner in Li et al. (AAAI-24), whose GPT-4 base row collapses 100 -> 25 from
-k=1 to k=10, and level with their neuro-symbolic Map+ASP / Davinci+ASP rows. A
-static audit of the pipeline (prompt contents, parser, grader, gold, retry policy)
-found nothing wrong, so this settles it empirically instead.
+Four arms over the same sampled items, one call each, replies saved:
+  full       the production prompt (anchor).
+  bare       minimal prompt without the direction convention or the `overlap` note.
+  renamed    entity letters permuted; same task and gold (contamination test).
+  scrambled  story replaced by another item's of the same k, question and gold kept
+             (leak test: should sit at the 1/9 chance floor).
 
-Four arms over the SAME sampled items, one call each, replies saved:
-
-  full       the production prompt. Replicates the baseline on this subsample and
-             anchors the other three. Expect ~the baseline number.
-  bare       a minimal system prompt: the task, the nine labels, the output
-             contract, and nothing else. The production prompt also states the
-             direction convention ("A relative to B") and what `overlap` means,
-             which is the one place our setup is more generous than a plain
-             input-output prompt. This measures what that generosity is worth.
-  renamed    entity letters permuted by a fixed random bijection, so every story
-             is a string that appears in no corpus, while the reasoning task and
-             the gold label are identical. Contamination test: memorised answers
-             break, real reasoning does not.
-  scrambled  the story is replaced by a DIFFERENT item's story of the same k; the
-             question, and the gold, are kept. The queried entities are then
-             almost never present, so the item is unanswerable. THE LEAK
-             DETECTOR: anything above the ~11% floor here means the answer is
-             reaching the model by a path other than the story.
-
-Run it the way any driver runs, against a served model:
+Run against a served model:
 
   sbatch -J sg-probe -G A100:4 -t 02:00:00 \
     --export=ALL,BENCHMARK=stepgame,DRIVER=probe,MODEL=openai/gpt-oss-120b,TP=4,\
@@ -55,9 +37,7 @@ from memory_agents.llm.client import LLMClient
 
 LABELS = "above, below, left, right, upper-left, upper-right, lower-left, lower-right, overlap"
 
-# Deliberately minimal: the task, the label set, the output contract. No direction
-# convention, no note on `overlap`, no "only direction matters". Everything the
-# production prompt says beyond this is what the `bare` arm removes.
+# Task, label set and output contract only; no direction convention or `overlap` note.
 BARE_SYSTEM = f"""You are solving a spatial reasoning problem.
 
 You are given a story describing where objects sit relative to one another, and a
@@ -102,10 +82,8 @@ def build_arms(items, n_per_k, seed):
         rng.shuffle(shuffled)
         mapping = dict(zip(letters, shuffled))
         donor = donors[it.id]
-        # Entities are sampled from 26 letters, so a donor story sometimes happens
-        # to contain both queried entities. Those items are answerable -- just
-        # against a different story, so the original gold is right only by chance.
-        # Flagged rather than resampled, so the leak test can be read both ways.
+        # A donor story can contain both queried entities by chance; flagged, not resampled,
+        # so the leak test can be read with and without those items.
         d_ents = set(_ENT.findall(" ".join(donor.story)))
         q_ents = set(re.findall(r"\bagent ([A-Z])\b", it.question))
         cases.append({
@@ -174,9 +152,7 @@ async def main():
                 return {"id": case["id"], "arm": arm, "error": repr(exc),
                         "predicted": None, "success": False}
         predicted = SG.parse_answer(resp.text)
-        # The reasoning trace is where a leak would be visible, so keep a tail of
-        # it -- but only for the arm that is supposed to be unanswerable, since it
-        # is thousands of tokens and we do not need it for the others.
+        # Keep a reasoning tail only for the scrambled arm, where a leak would show.
         trace = (resp.reasoning_text or "")[-1200:] if arm == "scrambled" else ""
         return {
             "id": case["id"], "arm": arm, "k": case["k"], "hops": case["hops"],
@@ -200,7 +176,6 @@ async def main():
     await client.aclose()
     elapsed = time.time() - t0
 
-    # ---- report -----------------------------------------------------------
     print(f"\n{'arm':<12} {'n':>5} {'solved':>7} {'acc':>7} {'fmt_fail':>9}   interpretation")
     floor = 1 / 9
     summary = {}
@@ -221,8 +196,7 @@ async def main():
         print(f"{arm:<12} {n:>5} {ok:>7} {acc:>7.3f} {ff:>9}   {note}")
     print(f"\nchance floor = {floor:.3f} (1/9)   elapsed = {elapsed:.0f}s")
 
-    # The clean read of the leak test: items whose donor story does not even
-    # mention the queried entities, so no honest answer exists.
+    # Clean leak read: the donor story lacks the queried entities, so no honest answer exists.
     unans = [r for r in results
              if r["arm"] == "scrambled" and not r.get("scrambled_entities_present")]
     if unans:

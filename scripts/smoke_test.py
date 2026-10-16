@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Smoke test for the hosting + async client.
+"""Smoke test for the vLLM server and the async client.
 
   # start the server first:  sbatch scripts/serve_and_run.sbatch
   python scripts/smoke_test.py                # fire N concurrent chats
@@ -21,7 +21,7 @@ from memory_agents.llm.client import LLMClient
 
 
 async def chat_smoke(client, n):
-    """Send n identical chats at once -- checks the client, concurrency, tokens."""
+    """Send n identical chats concurrently and print each reply and token count."""
     messages = [{"role": "user",
                  "content": "Reply with exactly this line and nothing else:\nFinal: 0"}]
     responses = await asyncio.gather(*[client.chat(messages) for _ in range(n)])

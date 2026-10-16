@@ -1,25 +1,12 @@
-"""Async client for the vLLM server.
-
-We host the model with vLLM's OpenAI-compatible server (see
-scripts/serve_and_run.sbatch) and talk to it with the OpenAI SDK. Two consequences:
-
-* It is *async* (AsyncOpenAI). One episode is sequential -- each move needs the
-  previous grid state -- so the throughput win comes from running many episodes
-  at once against the same server. Async lets a coroutine `await` its network
-  call and hand the event loop to another episode meanwhile.
-* It is provider-agnostic. Point `base_url` at the vLLM server now, or at a real
-  vendor API later, and nothing else in the harness changes.
+"""Async OpenAI-SDK clients for vLLM's OpenAI-compatible chat and embedding
+servers; async so many episodes can share one server concurrently.
 """
 
 from openai import AsyncOpenAI
 
 
 class LLMResponse:
-    """One reply from the model, plus the token counts we log per step.
-
-    Kept as a plain object (like Transition/EpisodeResult) so the harness can do
-    `response.text` / `response.prompt_tokens` without touching the raw SDK type.
-    """
+    """One reply from the model, plus its token counts."""
 
     def __init__(self, text: str, prompt_tokens: int, completion_tokens: int,
                  finish_reason: str | None = None, reasoning_tokens: int = 0,
@@ -27,21 +14,13 @@ class LLMResponse:
         self.text = text
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
-        # "length" means the generation hit max_tokens. With a reasoning parser on,
-        # that usually leaves .text empty (the whole budget went into <think>), which
-        # is indistinguishable from a malformed answer unless we keep this.
+        # "length" with empty .text: the budget went into <think>, not a bad answer.
         self.finish_reason = finish_reason
         self.reasoning_tokens = reasoning_tokens
-        # The <think> block the reasoning parser stripped out of .content. Keeping it
-        # is what makes the format-failure log worth reading: an episode that dies on
-        # empty replies otherwise logs an empty head and tail, which says nothing that
-        # text_len=0 did not already say. The tail of this shows what the model was
-        # actually doing when it ran out of budget.
+        # The <think> block the reasoning parser stripped from .content.
         self.reasoning_text = reasoning_text
-        # Tokens spent on replies that were discarded before this one (see
-        # BaselineAgent.act). Zero on the happy path. Kept apart from
-        # prompt_tokens/completion_tokens so "what this reply cost" and "what getting
-        # a usable move cost" stay separable in the results.
+        # Tokens of replies discarded before this one (see BaselineAgent.act),
+        # kept apart from this reply's own counts.
         self.retry_prompt_tokens = 0
         self.retry_completion_tokens = 0
 
@@ -53,16 +32,13 @@ class LLMClient:
         # api_key is unused by vLLM but the SDK requires a non-empty value.
         self.client = AsyncOpenAI(base_url=base_url, api_key="EMPTY", timeout=timeout)
         self.model = model
-        # temperature=0 + a fixed seed => deterministic decoding, so a re-run of
-        # the benchmark gives the same numbers. Reasoning models (Qwen3, QwQ, R1)
-        # need a much bigger max_tokens (thousands, before the Final: line) AND
-        # sampling, not greedy: Qwen3 warns temperature=0 in thinking mode causes
-        # repetition loops -- pass temperature=0.6, top_p=0.95, top_k=20 there.
+        # Reasoning models need a large max_tokens and sampling (Qwen3: 0.6 / 0.95 /
+        # top_k=20); temperature=0 in thinking mode causes repetition loops.
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.seed = seed
         self.top_p = top_p
-        self.top_k = top_k  # not an OpenAI param; sent via extra_body (vLLM reads it)
+        self.top_k = top_k  # not an OpenAI param; sent via extra_body
 
     async def chat(self, messages: list[dict]) -> LLMResponse:
         """Send the running message list, return the reply + token usage."""
@@ -78,9 +54,7 @@ class LLMClient:
         )
         choice = completion.choices[0]
         usage = completion.usage
-        # vLLM reports the stripped <think> block separately when a reasoning parser
-        # is enabled; it is not in .content, so count it here to see where the token
-        # budget actually went, and keep the text itself for the failure log.
+        # With a reasoning parser, vLLM reports the <think> block outside .content.
         details = getattr(usage, "completion_tokens_details", None)
         return LLMResponse(
             text=choice.message.content or "",
@@ -97,27 +71,14 @@ class LLMClient:
 
 
 class EmbeddingClient:
-    """Async client for a vLLM server running an embedding model.
-
-    A separate class rather than a method on LLMClient because the two are never
-    served by the same process: vLLM runs one model per server, so embeddings come
-    from their own (small, 1-GPU) job while chat comes from the 32B job. Keeping
-    the classes apart means neither run has to construct a client for a server
-    that does not exist.
-    """
+    """Async client for a separate vLLM server running an embedding model."""
 
     def __init__(self, base_url: str, model: str, timeout: float = 600.0):
         self.client = AsyncOpenAI(base_url=base_url, api_key="EMPTY", timeout=timeout)
         self.model = model
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts, preserving input order.
-
-        The OpenAI embeddings API returns one item per input with an `index`
-        field; sort on it rather than trusting response order, since order is a
-        convention the spec does not actually guarantee. Callers batch (the
-        driver uses ~64) and L2-normalize; raw vectors are returned here.
-        """
+        """Embed a batch of texts in input order (sorted by `index`); not normalized."""
         resp = await self.client.embeddings.create(model=self.model, input=texts)
         items = sorted(resp.data, key=lambda d: d.index)
         return [item.embedding for item in items]

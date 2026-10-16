@@ -12,8 +12,8 @@ The mock answers a configurable fraction of items correctly (by reading the gold
 label, which is exactly what makes it a mock and not an agent), so both the
 solved and the failed paths through distillation get taken.
 
-    python scripts/dryrun_stepgame.py
-    python scripts/dryrun_stepgame.py --keep      # leave the artefacts for inspection
+    python tests/dryrun_stepgame.py
+    python tests/dryrun_stepgame.py --keep      # leave the artefacts for inspection
 """
 
 import argparse
@@ -29,7 +29,7 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
-sys.path.insert(0, str(REPO / "scripts"))
+sys.path.insert(0, str(REPO / "tests"))
 
 from memory_agents.envs import stepgame          # noqa: E402
 from memory_agents.envs.stepgame_solver import LABELS  # noqa: E402
@@ -178,7 +178,7 @@ def main() -> int:
     shim.write_text(f'''
 import sys, pathlib, json
 sys.path.insert(0, {str(REPO / "src")!r})
-sys.path.insert(0, {str(REPO / "scripts")!r})
+sys.path.insert(0, {str(REPO / "tests")!r})
 import dryrun_stepgame as D
 from memory_agents.envs import stepgame as _sg
 _gold = {{}}
@@ -193,10 +193,10 @@ class _MC(D.MockClient):
                          seed=k.get("seed", 0) or 0)
 _c.LLMClient = _MC
 _c.EmbeddingClient = D.MockEmbeddingClient
-for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank",
-           "run_contrastive"):
+import importlib as _il
+for _m in ("baseline", "reflexion", "memp", "memorybank", "contrastive"):
     try:
-        _mod = __import__(_m)
+        _mod = _il.import_module("memory_agents.methods." + _m)
         if hasattr(_mod, "LLMClient"):
             _mod.LLMClient = _MC
         if hasattr(_mod, "EmbeddingClient"):
@@ -207,7 +207,7 @@ for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank",
 
     import os
     env = dict(os.environ)
-    env["PYTHONPATH"] = f"{tmp}:{REPO / 'src'}:{REPO / 'scripts'}"
+    env["PYTHONPATH"] = f"{tmp}:{REPO / 'src'}:{REPO / 'tests'}"
     env["LLM_BASE_URL"] = "http://mock"
     env["LLM_MODEL"] = "mock"
     env["LLM_MODEL_ID"] = "mock/dryrun"
@@ -218,81 +218,81 @@ for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank",
               "--concurrency", "4"]
 
     print("\n" + "=" * 70 + "\n  1. BASELINE\n" + "=" * 70)
-    run(["scripts/run_baseline.py", *common, "--split", "test"], env, tmp)
+    run(["scripts/run.py", "baseline", *common, "--split", "test"], env, tmp)
     baseline = newest("baseline_stepgame_*.json", tmp)
 
     print("\n" + "=" * 70 + "\n  2. REFLEXION\n" + "=" * 70)
-    run(["scripts/run_reflexion.py", "--phase", "root", *common,
+    run(["scripts/run.py", "reflexion", "--phase", "root", *common,
          "--split", "test"], env, tmp)
     root = newest("reflexion_root_stepgame_*.json", tmp)
     for arm in ("memory", "control"):
-        run(["scripts/run_reflexion.py", "--phase", "arm", "--arm", arm,
+        run(["scripts/run.py", "reflexion", "--phase", "arm", "--arm", arm,
              "--root", root, "--trials", "3", "--concurrency", "4"], env, tmp)
     mem = newest("reflexion_memory_stepgame_*.json", tmp)
     ctl = newest("reflexion_control_stepgame_*.json", tmp)
-    run(["scripts/run_reflexion.py", "--phase", "compare",
+    run(["scripts/run.py", "reflexion", "--phase", "compare",
          "--memory", mem, "--control", ctl], env, tmp)
 
     print("\n" + "=" * 70 + "\n  3. MEMP\n" + "=" * 70)
-    run(["scripts/run_memp.py", "--phase", "build", *common,
+    run(["scripts/run.py", "memp", "--phase", "build", *common,
          "--split", "train", "--chunk", "8"], env, tmp)
     build = newest("memp_build_stepgame_train_*.json", tmp)
-    run(["scripts/run_memp.py", "--phase", "distill", *common,
+    run(["scripts/run.py", "memp", "--phase", "distill", *common,
          "--build", build, "--chunk", "8", "--verify-gold", "5"], env, tmp)
     bank = newest("memp_bank_stepgame_*.json", tmp)
-    run(["scripts/run_memp.py", "--phase", "embed", *common], env, tmp)
+    run(["scripts/run.py", "memp", "--phase", "embed", *common], env, tmp)
     emb = newest("memp_embeddings_stepgame_*.npz", tmp)
-    run(["scripts/run_memp.py", "--phase", "upgrade", *common, "--bank", bank], env, tmp)
+    run(["scripts/run.py", "memp", "--phase", "upgrade", *common, "--bank", bank], env, tmp)
     bank_traj = pathlib.Path(str(bank).replace(".json", "_traj.json"))
     for arm in ("retrieved", "random", "fixed"):
-        run(["scripts/run_memp.py", "--phase", "eval", *common, "--arm", arm,
+        run(["scripts/run.py", "memp", "--phase", "eval", *common, "--arm", arm,
              "--split", "test", "--bank", bank_traj, "--embeddings", emb,
              "--chunk", "8"], env, tmp)
     retrieved = newest("memp_eval_stepgame_retrieved_*.json", tmp)
     rnd = newest("memp_eval_stepgame_random_*.json", tmp)
-    run(["scripts/run_memp.py", "--phase", "compare", "--baseline", baseline,
+    run(["scripts/run.py", "memp", "--phase", "compare", "--baseline", baseline,
          "--retrieved", retrieved, "--random", rnd], env, tmp)
 
     print("\n" + "=" * 70 + "\n  4. MEMORYBANK\n" + "=" * 70)
-    run(["scripts/run_memorybank.py", "--phase", "distill", *common,
+    run(["scripts/run.py", "memorybank", "--phase", "distill", *common,
          "--build", build, "--chunk", "8", "--rules-preamble", "on",
          "--verify-gold", "5"], env, tmp)
     mb_bank = newest("memorybank_bank_stepgame_*.json", tmp)
     for arm in ("retrieved", "random"):
-        run(["scripts/run_memorybank.py", "--phase", "eval", *common, "--arm", arm,
+        run(["scripts/run.py", "memorybank", "--phase", "eval", *common, "--arm", arm,
              "--split", "test", "--bank", mb_bank, "--embeddings", emb,
              "--chunk", "8"], env, tmp)
     mb_ret = newest("memorybank_eval_stepgame_retrieved_*.json", tmp)
     mb_rnd = newest("memorybank_eval_stepgame_random_*.json", tmp)
-    run(["scripts/run_memorybank.py", "--phase", "compare", "--baseline", baseline,
+    run(["scripts/run.py", "memorybank", "--phase", "compare", "--baseline", baseline,
          "--retrieved", mb_ret, "--random", mb_rnd], env, tmp)
 
     print("\n" + "=" * 70 + "\n  5. CONTRASTIVE\n" + "=" * 70)
-    run(["scripts/run_contrastive.py", "--phase", "distill", *common,
+    run(["scripts/run.py", "contrastive", "--phase", "distill", *common,
          "--build", build, "--chunk", "8", "--verify-gold", "5"], env, tmp)
     co_bank = newest("contrastive_bank_stepgame_*.json", tmp)
     # Every arm, because the granularity IS the experiment: a renderer that raises
     # on one of them, or an arm guard that refuses a bank it should accept, must
     # not be discovered on the GPU.
     for gran in ("avoid", "hindsight", "positive-only", "avoid-only"):
-        run(["scripts/run_contrastive.py", "--phase", "eval", *common,
+        run(["scripts/run.py", "contrastive", "--phase", "eval", *common,
              "--arm", "retrieved", "--granularity", gran, "--split", "test",
              "--bank", co_bank, "--embeddings", emb, "--chunk", "8"], env, tmp)
     # And every retrieval arm, including the two balanced ones -- their whole point
     # is a bank whose polarity is lopsided, which is exactly what the mock produces.
     for a in ("balanced", "random", "random-balanced"):
-        run(["scripts/run_contrastive.py", "--phase", "eval", *common,
+        run(["scripts/run.py", "contrastive", "--phase", "eval", *common,
              "--arm", a, "--granularity", "avoid", "--split", "test",
              "--bank", co_bank, "--embeddings", emb, "--chunk", "8"], env, tmp)
     # Wave 2: the artifacts are attached by a CPU pass over the SAME bank, so the
     # arms it enables differ from the ones above in the exemplar and nothing else.
-    run(["scripts/run_contrastive.py", "--phase", "exemplars", *common,
+    run(["scripts/run.py", "contrastive", "--phase", "exemplars", *common,
          "--bank", co_bank, "--build", build], env, tmp)
     co_ex = pathlib.Path(str(co_bank).replace(".json", "_ex.json"))
     for gran, ex, fr in (("hindsight", "on", "mixed"), ("hindsight", "off", "matched"),
                          ("hindsight", "on", "matched"), ("avoid", "on", "mixed"),
                          ("avoid-only", "on", "mixed")):
-        run(["scripts/run_contrastive.py", "--phase", "eval", *common,
+        run(["scripts/run.py", "contrastive", "--phase", "eval", *common,
              "--arm", "retrieved", "--granularity", gran, "--exemplars", ex,
              "--framing", fr, "--split", "test", "--bank", str(co_ex),
              "--embeddings", emb, "--chunk", "8"], env, tmp)
@@ -306,7 +306,7 @@ for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank",
     for _e in _d["entries"]:
         _e.pop("exemplar", None); _e.pop("failed_exemplar", None)
     stripped.write_text(json.dumps(_d))
-    r = _sp.run([sys.executable, str(REPO / "scripts/run_contrastive.py"),
+    r = _sp.run([sys.executable, str(REPO / "scripts/run.py"), "contrastive",
                  "--phase", "eval", *[str(c) for c in common],
                  "--arm", "retrieved", "--granularity", "avoid", "--exemplars", "on",
                  "--split", "test", "--bank", str(stripped), "--embeddings", str(emb)],
@@ -319,7 +319,7 @@ for _m in ("run_baseline", "run_reflexion", "run_memp", "run_memorybank",
     assert any("failed_exemplar" in e for e in _b), "…and the losing ones"
     print("  ok: distill attaches the concrete artifacts itself")
 
-    run(["scripts/run_contrastive.py", "--phase", "compare",
+    run(["scripts/run.py", "contrastive", "--phase", "compare",
          "--baseline", baseline,
          "--retrieved", newest("contrastive_eval_stepgame_avoid_retrieved_*.json", tmp),
          "--hindsight", newest("contrastive_eval_stepgame_hindsight_retrieved_*.json", tmp),

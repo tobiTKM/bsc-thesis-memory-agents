@@ -15,10 +15,11 @@ dependencies = [
     "numpy>=1.26",
     "pyyaml>=6.0",
     "tqdm>=4.66",
+    # The SPaRC environment; not on PyPI. Pinned to the commit the results used.
+    "Spatial-Gym @ git+https://github.com/lkaesberg/Spatial-Gym.git@32034a0dacf34bad47b2c4b5ecafe998b4479578",
 ]
 
-# vllm is intentionally not a hard dependency here: it's only needed on the
-# serving node and is a heavy install. It lives in requirements.txt instead.
+# vllm is not a dependency: serve_and_run.sbatch runs it from an Apptainer image.
 
 [tool.setuptools.packages.find]
 where = ["src"]

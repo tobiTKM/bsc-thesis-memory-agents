@@ -1,21 +1,7 @@
-"""Memp procedural memory: a retrieval bank of distilled procedures, and the
-model calls that write it.
-
-Memp (Fang et al., 2026) turns past trajectories into procedural memory --
-"how to solve this class of task" -- and retrieves the most similar entries for
-each new task by embedding similarity. Mirroring reflexion.py's split:
-
-* MempMemory -- the store: a flat bank of entries plus an aligned matrix of key
-  embeddings, with cosine top-k retrieval. Built once from the train split,
-  frozen at test time (docs/architecture.md section 5).
-* Distiller -- the writer: one solved-puzzle context -> one script-like
-  procedure. Two variants, because the bank's entries come from two sources:
-  the agent's own successful train trajectories, and (for train puzzles the
-  agent failed) the dataset's gold solution path in hindsight.
-
-Vectors live in a sidecar .npz, not in the bank JSON: the bank is written by the
-distill phase, which runs against the chat model and has no embedding server to
-talk to. attach_vectors() joins the two files at eval time.
+"""Memp procedural memory (Fang et al., 2026): a bank of distilled procedures
+with cosine top-k retrieval (MempMemory) and the LLM calls that write them
+(Distiller), from the agent's own successes or, for failed items, the gold path.
+Key vectors live in a sidecar .npz joined at eval time by attach_vectors().
 """
 
 import random
@@ -30,17 +16,10 @@ SCHEMA = "memp-bank-v1"
 
 
 class MempMemory(Memory):
-    """A flat bank of procedure entries with embedding-based retrieval.
+    """A flat bank of entries keyed by `source_pid`, each with id, provenance and
+    script; read/write serve the build side, retrieval goes through *_retrieve().
 
-    Unlike ReflexionMemory (keyed per puzzle, read back for the SAME puzzle), the
-    bank is cross-task: entries are keyed by the *train* puzzle they came from
-    (`source_pid`) but retrieved for unseen *test* puzzles by similarity. The
-    Memory ABC's read/write therefore serve the build side only -- read(pid) is
-    what lets a resumed distill phase skip puzzles already distilled -- while
-    retrieval goes through retrieve()/random_retrieve().
-
-    SCHEMA is a class attribute so a sibling bank (MemoryBankMemory) can inherit
-    every retrieval mechanism and differ only in its schema tag and entry shape.
+    Subclasses override SCHEMA and inherit retrieval unchanged.
     """
 
     SCHEMA = SCHEMA
@@ -49,10 +28,9 @@ class MempMemory(Memory):
         self.entries: list[dict] = []
         self.embed_model = embed_model
         self.stats: dict = {}
-        # Row i of `vectors` is the L2-normalized key embedding of entries[i].
-        # None until attach_vectors(); the distill phase never has vectors.
+        # Row i: L2-normalized key embedding of entries[i]; None until attach_vectors().
         self.vectors: np.ndarray | None = None
-        # Per-entry keyword embedding matrices, only for the AveFact retriever.
+        # Per-entry keyword embedding matrices, AveFact retriever only.
         self.keyword_vectors: list | None = None
 
     # ---- Memory ABC (build-side) -----------------------------------------
@@ -86,14 +64,7 @@ class MempMemory(Memory):
 
     # ---- retrieval (eval-side) -------------------------------------------
     def attach_vectors(self, ids, vecs) -> None:
-        """Join the sidecar embeddings onto the bank, one row per entry.
-
-        `ids`/`vecs` are the embed phase's train keys (all 500 train puzzles get
-        a vector whether or not they yielded an entry; the join here picks out
-        the ones that did). Raises on any entry whose source_pid has no vector:
-        a silent zero-vector would never be retrieved and the bank would just
-        quietly shrink.
-        """
+        """Join sidecar embeddings by source_pid; raises if any entry has none."""
         row_of = {str(pid): i for i, pid in enumerate(ids)}
         missing = [e["id"] for e in self.entries if e["source_pid"] not in row_of]
         if missing:
@@ -101,18 +72,12 @@ class MempMemory(Memory):
                              f"(first few: {missing[:5]}); wrong .npz for this bank?")
         mat = np.asarray([vecs[row_of[e["source_pid"]]] for e in self.entries],
                          dtype=np.float32)
-        # Normalize so cosine similarity is a plain dot product. The embed phase
-        # already normalizes, but re-doing it here costs nothing and removes the
-        # assumption.
         self.vectors = mat / np.linalg.norm(mat, axis=1, keepdims=True)
 
     def retrieve(self, query_vec, k: int) -> list[tuple[dict, float]]:
-        """Top-k entries by cosine similarity, with an explicit tie-break.
+        """Top-k by cosine similarity, ordered by (-similarity, entry id).
 
-        Sorting by (-similarity, entry id) rather than np.argsort alone makes the
-        retrieved set -- and therefore the injected block -- byte-identical across
-        resumes and re-runs even when similarities tie, which both reproducibility
-        and vLLM's prefix cache care about.
+        The id tie-break keeps the injected block byte-identical across resumes.
         """
         if self.vectors is None:
             raise RuntimeError("attach_vectors() first: the bank has no embeddings")
@@ -124,14 +89,9 @@ class MempMemory(Memory):
         return [(self.entries[i], float(sims[i])) for i in order[:k]]
 
     def avefact_retrieve(self, query_vecs, k: int) -> list[tuple[dict, float]]:
-        """AveFact retrieval: score by average similarity over matched keywords.
+        """AveFact: mean over query keywords of the best-matching entry keyword.
 
-        The paper extracts keywords from the task with an LLM and "computes the
-        average similarity across matched keywords". Concretely: each query
-        keyword is matched to its best-fitting keyword of the candidate entry, and
-        the entry's score is the mean of those best matches -- so an entry scores
-        highly only when most of the query's salient features find a counterpart,
-        rather than when one long description happens to look similar overall.
+        Ordered by (-score, entry id).
         """
         if self.keyword_vectors is None:
             raise RuntimeError("attach_keyword_vectors() first")
@@ -142,7 +102,7 @@ class MempMemory(Memory):
         scores = []
         for kw in self.keyword_vectors:
             if kw is None or not len(kw):
-                scores.append(-1.0)      # no keywords stored: never preferred
+                scores.append(-1.0)      # no keywords: never preferred
                 continue
             sims = q @ np.asarray(kw, dtype=np.float32).T   # (n_query, n_entry_kw)
             scores.append(float(sims.max(axis=1).mean()))
@@ -161,21 +121,12 @@ class MempMemory(Memory):
                   flush=True)
 
     def fixed_retrieve(self, k: int) -> list[tuple[dict, None]]:
-        """The same k entries for every puzzle -- the control the paper never ran.
-
-        Isolates "any procedural text in context" from "retrieval". Picks the
-        first k by entry id so the choice is deterministic and unremarkable.
-        """
+        """Control arm: the first k entries by id, for every puzzle."""
         picked = sorted(self.entries, key=lambda e: e["id"])[:k]
         return [(e, None) for e in picked]
 
     def revise(self, entry_id: str, script: str) -> None:
-        """Adjustment: overwrite one entry's script in place, keeping its vector.
-
-        The key text is unchanged (the entry still describes the same class of
-        puzzle), so the embedding stays valid and retrieval is unaffected -- only
-        what the agent reads changes.
-        """
+        """Adjustment: replace one entry's script in place; its vector stays valid."""
         for e in self.entries:
             if e["id"] == entry_id:
                 e["revisions"] = e.get("revisions", 0) + 1
@@ -185,12 +136,7 @@ class MempMemory(Memory):
         raise KeyError(f"no bank entry {entry_id!r} to revise")
 
     def add_with_vector(self, key, item: dict, vec) -> dict:
-        """Append a new entry and its key vector together (Vanilla / Validation).
-
-        Entries added during the Update stage come from *test* puzzles, whose
-        vectors are already in the embeddings sidecar, so the row is stacked onto
-        the matrix directly rather than re-joining the whole bank.
-        """
+        """Append an entry and its key vector (Vanilla / Validation update)."""
         if self.vectors is None:
             raise RuntimeError("attach_vectors() first")
         self.write(key, item)
@@ -202,11 +148,7 @@ class MempMemory(Memory):
         return self.entries[-1]
 
     def filtered(self, provenance: str) -> "MempMemory":
-        """A copy holding only entries of one provenance ('agent' or 'gold').
-
-        `agent` gives the paper-faithful bank: memory distilled solely from runs
-        the model itself completed, with no gold-path hindsight.
-        """
+        """Entries of one provenance ('agent' or 'gold'); 'all' returns self."""
         if provenance == "all":
             return self
         m = type(self)(embed_model=self.embed_model)
@@ -215,41 +157,24 @@ class MempMemory(Memory):
         return m
 
     def random_retrieve(self, k: int, seed_key: str) -> list[tuple[dict, None]]:
-        """The ablation arm: k entries drawn without regard to similarity.
+        """Random-arm ablation: k entries drawn with random.Random(seed_key).
 
-        Seeded per puzzle (seed_key = f"{seed}:{pid}") so the draw is reproducible
-        and, crucially, stable across a resume -- a resumed eval must inject the
-        same block the interrupted run would have.
+        seed_key is f"{seed}:{pid}", so a resumed eval injects the same block.
         """
         rng = random.Random(seed_key)
         picked = rng.sample(range(len(self.entries)), k=min(k, len(self.entries)))
-        # Sorted by entry id so the draw is stable across resumes.
-        #
-        # NOTE (2026-09-16): this comment used to claim id order was "the same
-        # presentation order convention as retrieve()". It is not -- retrieve()
-        # orders by (-similarity, id), with the id only as a tie-break. So every
-        # retrieved-vs-random contrast in this repo differs in presentation ORDER as
-        # well as in which entries appear. For those arms it is second-order (the two
-        # draws share almost no entries anyway), but it is a real confound and it is
-        # not "handled" the way this comment used to assert. It is left UNCHANGED on
-        # purpose: altering it now would make future runs incomparable with the
-        # completed SPaRC campaign. See docs/memp.md threats-to-validity.
+        # Sorted by id, not by similarity as in retrieve(); keep it, or new runs
+        # stop being comparable with existing results.
         picked.sort(key=lambda i: self.entries[i]["id"])
         return [(self.entries[i], None) for i in picked]
 
 
 class Distiller:
-    """Generates one procedure from one solved-puzzle context via the LLM.
-
-    Holds its own client (like Reflector) so the driver can give distillation its
-    own token budget without coupling it to the actor. Returns (text, LLMResponse)
-    so the driver can tally distillation tokens as part of Memp's build cost.
-    """
+    """Generates procedures via its own client; returns (text, LLMResponse)."""
 
     def __init__(self, client, benchmark=None):
         self.client = client
-        # Which task's distill prompts to write. Required for anything but SPaRC;
-        # None keeps the historical SPaRC path for existing callers.
+        # Required for anything but SPaRC; None falls back to SparcBenchmark.
         self.benchmark = benchmark
 
     def _bench(self):
@@ -260,12 +185,7 @@ class Distiller:
 
     async def distill_from_trajectory(self, episode, key_text: str, record=None,
                                       succeeded: bool = True):
-        """Procedure from an agent episode (a success, unless Vanilla says otherwise).
-
-        `record` is the benchmark's per-item record. The benchmark turns it into
-        whatever its prompt needs -- on SPaRC that is the puzzle's shape table, so
-        the prepended rulebook is the same one the actor solved under.
-        """
+        """Procedure from an agent episode; `record` is the benchmark item."""
         prompt = self._bench().distill_trajectory_prompt(
             episode, key_text, record, succeeded=succeeded)
         response = await self.client.chat([{"role": "user", "content": prompt}])

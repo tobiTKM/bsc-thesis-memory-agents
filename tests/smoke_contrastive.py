@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Invariants of the contrastive memory renderers, store and retrieval. No GPU.
 
-The granularity IS the experiment for this method (docs/contrastive.md section 3),
+The granularity IS the experiment for this method,
 so what each arm does and does not render is not a presentation detail -- it is the
 independent variable. Two failure modes would be invisible downstream, because the
 result files would still be internally consistent and the paired tests still paired:
@@ -24,8 +24,8 @@ So this asserts, on hand-built entries rather than real data:
 
 Runs in about a second, needs no dataset, and uses numpy only through the store.
 
-    python scripts/smoke_contrastive.py
-    python scripts/smoke_contrastive.py --show    # print one rendered block per arm
+    python tests/smoke_contrastive.py
+    python tests/smoke_contrastive.py --show    # print one rendered block per arm
 """
 
 import argparse
@@ -223,7 +223,7 @@ def check_store() -> None:
     print("\nthe store and its retrieval arms")
     m = ContrastiveMemory()
     # A deliberately lopsided bank: 2 DOs to 8 DON'Ts, the shape a weak actor
-    # actually produces (docs/contrastive.md section 3).
+    # actually produces.
     for i in range(10):
         e = dict(DO_ENTRY if i < 2 else DONT_ENTRY)
         e["id"] = f"m{i:04d}"

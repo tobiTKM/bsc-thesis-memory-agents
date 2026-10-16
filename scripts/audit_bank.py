@@ -1,37 +1,14 @@
 #!/usr/bin/env python
-"""Does a Memp bank state SPaRC's rules correctly? A regex proxy, run on any bank.
+"""Audit whether Memp / MemoryBank bank entries state SPaRC's rules correctly (regex proxy).
 
-docs/memp.md section 3.5 established that the banks are frequently *wrong* about the
-rules -- and section 3.6 showed that is why the LLM-written script contributes nothing
-on top of the mechanically-extracted trajectory. That audit was ad-hoc; this script
-makes it reproducible, so the same measurement can be pointed at a bank built before
-and after a change to the distillation prompt.
+Independent per-entry checks (an entry can trip several):
+  region_ok     squares/stars framed as a constraint on the regions the path encloses.
+  visit_wrong   squares/stars/polyshapes treated as cells to visit; only dots are visited.
+  count_wrong   the key text's census line ("square x3") read as a required visit count.
+  example_copy  near-verbatim copy of the distillation prompt's few-shot procedure.
 
-What it looks for, per entry (an entry can trip several at once -- these are
-independent checks, not a partition):
-
-  region_ok       the script frames squares/stars the way SPaRC actually defines them:
-                  a constraint on the REGIONS the path encloses (same-colour squares
-                  share a region; a star pairs with exactly one same-colour element).
-  visit_wrong     the script tells the agent to visit / enter / step on / collect a
-                  square, star or polyshape, or calls one a "waypoint" or "required
-                  cell". The path goes *around* those cells; only dots are visited.
-                  This is the triangle rule (edge touching) misapplied, or a plain
-                  Hamiltonian-path assumption.
-  count_wrong     the script reads the key text's census line ("rules: square x3" --
-                  how many square CELLS the grid holds) as a number of required
-                  visits, entries or crossings. No rule of that form exists.
-  example_copy    the script is a near-verbatim copy of the single few-shot procedure
-                  in the distillation prompt, i.e. the entry carries no puzzle-specific
-                  information at all (110/500 of Qwen3-0.6B's bank, per section 3.5).
-
-Only entries whose source puzzle actually HAS a square or star rule are scored for
-region_ok / visit_wrong, since the others have nothing to get right or wrong there.
-
-Caveat, inherited from section 3.5 and worth repeating in anything that cites this: a
-regex is a proxy for a hand-labelled audit. It is reliable for *comparing two banks
-under one definition*, which is what it is for; treat an absolute percentage as
-indicative, not exact.
+region_ok and visit_wrong are scored only over entries whose puzzle has a square or
+star rule. Use the numbers to compare banks, not as exact absolute rates.
 
     python scripts/audit_bank.py results/json/memp_bank_*.json
     python scripts/audit_bank.py --verbose results/json/memp_bank_gptoss120b.json
@@ -52,9 +29,7 @@ REGION_OK = re.compile(
     r"region|enclos|separat|same colou?r|colou?r\w*\s+(?:group|zone|side|region)"
     r"|wall between|partition|divide", re.I)
 
-# Squares/stars/polys framed as cells the path travels through. Two shapes: a verb of
-# entry aimed at one of those symbols, or the symbol relabelled as a thing to be
-# collected in passing ("waypoint", "required cell", "must-visit").
+# Squares/stars/polys framed as cells to enter, or relabelled as waypoints / required cells.
 _ENTER = (r"visit|pass(?:es|ing)?\s+through|step(?:s|ping)?\s+on|enter|collect"
           r"|travel\s+through|go\s+through|touch|thread|traverse")
 _SYMBOL = r"square|star|poly(?:shape|omino)?"
@@ -85,8 +60,7 @@ def _shingles(text: str, n: int = 8) -> set:
 
 
 def example_overlap(script: str, example_shingles: set) -> float:
-    """Fraction of the script's 8-word shingles that also appear in the few-shot
-    example. ~0 for an original procedure, high for a paraphrase-free copy."""
+    """Fraction of the script's 8-word shingles that also appear in the few-shot example."""
     sh = _shingles(script)
     if not sh:
         return 0.0
@@ -94,14 +68,7 @@ def example_overlap(script: str, example_shingles: set) -> float:
 
 
 def entry_text(entry: dict) -> str:
-    """The LLM-written prose of one bank entry, whichever method wrote it.
-
-    Memp banks call it `script` (a procedure), MemoryBank banks `case_note` (a
-    recollection). The checks below are about whether the prose states SPaRC's
-    rules correctly, which is a question worth asking of either -- a case note
-    that says "I stepped on the blue square" misinforms the actor exactly as a
-    procedure that says "visit each square" does.
-    """
+    """The LLM-written prose of an entry: `script` (Memp) or `case_note` (MemoryBank)."""
     for field in ("script", "case_note"):
         if field in entry:
             return entry[field]
@@ -114,7 +81,6 @@ def audit(bank_path, verbose=False, copy_threshold=0.5) -> dict:
     example_sh = _shingles(_PROCEDURE_EXAMPLE)
     text = {e["id"]: entry_text(e) for e in entries}
 
-    # Scored only where the puzzle actually carries the rule in question.
     scored = [e for e in entries
               if re.search(r"square|star", e["key_text"].split("rules:")[-1])]
     region = [e for e in scored if REGION_OK.search(text[e["id"]])]
@@ -122,9 +88,7 @@ def audit(bank_path, verbose=False, copy_threshold=0.5) -> dict:
     both = [e for e in scored
             if REGION_OK.search(text[e["id"]]) and VISIT_WRONG.search(text[e["id"]])]
     count = [e for e in entries if COUNT_WRONG.search(text[e["id"]])]
-    # example_copy only means anything for a bank whose prompt HAS a few-shot
-    # example. MemoryBank's case-note prompts deliberately have none, so the
-    # measure is reported as 0 there rather than compared against Memp's.
+    # Only meaningful for Memp banks; MemoryBank prompts have no few-shot example.
     copies = [e for e in entries
               if example_overlap(text[e["id"]], example_sh) >= copy_threshold]
 
@@ -133,7 +97,7 @@ def audit(bank_path, verbose=False, copy_threshold=0.5) -> dict:
         "bank": str(bank_path),
         "schema": data.get("schema", "?"),
         "model_id": data.get("config", {}).get("model_id", "?"),
-        # None for a Memp bank, which has no such knob; True/False for MemoryBank.
+        # None for Memp banks, which have no such option.
         "rules_preamble": data.get("config", {}).get("rules_preamble"),
         "entries": n,
         "scored_for_square_star": len(scored),

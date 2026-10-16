@@ -1,25 +1,8 @@
-"""The benchmark seam: everything a memory method needs that differs per task.
+"""The Benchmark interface: what a memory method needs that differs per task.
 
-SPaRC is an interactive grid MDP, StepGame is single-turn text QA, and LogicGame
-will be single-turn too. The four drivers (baseline, Reflexion, MemP, MemoryBank)
-are otherwise identical across them, so rather than forking a driver per benchmark
-each one asks a `Benchmark` for the handful of things that actually differ:
-
-  * which items exist, and what the record for one looks like
-  * how to run a pass over them, memoryless or with an injected block
-  * how to grade a reply and how hard the item was
-  * the retrieval key text
-  * the concrete exemplar / verbatim record a bank entry carries
-  * every prompt that mentions the task
-
-**SPaRC's implementation delegates to the existing functions rather than
-reimplementing them.** `harness.run.run_sparc_suite_baseline`,
-`run_sparc_suite_memory_pass` and every prompt in `prompts.py` are untouched, and
-`SparcBenchmark` is a thin forwarder onto them. That is deliberate: those code
-paths produced the numbers already written up in docs/memp.md and
-docs/memorybank.md, and the cheapest way to guarantee this refactor did not move
-them is for the SPaRC path to be the same code. scripts/regress_sparc.py confirms
-it rather than having to establish it.
+SPaRC is an interactive grid MDP and StepGame single-turn text QA; each driver in
+memory_agents/methods/ (baseline, reflexion, memp, memorybank, contrastive) is
+written once against this interface.
 """
 
 from __future__ import annotations
@@ -34,11 +17,10 @@ class Benchmark(ABC):
     name: str = ""
     key_fn: str = ""
     interactive: bool = True        # multi-step env vs. one reply per item
-    # Granularities the injected block supports, first one the default.
+    # Granularities the injected block supports; the first is the default.
     granularities: tuple = ("script", "trajectory", "proceduralization")
     case_granularities: tuple = ("case-record", "case")
-    # Contrastive memory's content arms (docs/contrastive.md section 3); the tuple
-    # lives in memory/contrastive.py so a driver and a renderer cannot disagree.
+    # Must match memory/contrastive.GRANULARITIES.
     contrastive_granularities: tuple = (
         "avoid", "hindsight", "positive-only", "avoid-only")
 
@@ -56,8 +38,7 @@ class Benchmark(ABC):
         """The primary difficulty label (SPaRC: level; StepGame: k)."""
 
     def secondary_difficulty(self, record):
-        """An optional second axis, or None. StepGame returns the true hop count,
-        which is not the same thing as k -- see docs/stepgame.md section 2.2."""
+        """An optional second difficulty axis, or None (StepGame: hop count, not k)."""
         return None
 
     @abstractmethod
@@ -93,14 +74,9 @@ class Benchmark(ABC):
         """The verbatim record for a gold entry, in `reflection_context` shape."""
 
     def failed_trajectory(self, record, episode_ctx: dict) -> dict:
-        """The verbatim record of a FAILED attempt, in `reflection_context` shape.
+        """The verbatim record of a failed attempt, in `reflection_context` shape.
 
-        What contrastive memory distils its DON'Ts from. Already in that shape in
-        the build file -- `episode_record()` keeps `episode_context` for failures
-        as well as successes, which is why this method needs no new build pass --
-        so the default hands it back untouched. A benchmark overrides only if it
-        has to normalise something. Returns {} when there is nothing usable (a
-        crashed episode has no context at all).
+        Contrastive DON'Ts are distilled from it. Returns {} for a crashed episode.
         """
         return dict(episode_ctx) if episode_ctx else {}
 
@@ -137,7 +113,8 @@ class Benchmark(ABC):
 
 
 # =========================================================================== #
-# SPaRC -- a forwarder onto the existing, unmodified implementation
+# SPaRC -- forwards to harness.run and prompts.py; this path must stay
+# byte-identical (tests/regress_sparc.py).
 # =========================================================================== #
 class SparcBenchmark(Benchmark):
     name = "sparc"
@@ -183,7 +160,7 @@ class SparcBenchmark(Benchmark):
         import yaml
         return yaml.safe_load(record["polyshapes"])
 
-    # ---- running: straight through to the untouched suite functions ------
+    # ---- running ---------------------------------------------------------
     async def run_baseline_suite(self, client, split, concurrency, limit=None):
         from .harness.run import run_sparc_suite_baseline
         return await run_sparc_suite_baseline(
@@ -228,7 +205,7 @@ class SparcBenchmark(Benchmark):
         finally:
             env.close()
 
-    # ---- prompts: forwarded verbatim ------------------------------------
+    # ---- prompts ---------------------------------------------------------
     def system_prompt(self, record) -> str:
         from .prompts import sparc_system_prompt
         return sparc_system_prompt(self.polyshapes(record))
@@ -290,9 +267,8 @@ class SparcBenchmark(Benchmark):
 class StepGameBenchmark(Benchmark):
     """StepGame over the frozen splits built by scripts/build_stepgame_splits.py.
 
-    `split` is a logical name ("train" / "test"), resolved to a split FILE. The
-    indirection is what lets the k-stratified and hop-stratified test splits be
-    swapped without touching a driver: point `--stepgame-test` at the other file.
+    `split` is a logical name ("train" / "test") resolved to a split file, so
+    `--stepgame-test` can point at the hop-stratified split instead.
     """
 
     name = "stepgame"
@@ -304,16 +280,13 @@ class StepGameBenchmark(Benchmark):
         from .prompts_stepgame_upstream import PROTOCOLS
         self._sg = stepgame
         self.variant = variant
-        # Which actor prompt the arm runs under. "ours" is the thesis protocol;
-        # the two "upstream*" values reproduce Li et al.'s prompt so our numbers
-        # can be put beside their published table. See prompts_stepgame_upstream.
+        # "upstream*" protocols reproduce Li et al.'s prompt; see prompts_stepgame_upstream.
         if prompt_protocol not in PROTOCOLS:
             raise SystemExit(
                 f"unknown --prompt-protocol {prompt_protocol!r} "
                 f"(expected one of {', '.join(PROTOCOLS)})")
         self.prompt_protocol = prompt_protocol
-        # "structural" keys on the reasoning shape, "lexical" on the phrasing --
-        # the ablation of docs/stepgame.md section 4.2.
+        # Retrieval key: "structural" = reasoning shape, "lexical" = phrasing.
         if key_variant not in ("structural", "lexical"):
             raise ValueError(f"unknown key_variant {key_variant!r}")
         self.key_variant = key_variant
@@ -326,11 +299,8 @@ class StepGameBenchmark(Benchmark):
     def _default(self, split: str) -> pathlib.Path:
         """The standard k-stratified split file for this variant.
 
-        Ambiguity is an error, not a coin flip. Rebuilding the splits at a
-        different --per-k leaves two files whose names differ only in their item
-        count, and silently picking one would mean an arm scored a different set
-        than the arm it is compared against -- which the paired tests would not
-        detect, because both would still be internally consistent.
+        Several candidates is an error, so arms compared against each other cannot
+        silently score different item sets.
         """
         from .envs import stepgame
         d = stepgame.data_dir() / "splits"
@@ -413,22 +383,11 @@ class StepGameBenchmark(Benchmark):
         }
 
     def agent_exemplar(self, record, episode_ctx: dict) -> dict:
-        """Identical to the gold one.
-
-        On SPaRC these differ because the agent's move sequence can be a different
-        valid path than the dataset's. StepGame has exactly one correct answer and
-        no path to vary, so a correctly-answered item and its worked solution
-        describe the same thing; the provenance field still records which produced
-        the note.
-        """
+        """Identical to the gold one: StepGame has a single correct answer and no path."""
         return self.gold_exemplar(record)
 
     def gold_trajectory(self, record) -> dict:
-        """The verbatim record: the question, and the solver's worked derivation.
-
-        Pure CPU, like SPaRC's env replay, and exact -- it is the same solver the
-        corpus gate verifies over all 454,625 items.
-        """
+        """The verbatim record: the question and the exact solver's worked derivation."""
         return {
             "first_obs": self._sg.format_item(record),
             "last_obs": record.gold_chain,
@@ -438,12 +397,7 @@ class StepGameBenchmark(Benchmark):
         }
 
     def verify_gold(self, split: str, n: int) -> None:
-        """Re-derive n stored gold chains and assert they still hold.
-
-        The StepGame counterpart of SPaRC's verify_gold_paths: cheap, no LLM, and
-        it catches the case where the split file and the current solver have
-        drifted apart -- which would silently poison every hindsight entry.
-        """
+        """Re-derive n stored gold answers and exit if the split and solver disagree."""
         from .envs.stepgame_solver import solve
         items = list(self.items(split).values())[:n]
         for item in items:
@@ -506,24 +460,15 @@ class StepGameBenchmark(Benchmark):
         from .prompts_stepgame import stepgame_avoid_prompt
         return stepgame_avoid_prompt(episode, key_text, record, rules=rules)
 
-    # ---- contrastive memory ----------------------------------------------
-    # failed_trajectory falls through to the base implementation:
-    # run_single_turn_episode already stores the question as first_obs, the reply
-    # as last_obs and the parsed label as the single move, which is exactly the
-    # shape prompts_stepgame.format_failed_attempt reads.
-
 
 # =========================================================================== #
 BENCHMARKS = {"sparc": SparcBenchmark, "stepgame": StepGameBenchmark}
 
 
 def add_benchmark_args(ap) -> None:
-    """The benchmark-selection flags, identical across all four drivers.
+    """The benchmark-selection flags shared by all drivers.
 
-    Lives here rather than in a driver because run_reflexion defers its
-    model-stack imports (so --phase compare runs on the login node), and
-    importing a driver that pulls `openai` would defeat that. This module imports
-    nothing heavier than pathlib at scope.
+    Keep this module free of heavy top-level imports: drivers import it on the login node.
     """
     ap.add_argument("--benchmark", default="sparc", choices=sorted(BENCHMARKS))
     ap.add_argument("--stepgame-train", default=None,
@@ -545,11 +490,10 @@ def add_benchmark_args(ap) -> None:
 
 
 def build_benchmark(args) -> Benchmark:
-    """Resolve the flags above into a Benchmark, honouring a frozen config.
+    """Resolve the flags above into a Benchmark.
 
-    `args` may be an argparse Namespace or a run's stored config dict, so a
-    resumed job rebuilds the benchmark its curve was started with rather than
-    whatever the resubmit line happened to say.
+    `args` may be a Namespace or a run's stored config dict, so a resumed job
+    rebuilds the benchmark it started with.
     """
     get = (args.get if isinstance(args, dict)
            else lambda k, d=None: getattr(args, k, d))

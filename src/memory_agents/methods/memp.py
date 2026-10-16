@@ -1,35 +1,24 @@
-#!/usr/bin/env python
-"""Memp (Fang et al., 2026) over SPaRC: build procedural memory on the train
-split, freeze it, retrieve it for the test split.
+"""Memp (Fang et al., 2026): build procedural memory on the train split, freeze
+it, and retrieve from it on the test split. Compared against the memoryless
+baseline at the same seed and a random-retrieval arm.
+memorybank.py and contrastive.py reuse this module's plumbing.
 
-The paper's loop is Build -> Retrieve -> Update. Here the bank is built offline
-from the train split and FROZEN at test time (docs/architecture.md section 5):
-each test puzzle is attempted exactly once, so there is no lift>=0 artifact and
-no control arm -- the comparison is two-sided against the memoryless baseline at
-the same seed, with a random-retrieval arm to separate "retrieval quality" from
-"any memory at all".
-
-Five phases, because build and eval are ~8 h of GPU each and the embedding model
-is a different server than the chat model (vLLM serves one model per process):
-
-  build    attempt all 500 TRAIN puzzles memoryless at baseline params, keeping
-           each episode's compact trajectory. Checkpointed every --chunk puzzles.
-  distill  turn the build pass into the bank: a solved puzzle's own trajectory
-           -> procedure ("agent" provenance); a failed/crashed puzzle's gold
-           solution path -> procedure in hindsight ("gold" provenance).
-  embed    (embedding model job) embed puzzle_key_text for ALL train+test
-           puzzles -> one .npz of vectors + a .json meta. Depends only on the
-           dataset, so it can run in parallel with build/distill.
-  eval     (chat model job) cosine top-k (or seeded-random k) entries per test
-           puzzle -> injected procedure block -> one pass over the test split.
-  compare  no GPU: baseline vs retrieved vs random, with McNemar exact tests.
+Phases:
+  build           memoryless pass over the train split, keeping each trajectory
+  distill         build pass -> bank: own trajectory if solved, else the gold path
+  embed           embed every train+test retrieval key (embedding-model server)
+  eval            one test pass with injected entries; --arm retrieved|random|avefact|fixed
+  compare         baseline vs retrieved vs random, McNemar exact tests (no GPU)
+  upgrade         attach replayed trajectories to a bank, for --granularity (no GPU)
+  keywords        extract per-item keywords for --arm avefact
+  embed-keywords  embed those keywords (embedding-model server)
 
   sbatch -J memp-build --export=ALL,DRIVER=memp,PHASE=build,SPLIT=train,LIMIT=0 scripts/serve_and_run.sbatch
   sbatch -J memp-dist  --export=ALL,DRIVER=memp,PHASE=distill,BUILD=results/json/memp_build_train_<stamp>.json scripts/serve_and_run.sbatch
   sbatch -J memp-embed -G A100:1 -t 01:00:00 --export=ALL,DRIVER=memp,PHASE=embed,TP=1 scripts/serve_and_run.sbatch
   sbatch -J memp-ret   --export=ALL,DRIVER=memp,PHASE=eval,ARM=retrieved,LIMIT=0,BANK=<bank.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
-  sbatch -J memp-rnd   --export=ALL,DRIVER=memp,PHASE=eval,ARM=random,LIMIT=0,BANK=<bank.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
-  python scripts/run_memp.py --phase compare --baseline <baseline.json> --retrieved <ret.json> --random <rnd.json>
+  python scripts/run.py memp --phase compare --baseline <baseline.json> --retrieved <ret.json> --random <rnd.json>
+  python scripts/run.py memp --phase upgrade --bank <bank.json>
 """
 
 import argparse
@@ -45,25 +34,20 @@ from datetime import datetime
 
 import numpy as np
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
-
-from memory_agents.benchmarks import add_benchmark_args, build_benchmark
+from memory_agents.benchmarks import build_benchmark
 from memory_agents.config import resolve_server
 from memory_agents.envs.base import EpisodeResult, make_json_safe
 from memory_agents.llm.client import EmbeddingClient, LLMClient
 from memory_agents.memory import Distiller, MempMemory
+from memory_agents.methods.common import SAMPLING, add_run_args, typed_flags
 
 BUILD_SCHEMA = "memp-build-v1"
 EVAL_SCHEMA = "memp-eval-v1"
-# The retrieval key-fn is now the benchmark's (SPaRC "puzzle-key-v1", StepGame
-# "stepgame-key-v1" or its lexical variant). Kept as a name for the SPaRC default
-# so an older embeddings sidecar with no key_fn recorded still validates.
+# SPaRC's key-fn name; runs use bench().key_fn.
 KEY_FN = "puzzle-key-v1"
 
 
-# One Benchmark per process, resolved from the CLI (or a resumed config) in
-# main(). Module-level because the phase functions and run_memorybank both reach
-# for it, and every phase of a run is by definition one benchmark.
+# The process's one Benchmark, set in main(); memorybank and contrastive set it too.
 BENCH = None
 
 
@@ -75,10 +59,7 @@ def bench():
         BENCH = SparcBenchmark()
     return BENCH
 
-# Knobs that define what a run *is*, per phase. On --resume these come from the
-# state file and the CLI cannot override them (same discipline as run_reflexion:
-# a resumed 8 h pass silently continuing at a different temperature would corrupt
-# the very numbers it exists to produce).
+# Knobs that define a run, per phase; on --resume the stored values win over the CLI.
 FROZEN = {
     "build": ("split", "limit", "temperature", "top_p", "top_k", "max_tokens",
               "seed"),
@@ -91,7 +72,7 @@ FROZEN = {
 
 
 # --------------------------------------------------------------------------- #
-# shared plumbing (the run_reflexion patterns, reused verbatim where possible)
+# shared plumbing
 # --------------------------------------------------------------------------- #
 def save_state(path, state) -> None:
     """Atomic checkpoint: write a sibling temp file, then os.replace."""
@@ -132,10 +113,8 @@ def split_ids(split: str, limit) -> list[str]:
 
 
 def episode_record(r) -> dict:
-    """One puzzle's outcome, in run_baseline's record shape plus the compact
-    trajectory. Unlike Reflexion -- which drops the trajectory once a puzzle is
-    solved -- the build pass keeps it FOR successes: the successful trajectory is
-    exactly what the distill phase turns into a procedure."""
+    """One puzzle's outcome in baseline's record shape, plus the compact
+    trajectory (kept for successes too: distill turns it into a procedure)."""
     return make_json_safe({
         "puzzle_id": str(r.puzzle_id),
         "success": r.success,
@@ -149,21 +128,19 @@ def episode_record(r) -> dict:
         "retry_tokens": r.retry_tokens(),
         "error": r.error or None,
         "episode_context": r.reflection_context(),
-        # StepGame's true hop count and the predicted/gold labels. Absent on
-        # SPaRC. Never read by a prompt -- reflection_context() is the only thing
-        # a distiller or reflector sees, and `extra` is deliberately not in it.
+        # StepGame only; not in reflection_context(), so no prompt sees it.
         **({"extra": r.extra} if getattr(r, "extra", None) else {}),
     })
 
 
 def accuracy_block(records: list[dict]) -> dict:
-    """run_baseline.summarize() over already-serialised records."""
+    """baseline.summarize() over already-serialised records."""
     n = len(records)
     wins = sum(1 for rec in records if rec["success"])
     by_diff: dict[int, list] = {}
     for rec in records:
         by_diff.setdefault(rec["difficulty"], []).append(rec["success"])
-    # StepGame's second difficulty axis; see docs/stepgame.md section 2.2.
+    # StepGame's second difficulty axis (the true hop count, not k).
     by_hops: dict[int, list] = {}
     for rec in records:
         hops = (rec.get("extra") or {}).get("hops")
@@ -199,8 +176,7 @@ async def run_build(args) -> None:
         cfg, out = state["config"], args.resume
         report_frozen(args, cfg, "build")
     else:
-        # Memories must come from puzzles the eval will never see; train and test
-        # are disjoint by construction, so anything else is a leakage bug.
+        # Memories must come from puzzles the eval never sees.
         if args.split != "train":
             raise SystemExit(f"the build pass runs on the train split (got "
                              f"--split {args.split}); submit with SPLIT=train")
@@ -234,9 +210,7 @@ async def run_build(args) -> None:
     cfg["model"] = client.model
     cfg["model_id"] = os.environ.get("LLM_MODEL_ID") or client.model
     try:
-        # Chunked, unlike Reflexion's per-trial checkpoint: this is ONE ~8 h pass,
-        # so waiting for the end to write state would make a wall-clock kill cost
-        # the whole job. Re-creating the env pool per chunk costs ~2 min in total.
+        # Checkpoint per chunk so a wall-clock kill loses at most one chunk.
         for lo in range(0, len(todo), args.chunk):
             chunk = todo[lo:lo + args.chunk]
             t0 = time.time()
@@ -269,18 +243,13 @@ async def run_build(args) -> None:
 # phase distill: build pass -> procedure bank
 # --------------------------------------------------------------------------- #
 def polyshapes_of(row):
-    """SPaRC's shape table. Kept as a name because run_memorybank imports it;
-    the distill prompts now get the whole record and let the benchmark decide
-    what to read from it."""
+    """SPaRC's shape table for a row (used by the Update policies)."""
     return bench().polyshapes(row)
 
 
 def gold_exemplar(record) -> dict:
-    """The concrete solved example attached to a gold-provenance entry.
-
-    Assembled in code, never by the LLM -- on SPaRC the action sequence comes
-    from the dataset's gold path, on StepGame from the verified solver -- so it
-    cannot be hallucinated either way."""
+    """The solved example of a gold entry, built in code (gold path or solver),
+    never by the LLM."""
     return bench().gold_exemplar(record)
 
 
@@ -340,8 +309,7 @@ async def run_distill(args) -> None:
         rec = build["puzzles"][pid]
         row = bench().record("train", pid)
         key_text = bench().key_text(row)
-        # Route on provenance. A crashed episode has no episode_context, which is
-        # exactly why the gold prompt reads the item's record only.
+        # A crashed episode has no episode_context, so it takes the gold route.
         from_agent = bool(rec["success"] and rec.get("episode_context"))
         async with sem:
             if from_agent:
@@ -383,8 +351,7 @@ async def run_distill(args) -> None:
                     row = bench().record("train", pid)
                     memory.write(pid, {
                         "provenance": "agent" if from_agent else "gold",
-                        # From the dataset, not the build record: a crashed
-                        # episode reports difficulty -1.
+                        # From the dataset: a crashed episode records difficulty -1.
                         "difficulty": bench().difficulty(row),
                         "key_text": bench().key_text(row),
                         "script": text,
@@ -403,8 +370,7 @@ async def run_distill(args) -> None:
 
     empties = await distill_pass(todo, cfg["seed"])
     if empties:
-        # Same prompt at the same seed would replay the same empty reply (usually a
-        # thinking budget exhausted inside <think>), so the one retry reseeds.
+        # The same seed would replay the same empty reply, so the retry reseeds.
         print(f"[distill] retrying {len(empties)} empty replies at seed+1", flush=True)
         empties = await distill_pass(empties, cfg["seed"] + 1)
     stats["empty"] = len(empties)
@@ -418,11 +384,9 @@ async def run_distill(args) -> None:
     print(f"[distill] wrote {out}", flush=True)
 
 
-def verify_gold_paths(df, n: int) -> None:   # SPaRC only; StepGame uses
-    # StepGameBenchmark.verify_gold, which re-derives stored chains instead.
-    """Replay the first n gold action sequences through a real env and assert
-    success -- proves the (dx,dy)->action table against the live env once, with
-    no LLM in the loop. Cheap enough to run on every distill job."""
+def verify_gold_paths(df, n: int) -> None:   # SPaRC only
+    """Replay the first n gold paths through the env and assert each one solves
+    (checks path_to_actions, no LLM)."""
     from memory_agents.envs.sparc import path_to_actions
     from memory_agents.envs.sparc import SparcEnv, is_success
 
@@ -449,20 +413,11 @@ def verify_gold_paths(df, n: int) -> None:   # SPaRC only; StepGame uses
 # phase upgrade: add round-by-round trajectories to an existing bank (no GPU)
 # --------------------------------------------------------------------------- #
 def run_upgrade(args) -> None:
-    """Attach the paper's `Trajectory` granularity to every entry of a bank.
+    """Attach a round-by-round `trajectory` to every bank entry, without a model.
 
-    Replays each entry's own exemplar action sequence through a real env and
-    stores the resulting round-by-round trace. Uniform across provenance: an
-    agent entry replays the moves the model actually made, a gold entry replays
-    the dataset's solution path. Doing it for the whole bank (rather than only
-    the handful of agent successes) keeps granularity from being confounded with
-    bank size when the arms are compared.
-
-    Pure replay -- no model, no GPU. Runs on the login node in a minute.
-
-    On a single-turn benchmark there is no env and no action sequence to replay:
-    the verbatim record is the item's question plus its worked derivation, which
-    the benchmark builds directly. Same output field, same granularity contract.
+    Interactive benchmarks replay the entry's exemplar actions through the env;
+    single-turn ones store the item's question plus its worked derivation. Every
+    entry is upgraded so granularity is not confounded with bank size.
     """
     src = pathlib.Path(args.bank)
     data = json.loads(src.read_text())
@@ -502,8 +457,6 @@ def run_upgrade(args) -> None:
     print(f"[upgrade] {upgraded}/{len(memory)} entries now carry a trajectory "
           f"({solved} of those replays reached a solved state, {failed} failed)",
           flush=True)
-    # A replay that does not end solved means the stored exemplar is not a winning
-    # line -- worth knowing, since that entry now shows the agent a losing trace.
     if upgraded and solved < upgraded:
         print(f"[upgrade] NOTE: {upgraded - solved} replays did not end solved; "
               f"those entries' exemplars were not winning paths", flush=True)
@@ -516,11 +469,7 @@ def run_upgrade(args) -> None:
 async def run_keywords(args) -> None:
     """Extract per-puzzle keywords for the AveFact retriever (one LLM call each).
 
-    The item set and key text come from the active benchmark, but the extraction
-    prompt itself (prompts.memp_keywords_prompt) is still SPaRC-shaped -- AveFact
-    is a SPaRC replication ablation and has no StepGame arm in the plan. Running
-    it on another benchmark would work mechanically and prompt badly, so the
-    key_fn recorded below names the benchmark actually used.
+    The extraction prompt is SPaRC-shaped; other benchmarks run but prompt poorly.
     """
     cfg = {"temperature": args.temperature, "top_p": args.top_p,
            "top_k": args.top_k}
@@ -529,7 +478,7 @@ async def run_keywords(args) -> None:
     out = pathlib.Path(args.out or f"results/json/memp_keywords_{stamp}.json")
     result = {"model_id": os.environ.get("LLM_MODEL_ID") or distiller.client.model,
               "key_fn": bench().key_fn, "benchmark": bench().name, "keywords": {}}
-    if out.exists():                      # resume: keyword extraction is 1000 calls
+    if out.exists():                      # resume a partial file
         result = json.loads(out.read_text())
     sem = asyncio.Semaphore(args.concurrency)
 
@@ -592,7 +541,7 @@ async def run_embed_keywords(args) -> None:
 
 
 def load_keywords(path):
-    """(keyword vectors per puzzle id) -- used for both queries and bank entries."""
+    """Keyword vectors per puzzle id, returned twice: as queries and as entry keys."""
     npz = np.load(str(pathlib.Path(path).with_suffix(".npz")))
     by_pid: dict[str, list] = {}
     for pid, vec in zip(npz["kw_pids"], npz["kw_vecs"]):
@@ -602,15 +551,14 @@ def load_keywords(path):
 
 
 # --------------------------------------------------------------------------- #
-# phase embed: puzzle_key_text for both splits -> vectors on disk
+# phase embed: key text for both splits -> vectors on disk
 # --------------------------------------------------------------------------- #
 async def run_embed(args) -> None:
     base_url, model = resolve_server()
     client = EmbeddingClient(base_url=base_url, model=model)
     embed_model = os.environ.get("LLM_MODEL_ID") or model
 
-    # The embed phase's own smoke: the sbatch chat smoke cannot run against a
-    # pooling server, so prove the endpoint works before spending any real calls.
+    # Smoke-test the pooling endpoint here; the sbatch chat smoke cannot.
     probe = await client.embed(["smoke"])
     dim = len(probe[0])
     norm = float(np.linalg.norm(probe[0]))
@@ -640,8 +588,7 @@ async def run_embed(args) -> None:
     finally:
         await client.aclose()
 
-    # Atomic like save_state: a torn npz would fail eval's np.load with a message
-    # that says nothing about why.
+    # Atomic write, as in save_state.
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".tmp.npz")
     np.savez(tmp, **arrays)
@@ -650,20 +597,12 @@ async def run_embed(args) -> None:
             "key_fn": bench().key_fn, "benchmark": bench().name,
             "n_train": int(arrays["train_ids"].shape[0]),
             "n_test": int(arrays["test_ids"].shape[0])}
-    # .meta.json, not .json: results/json/*.json is what summarize_results globs,
-    # and this sidecar is a contract for the eval phase, not a run.
+    # .meta.json, not .json: summarize_results globs results/json/*.json.
     meta_path = out.with_name(out.stem + ".meta.json")
     save_state(meta_path, meta)
 
-    # Sanity: nothing may be strictly more similar to a key than the key itself.
-    # That is the property which actually catches misaligned id/vector rows.
-    #
-    # Deliberately NOT "argmax == own row": distinct items can share a byte-identical
-    # key text, so their vectors are identical and the argmax legitimately lands on
-    # whichever row comes first. StepGame's structural key does this a lot -- every
-    # one-hop, one-sentence item with the same relation renders the same key, which
-    # is 130 of 500 train items in the k-stratified split. Requiring a unique argmax
-    # would fail a correctly-built embedding file.
+    # Catch misaligned id/vector rows. Not `argmax == own row`: items with an
+    # identical key text have identical vectors and tie.
     tv = arrays["train_vecs"]
     probe = min(64, tv.shape[0])
     sims = tv[:probe] @ tv.T
@@ -676,9 +615,7 @@ async def run_embed(args) -> None:
         ids_ = arrays[f"{split}_ids"]
         distinct = len({tuple(np.round(v, 6)) for v in arrays[f"{split}_vecs"]})
         if distinct < len(ids_):
-            # Not an error: items with identical structure are interchangeable for
-            # retrieval, and the id tie-break keeps the choice reproducible. But it
-            # bounds how much retrieval can discriminate, so it belongs in the log.
+            # Not an error (ties break by id), but it limits retrieval.
             print(f"[embed] note: {split} has {distinct} distinct vectors for "
                   f"{len(ids_)} items ({len(ids_) - distinct} share a key text "
                   f"with another item)", flush=True)
@@ -702,13 +639,10 @@ def load_embeddings(path) -> tuple[dict, dict]:
 
 
 def build_blocks(memory, arrays, cfg, test_ids, keyword_queries=None):
-    """Precompute the injected block + retrieval log for a set of test puzzles.
+    """Injected block and retrieval log per test puzzle.
 
-    With a frozen bank, retrieval is a pure function of (bank, embeddings, arm, k,
-    seed), so precomputing makes block_for a dict lookup (trivially safe under
-    concurrency) and means a resumed job injects byte-identical blocks. The Update
-    policies mutate the bank between groups, so they call this again per group --
-    hence `test_ids` is a parameter rather than the whole split.
+    Precomputed so a resumed job injects identical blocks; the Update policies
+    call it again per group.
     """
     arm, k, seed = cfg["arm"], cfg["top_k_memories"], cfg["seed"]
     granularity = cfg.get("granularity", "script")
@@ -742,8 +676,7 @@ def build_blocks(memory, arrays, cfg, test_ids, keyword_queries=None):
 
 
 # --------------------------------------------------------------------------- #
-# the Update stage (the paper's section 4.3): the bank evolves across the test
-# split, refreshed after every group of tasks.
+# the Update stage: the bank evolves across the test split, group by group
 # --------------------------------------------------------------------------- #
 async def update_pass(policy, memory, arrays, group_results, retrieved_log,
                       df_test, row_of, cfg, args, seed) -> dict:
@@ -753,8 +686,8 @@ async def update_pass(policy, memory, arrays, group_results, retrieved_log,
       validation  only the successful ones do; failures are discarded
       adjustment  each failure revises the memory that was retrieved for it
 
-    Returns counters for the run record. New entries carry the *test* puzzle's own
-    embedding (already in the sidecar), so retrieval for later groups sees them.
+    Returns counters. New entries carry the test puzzle's own embedding, so later
+    groups can retrieve them.
     """
     from memory_agents.envs.sparc import puzzle_key_text   # SPaRC-only ablation
     stats = collections.Counter()
@@ -781,7 +714,7 @@ async def update_pass(policy, memory, arrays, group_results, retrieved_log,
                     _script_of(memory, picks[0]["id"]), episode, key_text,
                     polyshapes_of(row))
             return ("revise", pid, (picks[0]["id"], text), resp)
-        # vanilla / validation both distil the trajectory into a NEW memory
+        # vanilla / validation: distil into a new memory
         async with sem:
             text, resp = await distiller.distill_from_trajectory(
                 episode, key_text, polyshapes_of(row), succeeded=bool(r.success))
@@ -816,10 +749,8 @@ async def update_pass(policy, memory, arrays, group_results, retrieved_log,
                 if not text:
                     stats["empty"] += 1
                     continue
-                # The agent's OWN moves, never the dataset's gold path: an online
-                # entry is built from a test puzzle, and a gold exemplar would put
-                # that puzzle's official solution into the context of every later
-                # test puzzle that retrieves it.
+                # The agent's own moves, never the gold path: that would leak a
+                # test puzzle's solution into later test puzzles.
                 memory.add_with_vector(pid, {
                     "provenance": "online",
                     "difficulty": int(row["difficulty_level"]),
@@ -875,19 +806,16 @@ async def run_eval(args) -> None:
                            f"{cfg['split']}_{stamp}.json")
     cfg["concurrency"] = args.concurrency
 
-    # An Update run rewrites its bank as it goes, so a resumed job must continue
-    # from the memory the finished groups produced, not from the on-disk seed bank.
+    # An Update run saves its evolving bank; a resume continues from that one.
     bank_src = state.get("bank") or json.loads(pathlib.Path(cfg["bank"]).read_text())
     memory = MempMemory.from_dict(bank_src)
     arrays, meta = load_embeddings(cfg["embeddings"])
     memory.embed_model = cfg["embed_model"] = meta.get("embed_model", "")
-    if not state.get("bank"):     # filtering already applied before it was saved
+    if not state.get("bank"):     # a saved bank is already filtered
         memory = memory.filtered(cfg.get("provenance", "all"))
     if not len(memory):
         raise SystemExit(f"provenance={cfg.get('provenance')} leaves the bank empty")
-    # Pool both splits: a resumed Update run holds entries sourced from *test*
-    # puzzles (added online), which are absent from the train arrays alone. For a
-    # frozen run nothing changes -- no entry has a test source_pid.
+    # Both splits: a resumed Update bank holds entries sourced from test puzzles.
     memory.attach_vectors(
         np.concatenate([arrays["train_ids"], arrays["test_ids"]]),
         np.concatenate([arrays["train_vecs"], arrays["test_vecs"]]))
@@ -914,8 +842,7 @@ async def run_eval(args) -> None:
     def blocks_for(ids):
         return build_blocks(memory, arrays, cfg, ids, keyword_queries)
 
-    # A frozen bank can precompute every block once. The Update policies rewrite
-    # the bank between groups, so those recompute per group instead.
+    # Update policies rewrite the bank, so they recompute blocks per group.
     online = cfg.get("update", "none") != "none"
     if online and bench().name != "sparc":
         raise SystemExit(
@@ -942,13 +869,11 @@ async def run_eval(args) -> None:
           f"update={cfg.get('update')} bank={len(memory)} entries; attempting "
           f"{len(todo)} {cfg['split']} puzzles at seed {cfg['seed']}", flush=True)
 
-    # The Update stage processes the split in groups (the paper refreshes memory
-    # "after every t test-set tasks"); a frozen run just uses the chunk size.
+    # Update runs split the test set into --groups; a frozen run uses --chunk.
     group_size = max(1, math.ceil(len(test_ids) / cfg["groups"])) if online \
         else args.chunk
 
-    # Only the Update policies need per-item records at eval time, and they are a
-    # SPaRC-only ablation, so a frozen run never touches the dataset here.
+    # Only the (SPaRC-only) Update policies need dataset rows here.
     df_test = row_of = None
     if online:
         from datasets import load_dataset
@@ -988,8 +913,7 @@ async def run_eval(args) -> None:
                               "bank_after": len(memory),
                               "cumulative_solved": solved})
                 state["updates"].append(stats)
-                # Rewrite the bank alongside the episodes so a resume continues
-                # with the memory the finished groups actually produced.
+                # Saved with the episodes so a resume continues from this bank.
                 state["bank"] = memory.to_dict()
                 print(f"[update] group {stats['group']}: +{stats.get('added', 0)} "
                       f"added, {stats.get('revised', 0)} revised, "
@@ -1034,7 +958,6 @@ def finalize_eval(state: dict, out) -> None:
         summary["entries_revised"] = sum(u.get("revised", 0) for u in ups)
         summary["update_tokens"] = sum(
             u.get("prompt_tokens", 0) + u.get("completion_tokens", 0) for u in ups)
-        # The paper's Figure 3 reads as a per-group curve, so keep it renderable.
         summary["group_curve"] = [
             {"group": u.get("group"), "solved": u.get("solved_this_group"),
              "attempted": u.get("attempted"), "bank_after": u.get("bank_after")}
@@ -1054,12 +977,7 @@ def finalize_eval(state: dict, out) -> None:
 # phase compare: baseline vs retrieved vs random
 # --------------------------------------------------------------------------- #
 def mcnemar_exact(flips_a: int, flips_b: int) -> float:
-    """Two-sided exact McNemar p-value from the two discordant counts.
-
-    Same 500 puzzles, one attempt per run => paired binary outcomes, and only the
-    discordant pairs are informative. Under H0 each discordant pair is a fair
-    coin, so the p-value is an exact binomial tail -- math.comb, no scipy.
-    """
+    """Two-sided exact McNemar p-value (binomial tail) from the discordant counts."""
     n = flips_a + flips_b
     if n == 0:
         return 1.0
@@ -1069,12 +987,7 @@ def mcnemar_exact(flips_a: int, flips_b: int) -> float:
 
 
 def eval_outcomes(path, schema: str = EVAL_SCHEMA) -> tuple[dict, dict]:
-    """Per-puzzle wins from one eval state file.
-
-    `schema` is a parameter so run_memorybank.py can reuse this (and the compare
-    machinery built on it) for its own eval files; the default keeps every Memp
-    caller unchanged.
-    """
+    """Per-puzzle wins and raw data of one eval file (`schema` for other methods)."""
     data = json.loads(pathlib.Path(path).read_text())
     if data.get("config", {}).get("schema") != schema:
         raise SystemExit(f"{path} is not a {schema} file")
@@ -1082,13 +995,8 @@ def eval_outcomes(path, schema: str = EVAL_SCHEMA) -> tuple[dict, dict]:
 
 
 def baseline_outcomes(path) -> tuple[dict, dict]:
-    """Wins + a {summary, episodes}-shaped view of the baseline run.
-
-    Accepts either a run_baseline output or a reflexion ROOT state file: the
-    root IS the memoryless baseline over the split (trial 1 at the base seed),
-    so the one root job per model serves as both Reflexion's shared trial 1 and
-    Memp's baseline -- no separate baseline pass needed.
-    """
+    """Wins plus a {summary, episodes} view of a baseline output or of a reflexion
+    root state file (whose single attempt is the memoryless baseline)."""
     data = json.loads(pathlib.Path(path).read_text())
     if "episodes" in data:
         return ({str(e["puzzle_id"]): e["success"] for e in data["episodes"]}, data)
@@ -1113,7 +1021,7 @@ def baseline_outcomes(path) -> tuple[dict, dict]:
                    "model": cfg.get("model"), "model_id": cfg.get("model_id")}
         return ({e["puzzle_id"]: e["success"] for e in episodes},
                 {"summary": summary, "episodes": episodes})
-    raise SystemExit(f"{path} is neither a run_baseline output (no 'episodes') "
+    raise SystemExit(f"{path} is neither a baseline output (no 'episodes') "
                      f"nor a reflexion root state file")
 
 
@@ -1138,7 +1046,7 @@ def run_compare(args) -> None:
         rnd_wins, rnd = eval_outcomes(args.random)
         arms.insert(1, ("memp-random", rnd_wins, list(rnd["puzzles"].values())))
 
-    # The whole comparison rests on config matching; warn loudly when it doesn't.
+    # The comparison is only valid if the configs match.
     bs, rc = base.get("summary", {}), ret["config"]
     for key in ("split", "seed", "temperature", "max_tokens"):
         if bs.get(key) != rc.get(key):
@@ -1183,8 +1091,6 @@ def run_compare(args) -> None:
         lines.append(pair("retrieved", ret_wins, "random", rnd_wins))
     lines.append("")
 
-    # Memp's price of admission: the bank was not free. Reported separately from
-    # eval cost because it amortises over every future eval against this bank.
     bank_path = pathlib.Path(rc.get("bank", ""))
     if bank_path.exists():
         stats = json.loads(bank_path.read_text()).get("stats", {})
@@ -1211,10 +1117,10 @@ def run_compare(args) -> None:
 
 # --------------------------------------------------------------------------- #
 def _resumed_config(args) -> dict | None:
-    """The stored config of whatever file this invocation continues, or None.
+    """The stored config of the file this invocation continues, or None.
 
-    --resume covers build/distill/eval; --bank covers the upgrade phase, whose
-    bank was written under one benchmark and must be re-read under the same one.
+    --resume covers build/distill/eval; --bank covers upgrade, which must re-read
+    its bank under the benchmark it was written with.
     """
     for attr in ("resume", "bank"):
         path = getattr(args, attr, None)
@@ -1230,28 +1136,21 @@ def _resumed_config(args) -> dict | None:
     return None
 
 
-async def main() -> None:
+async def main(argv: list[str], prog: str) -> None:
     ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        prog=prog, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--phase", required=True,
                     choices=["build", "distill", "embed", "eval", "compare",
                              "upgrade", "keywords", "embed-keywords"])
-    ap.add_argument("--split", default="test",
-                    help="build refuses anything but train; eval defaults to test")
-    ap.add_argument("--concurrency", type=int, default=32)
-    ap.add_argument("--limit", type=int, default=0, help="0 or less = whole split")
+    add_run_args(ap, **SAMPLING,
+                 split_help="build refuses anything but train; eval defaults to test",
+                 seed_help="decoding seed; keep equal to the baseline's for eval")
     ap.add_argument("--chunk", type=int, default=100,
                     help="puzzles per checkpoint in build/eval, calls per "
                          "checkpoint in distill")
-    ap.add_argument("--max-tokens", type=int, default=12288, help="actor budget")
     ap.add_argument("--distill-max-tokens", type=int, default=12288,
                     help="distillation budget (distill phase)")
-    ap.add_argument("--temperature", type=float, default=0.6)
-    ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--top-k", type=int, default=20,
-                    help="sampling top-k (NOT the number of memories)")
-    ap.add_argument("--seed", type=int, default=0,
-                    help="decoding seed; keep equal to the baseline's for eval")
     ap.add_argument("--top-k-memories", type=int, default=3,
                     help="memories injected per test puzzle (eval)")
     ap.add_argument("--arm", choices=["retrieved", "random", "avefact", "fixed"],
@@ -1284,20 +1183,15 @@ async def main() -> None:
     ap.add_argument("--baseline", default=None, help="baseline JSON (compare)")
     ap.add_argument("--retrieved", default=None, help="retrieved-arm JSON (compare)")
     ap.add_argument("--random", default=None, help="random-arm JSON (compare)")
-    ap.add_argument("--out", default=None, help="output path")
-    add_benchmark_args(ap)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    # Which frozen knobs the user actually typed, so a resume can tell "left at
-    # its default" from "explicitly asked for" (run_reflexion's trick).
-    typed = {a.lstrip("-").replace("-", "_").split("=")[0]
-             for a in sys.argv[1:] if a.startswith("--")}
+    # Typed flags, so a resume can report which ones it ignores.
+    typed = typed_flags(argv)
     args.explicit = {k: k in typed for keys in FROZEN.values() for k in keys}
     args.limit = args.limit if args.limit > 0 else None
 
-    # Resolve the benchmark once, for the whole process. On --resume it comes
-    # from the state file, not the CLI: a resumed distill or eval has to keep
-    # rendering the key-fn and prompts its partial output was written with.
+    # On resume the benchmark comes from the state file, so prompts and key-fn
+    # match the partial output.
     global BENCH
     stored = _resumed_config(args)
     BENCH = build_benchmark(stored if stored else args)
@@ -1332,6 +1226,3 @@ async def main() -> None:
                      "(--random is optional but recommended)")
         run_compare(args)
 
-
-if __name__ == "__main__":
-    asyncio.run(main())

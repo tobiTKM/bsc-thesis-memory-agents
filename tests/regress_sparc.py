@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Prove the benchmark refactor did not move a single byte of the SPaRC path.
 
-The SPaRC numbers in docs/memp.md, docs/memorybank.md and docs/reflexion_results.md
+The reported SPaRC numbers (Reflexion, Memp, MemoryBank)
 were produced before `benchmarks.py` existed, when every driver called
 prompts.py and harness/run.py directly. Those results stay citable only if the
 refactored path renders the *identical* text -- one changed whitespace in a system
-prompt silently invalidates every accuracy in those documents, and nothing else in
+prompt silently invalidates every reported accuracy, and nothing else in
 the repo would notice.
 
 So this compares, for real puzzles drawn from the real dataset:
@@ -21,7 +21,7 @@ So this compares, for real puzzles drawn from the real dataset:
 
 Needs the SPaRC dataset (cached) and the Spatial_Gym stack; no GPU and no model.
 
-    python scripts/regress_sparc.py --n 25
+    python tests/regress_sparc.py --n 25
 """
 
 import argparse

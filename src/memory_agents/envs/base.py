@@ -16,16 +16,11 @@ class Transition:
         self.reward = reward
         self.legal_actions = legal_actions
         self.rule_status = rule_status
-        # Where the path head sat *after* this move. The env's observation already
-        # carries the full path each step (visited nodes, current head), so this is
-        # not the only record of the path -- it just gives the Reflector a compact,
-        # explicitly *ordered* move log the final grid alone doesn't spell out.
+        # Path head after this move; gives the reflector an ordered move log.
         self.agent_location = agent_location
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
-        # Cost of the unparseable replies discarded before this move landed. Held
-        # apart from the two fields above so "tokens per model reply" stays a
-        # meaningful statistic while the waste is still counted somewhere.
+        # Cost of unparseable replies discarded before this move, kept apart from the above.
         self.retry_prompt_tokens = retry_prompt_tokens
         self.retry_completion_tokens = retry_completion_tokens
 
@@ -45,27 +40,17 @@ class EpisodeResult:
         self.truncated = truncated
         self.difficulty = difficulty
         self.transitions = transitions if transitions is not None else []
-        # Reflection context. The env observation *is* the path drawn, so last_obs
-        # (the final grid) is the richest single record of what the agent produced;
-        # first_obs is the puzzle it started from and terminal_reason is *why* it
-        # ended (see _terminal_reason() in the harness).
+        # Reflection context: start grid, final grid (the drawn path), and why it ended.
         self.first_obs = first_obs
         self.last_obs = last_obs
         self.terminal_reason = terminal_reason
-        # An episode that dies on unparseable replies appends no Transition for its
-        # final move, so the whole chain of calls that killed it had nowhere to be
-        # recorded and showed up as free. It lands here instead.
+        # Tokens of the final failed calls of an episode aborted on unparseable replies.
         self.aborted_prompt_tokens = aborted_prompt_tokens
         self.aborted_completion_tokens = aborted_completion_tokens
-        # Set only when the episode crashed (terminal_reason == "error"); see
-        # errored_episode() in the harness.
+        # Set only when terminal_reason == "error".
         self.error = error
-        # Per-benchmark extras that belong in the RESULTS but not in the
-        # reflection context: StepGame puts the true hop count here (a second
-        # difficulty axis, see docs/stepgame.md section 2.2) along with the gold
-        # and predicted labels for error analysis. Deliberately NOT read by
-        # reflection_context() -- a reflector that could see `gold` would make
-        # the whole Reflexion arm meaningless.
+        # Per-benchmark result fields (e.g. StepGame hops, gold label). Never read by
+        # reflection_context(): no gold answer may reach a reflection prompt.
         self.extra = extra or {}
 
     def steps(self) -> int:
@@ -83,42 +68,20 @@ class EpisodeResult:
                 + self.aborted_completion_tokens)
 
     def retry_tokens(self) -> int:
-        """Of the above, what was spent on replies that never yielded a move.
-
-        Reported separately because it is pure waste: a method that provokes more
-        format failures must not get to look cheap.
-        """
+        """Tokens spent on replies that never yielded a move (a subset of the above)."""
         return (sum(t.retry_prompt_tokens + t.retry_completion_tokens
                     for t in self.transitions)
                 + self.aborted_prompt_tokens + self.aborted_completion_tokens)
 
     # ---- reflection context (survives a job boundary) --------------------
-    # A multi-trial Reflexion run spans more SLURM jobs than one 12h limit fits, so
-    # trial t+1's reflection is written in a *different process* than the trial-t
-    # episode it reflects on. These two methods are that handoff: exactly the fields
-    # reflexion_reflection_prompt() reads, and nothing else -- full transitions carry
-    # per-step rule_status/legal_actions that would multiply the state file's size
-    # for data no prompt looks at.
+    # Exactly the fields reflexion_reflection_prompt() reads, so a resumed process can reflect.
 
     def reflection_context(self) -> dict | None:
-        """What a later process needs to reflect on this episode, or None if there
-        is nothing to reflect on.
-
-        None for crashed episodes: `errored_episode` has no trajectory and no grids,
-        so reflecting on it would ask the model to diagnose a failure that never
-        happened and produce a hint invented from nothing.
-        """
+        """JSON-safe fields needed to reflect on this episode; None for crashed episodes."""
         if self.terminal_reason == "error":
             return None
-        # make_json_safe is not optional here: agent_location arrives from the env as a
-        # numpy ndarray and rule_status can hold numpy bools, neither of which
-        # json.dumps will encode. Nothing serialised a trajectory before this method
-        # existed, so the raw types had never had to survive a round trip.
-        # Converted per value rather than once over the whole dict, because
-        # make_json_safe's cycle guard returns None for any object it has already
-        # seen -- and if the env hands back the same location array each step (it owns
-        # the buffer, we only read it), one shared traversal would blank every move
-        # after the first.
+        # Converted per value: make_json_safe's cycle guard returns None for an object
+        # already seen, which would blank a location array the env reuses across steps.
         return {
             "first_obs": self.first_obs,
             "last_obs": self.last_obs,
@@ -126,24 +89,19 @@ class EpisodeResult:
             # [step, action, agent_location] per move -- what format_trajectory renders.
             "moves": [[t.step, t.action, make_json_safe(t.agent_location)]
                       for t in self.transitions],
-            # Only the final one is prompted with (the per-rule verdict at the end).
+            # Only the final rule_status is prompted with.
             "rule_status": make_json_safe(
                 self.transitions[-1].rule_status if self.transitions else {}),
         }
 
     @classmethod
     def from_reflection_context(cls, ctx: dict, puzzle_id: str = "") -> "EpisodeResult":
-        """Rebuild the stand-in episode the reflection prompt consumes.
-
-        Deliberately a real EpisodeResult with real Transitions rather than a new
-        type: prompts.py then needs no notion of "replayed" episodes and the reflection
-        text is identical whether it is written in-process or after a resume.
-        """
+        """Rebuild a stand-in episode so the reflection prompt is identical after a resume."""
         moves = ctx.get("moves", [])
         rule_status = ctx.get("rule_status", {})
         transitions = [
             Transition(step=step, action=action, reward=0.0, legal_actions=[],
-                       # only the last move's verdict was kept; it is all that is read
+                       # only the last move's verdict was kept
                        rule_status=rule_status if i == len(moves) - 1 else {},
                        agent_location=location)
             for i, (step, action, location) in enumerate(moves)
@@ -156,11 +114,7 @@ class EpisodeResult:
 
 
 def make_json_safe(obj, seen=None):
-    """Convert numpy/dataset objects into plain JSON-serialisable values.
-
-    Ported from Spatial-Gym's llm_testing host so the agent sees the same payload
-    the established baseline does.
-    """
+    """Convert numpy/dataset objects into plain JSON values (ported from Spatial-Gym)."""
     if seen is None:
         seen = set()
     if obj is None or isinstance(obj, (bool, int, float, str)):

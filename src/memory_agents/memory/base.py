@@ -1,9 +1,5 @@
-"""The Memory interface shared by every memory method.
-
-A Memory is a keyed store of text items the agent reads before acting and writes
-after an episode. Reflexion keys by puzzle id (per-puzzle reflections); a
-cross-task method would key by a single global key. Keeping this abstract is what
-lets MemoryBank / MemP slot in behind the same harness without touching the loop.
+"""The Memory interface: a keyed store of text items the agent reads before
+acting and writes after an episode.
 """
 
 import json

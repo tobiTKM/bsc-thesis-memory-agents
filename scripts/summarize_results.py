@@ -1,10 +1,6 @@
 #!/usr/bin/env python
-"""Condense a run's results JSON into a short human-readable text report.
-
-The results files are one summary block plus one record per puzzle, which is the
-right shape for later analysis but not for reading. This prints the run's
-settings (the knobs we might change between runs), the whole-split numbers, the
-same numbers per difficulty, and the hardest puzzles that were solved.
+"""Condense a run's results JSON into a short text report: settings, overall and
+per-difficulty stats, and the hardest solved puzzles.
 
   python scripts/summarize_results.py                       # newest run
   python scripts/summarize_results.py results/*.json        # all + comparison
@@ -19,13 +15,13 @@ import statistics
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-RESULTS_JSON = REPO / "results" / "json"   # run data written by run_baseline.py
-RESULTS_TXT = REPO / "results" / "txt"     # reports written by this script
+RESULTS_JSON = REPO / "results" / "json"
+RESULTS_TXT = REPO / "results" / "txt"
 
 
 # ---- formatting helpers --------------------------------------------------
 def dist(values) -> str:
-    """avg/med/min/max of a list, the shape every per-puzzle stat is reported in."""
+    """avg/med/min/max of a list of numbers."""
     if not values:
         return "n/a"
     return (f"avg={statistics.mean(values):.2f}, med={statistics.median(values):.2f}, "
@@ -42,15 +38,10 @@ def hms(seconds: float) -> str:
 
 
 def format_failures(summary: dict, replies: int) -> list:
-    """One line on unparseable replies -- expanded only when they cost something.
+    """Report lines on unparseable replies, including episodes aborted by them.
 
-    The count alone is not the interesting number: the agent retries up to
-    max_format_retries times, so a failure that recovered cost tokens and
-    nothing else. What contaminates the results is an *abort* (every retry
-    failed), because the harness ends that episode as truncated, where it is
-    indistinguishable from a real dead end. So report aborts, and stay quiet
-    when there are none. A run with a high rate here is not trustworthy until
-    it is explained -- see the 4096-token run that lost 66% of its episodes.
+    An abort (every retry failed) ends the episode as truncated, which is
+    indistinguishable from a real dead end in the stats.
     """
     ff = summary.get("format_failures") or {}
     if not ff:
@@ -59,19 +50,15 @@ def format_failures(summary: dict, replies: int) -> list:
     if not n:
         return []
 
-    # The aggregate does not keep attempt numbers, so read the raw log: a record
-    # at the last attempt index means that reply was never parsed = episode aborted.
+    # The aggregate has no attempt numbers, so read the raw log.
     aborted = None
     log = pathlib.Path(ff.get("log", ""))
     if not log.exists():
-        # Runs made before results/ was split into json/ and txt/ recorded the log
-        # at the old flat path; it moved with everything else.
+        # Older runs recorded the log at a flat results/ path.
         log = RESULTS_JSON / log.name
     if log.exists():
-        # An abort is a reply logged at the LAST attempt index, not simply a puzzle
-        # with many records: an episode whose five separate moves each failed once
-        # and recovered also produces five records, and counting those as aborts
-        # inflated this number with exactly the cases that were harmless.
+        # An abort is a record at the last attempt index; several records for one
+        # puzzle can be separate moves that each recovered.
         retries = summary.get("max_format_retries", 5)
         aborted_puzzles = set()
         for line in log.read_text().splitlines():
@@ -97,10 +84,7 @@ def format_failures(summary: dict, replies: int) -> list:
 
 
 # ---- analysis ------------------------------------------------------------
-# What terminated/truncated MEAN differs per benchmark, so the labels do too.
-# The arithmetic is identical -- they are reported over all episodes and sum to
-# 100% -- but printing "dead end, no legal move" next to a StepGame format
-# failure would describe a failure mode that benchmark does not have.
+# Same terminated/truncated arithmetic on every benchmark; only the meaning differs.
 _LABELS = {
     "sparc": ("[reached the exit]",
               "[dead end, no legal move]",
@@ -112,19 +96,10 @@ _LABELS = {
 
 
 def block(episodes: list, indent: str, benchmark: str = "sparc") -> list:
-    """The per-puzzle stat block, used for the whole split and each difficulty.
+    """The stat block for a group of episodes (whole split or one difficulty).
 
-    `terminated` and `truncated` are reported over *all* puzzles and sum to 100%.
-    On SPaRC `terminated` means the agent reached the exit (wins are a subset of
-    it) and `truncated` means it had no legal action left, i.e. walked into a
-    dead end; the step cap also sets `truncated`, but episodes run ~15 steps
-    against a cap of 100, so that never fires. So "failed at exit" is the
-    rule-violation bucket, and the two failure modes the memory methods have to
-    attack are: lost the path (truncated) vs lost the rules.
-
-    On a single-turn benchmark the same two flags mean "submitted an answer" and
-    "never produced a parseable one", so the third bucket is simply a wrong
-    answer. Same arithmetic, different words.
+    `terminated` and `truncated` are over all episodes and sum to 100%; wins are a
+    subset of `terminated`. On SPaRC `truncated` means a dead end (the step cap never binds).
     """
     reached, cutoff, missed = _LABELS.get(benchmark, _LABELS["sparc"])
     n = len(episodes)
@@ -135,7 +110,6 @@ def block(episodes: list, indent: str, benchmark: str = "sparc") -> list:
     steps = [e.get("steps", 0) for e in episodes]
     completion = [e.get("completion_tokens", 0) for e in episodes]
     prompt = [e.get("prompt_tokens", 0) for e in episodes]
-    # tokens per model reply, i.e. how long the model thinks on a single move
     per_reply = [e.get("completion_tokens", 0) / e["steps"]
                  for e in episodes if e.get("steps")]
 
@@ -160,13 +134,10 @@ def block(episodes: list, indent: str, benchmark: str = "sparc") -> list:
 
 
 def episodes_from_state(state: dict) -> list:
-    """Flatten a multi-trial run to one record per puzzle: its final outcome.
+    """Flatten a multi-trial run to one record per puzzle.
 
-    A puzzle attempted over several trials still has one outcome for the run --
-    solved or not -- so the per-puzzle stats stay comparable with a single-pass
-    baseline. The representative attempt is the winning one where there is one and
-    the last one otherwise (that is what "how did this puzzle end" means), while
-    tokens are summed over *every* attempt, because all of them were paid for.
+    Outcome fields come from the winning attempt (else the last); tokens are
+    summed over all attempts.
     """
     out = []
     for pid, e in sorted(state.get("puzzles", {}).items()):
@@ -233,14 +204,12 @@ def trial_curve(state: dict) -> list:
             f"{t.get('cumulative_accuracy', 0):>8.3f} "
             f"{t.get('reflections_written', 0):>6} "
             f"{t.get('elapsed_sec', 0) / 60:>8.0f}")
-    # Only unsolved puzzles are re-attempted and solved ones are carried forward, so
-    # this curve cannot fall. Saying so here stops the shape being read as evidence.
     out += [
         "",
         f"  cumulative accuracy over {n} puzzles; it can only rise with the trial",
         "  index (solved puzzles are carried forward), so it is NOT evidence on its",
         "  own -- compare it against the control arm at the same trial:",
-        "    python scripts/run_reflexion.py --phase compare --memory <f> --control <f>",
+        "    python scripts/run.py reflexion --phase compare --memory <f> --control <f>",
     ]
     actor = sum(t.get("actor_prompt_tokens", 0) + t.get("actor_completion_tokens", 0)
                 for t in trials)
@@ -251,32 +220,25 @@ def trial_curve(state: dict) -> list:
     return out
 
 
-# The three cross-task methods write the same {config, puzzles, summary} shape and
-# differ only in their schema prefix, so every reader below is shared. Adding a
-# fourth method means adding its prefix here, not a fourth branch.
+# The cross-task methods share one {config, puzzles, summary} state shape and differ
+# only in schema prefix; a new method only needs its prefix added here.
 BANK_FAMILY = ("memp-bank-v1", "memorybank-bank-v1", "contrastive-bank-v1")
 STATE_FAMILY = ("memp", "memorybank", "contrastive")
 
 
 def method_of(schema: str) -> str:
-    """"memorybank-eval-v1" -> "memorybank". The render branch keys on this."""
+    """"memorybank-eval-v1" -> "memorybank"."""
     return schema.split("-", 1)[0] if schema else ""
 
 
 def episodes_from_memp_state(state: dict) -> list:
-    """Flatten a memp/memorybank/contrastive build or eval state, one record per item.
-
-    The records are already in run_baseline's shape; only the build pass's
-    episode_context (the compact trajectory kept for the distill phase) is
-    dropped, since no stat reads it and it dwarfs everything else.
-    """
+    """Records of a memp/memorybank/contrastive state, minus the bulky episode_context."""
     return [{k: v for k, v in rec.items() if k != "episode_context"}
             for _pid, rec in sorted(state.get("puzzles", {}).items())]
 
 
 def summary_from_memp_state(state: dict) -> dict:
-    """The settings block for a memp state file: the run's own summary (present
-    once the pass completed) plus the frozen config knobs render() prints."""
+    """The run's summary (written once the pass completes) merged with its config."""
     cfg = state.get("config", {})
     s = dict(state.get("summary") or {})
     s.update({
@@ -290,9 +252,6 @@ def summary_from_memp_state(state: dict) -> dict:
         "seed": cfg.get("seed"),
         "concurrency": cfg.get("concurrency"),
         "arm": cfg.get("arm"),
-        # Was hardcoded "memp", which silently mis-rendered MemoryBank and would
-        # have done the same to contrastive: both write the identical state shape
-        # but their schema does not start with "memp".
         "method": method_of(cfg.get("schema", "")),
         "phase": cfg.get("phase"),
         "top_k_memories": cfg.get("top_k_memories"),
@@ -300,9 +259,7 @@ def summary_from_memp_state(state: dict) -> dict:
         "embed_model": cfg.get("embed_model"),
         "bank_entries": cfg.get("bank_entries"),
     })
-    # Knobs that finalize_eval copies into the summary when a pass completes, but
-    # which the config carries from the start -- so a run summarized WHILE it is
-    # still going reports what it is actually running rather than a default.
+    # Fall back to the config so an unfinished run reports its real settings.
     for key in ("granularity", "provenance", "failure_coverage_bank",
                 "mean_block_chars"):
         if s.get(key) is None and cfg.get(key) is not None:
@@ -315,10 +272,8 @@ def summary_from_memp_state(state: dict) -> dict:
 
 def analyse(path: pathlib.Path) -> dict:
     data = json.loads(path.read_text())
-    # Three on-disk shapes: single-pass runs ({summary, episodes}), multi-trial
-    # Reflexion state files ({config, trials, puzzles, memory}) and memp state
-    # files ({config: {schema: <method>-*}, puzzles}). A *bank* is none of these
-    # -- it holds memories, not episodes -- so name it rather than render junk.
+    # Shapes: single-pass {summary, episodes}, Reflexion {config, trials, puzzles},
+    # cross-task {config: {schema}, puzzles}. A memory bank is rejected.
     schema = data.get("config", {}).get("schema", "")
     if data.get("schema") in BANK_FAMILY or "entries" in data:
         stats = data.get("stats", {})
@@ -341,9 +296,7 @@ def analyse(path: pathlib.Path) -> dict:
     by_diff = collections.defaultdict(list)
     for ep in episodes:
         by_diff[ep.get("difficulty", -1)].append(ep)
-    # StepGame's second difficulty axis: `difficulty` above is k, the story
-    # length, while `extra.hops` is the reasoning depth, and they are not the
-    # same thing (docs/stepgame.md section 2.2). Absent on SPaRC.
+    # StepGame: `difficulty` is k (story length); `extra.hops` is reasoning depth.
     by_hops = collections.defaultdict(list)
     for ep in episodes:
         hops = (ep.get("extra") or {}).get("hops")
@@ -372,20 +325,14 @@ def render(a: dict, top: int) -> str:
     w(f"  {a['path'].name}")
     w("=" * 72)
 
-    # Older runs predate some of these fields; say so rather than printing a
-    # default that was never actually used.
+    # Older runs lack some fields; print "(not recorded)" rather than a default.
     def setting(label: str, key: str, fmt=str):
         val = s.get(key)
         w(f"  {label:<20} {fmt(val) if val is not None else '(not recorded)'}")
 
     w("")
     w("RUN")
-    # `model` is only vLLM's --served-model-name alias, which used to default to
-    # "qwen" for every checkpoint. Printing it next to the real model read as though
-    # gpt-oss had been served as a Qwen, so it is no longer shown: the checkpoint is
-    # the only thing a reader of this report needs. Runs old enough to predate
-    # model_id have nothing but the alias, so those say so instead of passing it off
-    # as the model.
+    # `model` is the served alias; model_id is the real checkpoint.
     served, exact = s.get("model", "?"), s.get("model_id")
     if exact:
         w(f"  {'model:':<20} {exact}")
@@ -419,15 +366,12 @@ def render(a: dict, top: int) -> str:
                 "contrastive": "   [WHICH HALVES ARE SHOWN -- this is the "
                                "independent variable]",
             }.get(s.get("method"), "")
-            # Each driver's own argparse default, so an old file with no
-            # granularity recorded still reports what it must have run under.
+            # Fallbacks must match each driver's argparse default.
             gran = s.get("granularity") or {
                 "memp": "script", "memorybank": "case-record",
                 "contrastive": "contrastive"}.get(s.get("method"), "(not recorded)")
             w(f"  {'granularity:':<20} {gran}{scale}")
-            # Contrastive only: what share of the entries the actor actually saw
-            # carried a failed attempt. It bounds what the failure half could
-            # have done, so it belongs beside the accuracy, not in a file only.
+            # Contrastive only.
             if s.get("failure_coverage_injected") is not None:
                 w(f"  {'failure coverage:':<20} "
                   f"{s['failure_coverage_injected']:.1%} of injected entries "
@@ -481,12 +425,9 @@ def render(a: dict, top: int) -> str:
     w("")
     w("FULL RUN")
     out.extend(block(eps, "  ", a.get("benchmark", "sparc")))
-    # replies = one per step, plus every retry that had to be thrown away
     replies = sum(e.get("steps", 0) for e in eps) + (s.get("format_failures") or {}).get("n", 0)
     out.extend(format_failures(s, replies))
-    # Crashed episodes are neither terminated nor truncated, so they show up in no
-    # bucket above. Say so explicitly: a non-zero count means the run is incomplete,
-    # not that the model did badly.
+    # Crashed episodes are neither terminated nor truncated, so no bucket above counts them.
     if s.get("errors"):
         w(f"  errored episodes:    {share(s['errors'], n)}   [crashed; run is INCOMPLETE]")
     if s.get("retry_tokens"):
@@ -505,8 +446,6 @@ def render(a: dict, top: int) -> str:
         w("")
 
     if a.get("by_hops"):
-        # The honest difficulty axis on StepGame: k counts sentences, this counts
-        # the hops actually separating the two queried objects.
         w("BY HOPS  (true reasoning depth)")
         for h, group in a["by_hops"].items():
             w(f"  hops {h}")
@@ -515,8 +454,7 @@ def render(a: dict, top: int) -> str:
 
     if top:
         solved = [e for e in eps if e.get("success")]
-        # Rank by hops where they exist: on StepGame a k=10 item can be one hop,
-        # so ranking "hardest solved" by k would surface trivial items.
+        # Rank by hops where present: a high-k StepGame item can be a single hop.
         def hardness(e):
             hops = (e.get("extra") or {}).get("hops")
             return (-(hops if hops is not None else e.get("difficulty", 0)),
@@ -565,7 +503,7 @@ def main() -> int:
 
     paths = args.paths
     if not paths:
-        # *.json only: the format-failure logs sit here too but are .jsonl.
+        # *.json only: the format-failure .jsonl logs live here too.
         candidates = sorted(RESULTS_JSON.glob("*.json"), key=lambda p: p.stat().st_mtime)
         if not candidates:
             print(f"no *.json found in {RESULTS_JSON}", file=sys.stderr)

@@ -1,19 +1,7 @@
-"""The StepGame sentence -> relation template table, loaded from the fetched corpus.
+"""Li, Hogg & Cohn's rectified StepGame sentence -> relation templates, from the fetched corpus.
 
-The table is Li, Hogg & Cohn's rectified version of the 214 crowdsourced templates
-Shi, Zhang & Lipani generated StepGame from: 14 of them expressed a relation other
-than the label they were generated under, and this table is the corrected mapping.
-
-It is *loaded*, not vendored, and deliberately so -- see scripts/fetch_stepgame.py
-for why (upstream publishes no LICENSE). That also keeps the table and the corpus
-pinned to the same commit: a template table from a different revision than the
-stories it decodes would silently mis-parse a subset of them, which is precisely
-the failure mode the rectified corpus exists to remove.
-
-The upstream file is a single `sentence_to_relation = {...}` dict literal, read
-here with `ast.literal_eval` rather than imported. Importing would execute an
-unsigned file downloaded over the network for no benefit; literal_eval evaluates
-nothing but the data.
+Not vendored (upstream has no LICENSE); must come from the same commit as the stories.
+Read with `ast.literal_eval`, never imported, so the downloaded file is not executed.
 """
 
 import ast
@@ -21,16 +9,11 @@ import os
 import pathlib
 import re
 
-# Both sides are regex: the key matches a story sentence and names its two
-# entities, the value is a backreference template expanding to "<a>_<rel>_<b>",
-# read as "a is <rel> of b". Some templates invert the order they mention the
-# entities in ("A is over there and B is on the left of it" -> B_left_A), which
-# is why the value cannot simply be a relation name.
+# Key: sentence regex; value: backreference template giving "<a>_<rel>_<b>" (a is <rel> of b).
+# Some templates swap entity order ("A is over there and B is on the left of it" -> B_left_A).
 _DICT_NAME = "sentence_to_relation"
 _FILENAME = "sentence_to_relation.py"
 
-# Env override first so a SLURM job can point at a $WORK copy without a code
-# change; otherwise the repo-local mirror the fetch script writes.
 _ENV_VAR = "STEPGAME_DATA"
 
 _cache: list[tuple[re.Pattern, str]] | None = None
@@ -63,12 +46,7 @@ def _extract_dict(source: str) -> dict[str, str]:
 def load_templates(path=None, refresh: bool = False) -> list[tuple[re.Pattern, str]]:
     """Compiled (pattern, replacement) pairs, in upstream order.
 
-    Anchored with ^...$ because the upstream patterns are not: unanchored, the
-    `left` template "A is to the left of B." would also match inside "A is to the
-    left of B and above C.", and whichever template happened to come first in the
-    dict would win. Every StepGame sentence is exactly one relation, so a full
-    match is the correct contract and a non-match is a real signal (it means the
-    corpus and the table have drifted apart).
+    Anchored with ^...$ (upstream is not), so a template cannot match inside a longer sentence.
     """
     global _cache
     if _cache is not None and not refresh and path is None:

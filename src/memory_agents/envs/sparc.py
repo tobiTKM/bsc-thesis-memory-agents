@@ -1,3 +1,5 @@
+"""SPaRC grid-puzzle env wrapper (Spatial_Gym), reply parsing and dataset-record helpers."""
+
 import json
 import re
 
@@ -7,26 +9,20 @@ import yaml
 
 from .base import make_json_safe
 
-# A "Final:" line anywhere in the reply, tolerating markdown bold and trailing
-# punctuation. \b keeps it from matching the first digit of a longer number.
+# "Final: <0-3>" anywhere in the reply, tolerating markdown bold; \b rejects longer numbers.
 _FINAL_RE = re.compile(r"Final:\s*\**\s*([0-3])\b")
-# Fallback: the whole last line is just the digit (what the strict parser accepted).
+# Fallback: the last line is just the digit.
 _BARE_RE = re.compile(r"^\**\s*([0-3])\s*\**[.)]?$")
 
-# Env step cap. Recorded in the results so summarize_results' reading of a
-# truncation -- a dead end, not a step-limit cutoff -- stays checkable: episodes
-# run ~15 steps against this, so the cap never fires.
+# Recorded in results: a truncation is read as a dead end, which holds while the cap never binds.
 MAX_STEPS = 100
 
 
 class SparcEnv:
     def __init__(self, split="test", config="all", df_name="lkaesberg/SPaRC",
                  max_steps=MAX_STEPS, traceback=False):
-        """Three different senses of "split" collide in this call, so, explicitly:
-
-        `split` is the dataset split (train/test) and maps to the env's `df_set`;
-        `config` is the HuggingFace dataset *config* name ("all") and maps to the
-        env's `df_split`. The names are the env's, not ours.
+        """`split` is the dataset split (train/test) and maps to the env's `df_set`;
+        `config` is the HF dataset config name ("all") and maps to the env's `df_split`.
         """
         self.env = gym.make(
             "Spatial-Gym",
@@ -41,12 +37,7 @@ class SparcEnv:
 
     # ---- episode control -------------------------------------------------
     def reset(self, puzzle_id=None):
-        """Load a specific puzzle by id, or the next one if id is None.
-
-        Selecting by id is what makes concurrency safe: each episode targets its
-        own puzzle instead of relying on the env's internal sequential counter,
-        which several concurrent episodes would race on.
-        """
+        """Load a puzzle by id (safe under concurrency), or the env's next one if None."""
         options = {"puzzle_id": puzzle_id} if puzzle_id is not None else None
         return self.env.reset(options=options)
 
@@ -77,19 +68,9 @@ def format_obs(obs) -> str:
 
 
 def parse_action(reply: str):
-    """Parse a model reply into an action int, or None on a format failure.
+    """Return the action from the last `Final:` marker (or a bare-digit last line).
 
-    A None here is a *format* failure (malformed output), not a task
-    failure: the harness should retry the call, not count it as an attempt.
-
-    Anchoring strictly to the last line (the previous behaviour) rejected replies
-    that were perfectly readable -- `Final: 0.`, `**Final: 0**`, a `Final: 0` with
-    one more sentence after it -- and every rejection costs a whole retry. So scan
-    the reply for `Final:` markers and take the LAST one, which is the model's
-    conclusion rather than a digit it floated while thinking.
-
-    NOTE: this accepts strictly more replies than the strict parser did, so
-    accuracy is not comparable across this change.
+    None is a format failure, to be retried by the harness, not a task failure.
     """
     if not reply:
         return None
@@ -109,19 +90,14 @@ def is_success(info) -> bool:
 
 
 # ---- dataset-record plumbing (Memp build/embed; no env state needed) --------
-# The dataset's gold `solutions[i]["path"]` is a list of {x,y} nodes in the same
-# doubled node grid the env plays on, one unit step apart, starting at the start
-# node. This table is the inverse of the env's _action_to_direction, and the one
-# place the two conventions meet -- note "up" is y-1 (grid y grows downward).
+# Inverse of the env's _action_to_direction; must match it. "up" is y-1 (y grows downward).
 _DELTA_TO_ACTION = {(1, 0): 0, (0, -1): 1, (-1, 0): 2, (0, 1): 3}
 
 
 def path_to_actions(path) -> list[int]:
-    """Convert a gold solution path into the env's action ints.
+    """Convert a gold `solutions[i]["path"]` (start node included) into action ints.
 
-    Raises on any non-unit delta instead of guessing: a wrong action sequence
-    stored as a "known-correct example" would poison every memory built from it.
-    A path of n nodes yields n-1 moves (the list includes the start node).
+    Raises on any non-unit step rather than storing a wrong gold sequence.
     """
     actions = []
     for a, b in zip(path, path[1:]):
@@ -151,18 +127,10 @@ def _cell_kind(props: dict) -> str:
 
 
 def puzzle_key_text(record) -> str:
-    """The canonical text a puzzle is embedded from -- key-fn `puzzle-key-v1`.
+    """Canonical text a puzzle is embedded from (key-fn `puzzle-key-v1`), keys and queries alike.
 
-    Used verbatim for BOTH the train keys and the test queries; that symmetry
-    (same renderer on both sides), not the exact format, is what makes cosine
-    similarity meaningful. Changing anything here invalidates every stored
-    vector, so treat the format as frozen once a bank has shipped -- bump the
-    version name and re-embed instead.
-
-    Deterministic on purpose: cells sorted by (y, x), properties rendered in a
-    fixed order, census sorted alphabetically. Difficulty is deliberately NOT in
-    the key: retrieval should match on puzzle *content* (rules present, layout
-    scale), and difficulty is metadata the bank entry carries separately.
+    Frozen: any change invalidates stored vectors, so bump the version and re-embed.
+    Difficulty is excluded so retrieval matches on content.
     """
     puzzle, cells = _parsed_cells(record)
     dims, start, end = puzzle["dimensions"], puzzle["start"], puzzle["end"]
@@ -187,14 +155,7 @@ def puzzle_key_text(record) -> str:
 
 
 def replay_path(env, puzzle_id, actions) -> dict:
-    """Replay an action sequence and capture it in `reflection_context` shape.
-
-    Lets a gold-path entry carry the same round-by-round trace an agent-solved
-    entry gets from its own episode, so the Trajectory / Proceduralization arms
-    can run over the whole bank instead of only the handful of puzzles the model
-    happened to solve. Without this, granularity would be confounded with bank
-    size (500 entries vs 71). Pure env replay -- no model call.
-    """
+    """Replay actions in the env (no model call); return them in `reflection_context` shape."""
     obs, info = env.reset(puzzle_id=puzzle_id)
     first_obs = format_obs(obs)
     moves, last_obs = [], first_obs
@@ -214,13 +175,7 @@ def replay_path(env, puzzle_id, actions) -> dict:
 
 
 def grid_summary(record) -> str:
-    """A one-line census of a puzzle's rule cells, for the exemplar in a memory.
-
-    Coarser than puzzle_key_text on purpose: the exemplar tells the actor what
-    kind of grid the example move sequence solved, and colors matter for that
-    (squares' whole rule is color separation) but positions do not -- the
-    example is to be adapted, not replayed.
-    """
+    """One-line census of a puzzle's rule cells (colors, no positions) for a memory exemplar."""
     _, cells = _parsed_cells(record)
     counts: dict[str, int] = {}
     for cell in cells:

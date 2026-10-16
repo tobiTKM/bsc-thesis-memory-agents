@@ -1,47 +1,24 @@
-#!/usr/bin/env python
-"""Run Reflexion over a SPaRC split for up to N trials, with a matched control arm.
+"""Reflexion (Shinn et al., 2023) over a benchmark split for up to N trials, with a
+trial-matched control arm.
 
-This is the paper's loop (Shinn et al., 2023, Algorithm 1): attempt a task, and while
-it is still unsolved and trials remain, turn the failed trajectory into a short verbal
-reflection, append it to that task's episodic memory (bounded to the last `cap`), and
-re-attempt the SAME task with that memory in context. Solved tasks are never
-re-attempted, exactly like the reference implementation's `skip` flag.
+Each unsolved task gets a verbal reflection on its latest failure, kept in that task's
+episodic memory (last `cap`), and is re-attempted with it; solved tasks are carried forward.
+Since only unsolved tasks are retried, cumulative accuracy rises with trials even without
+memory; the control arm (same trials and seeds, no reflections) measures that, and the
+effect of memory is memory minus control.
 
-Three phases, because a 10-trial run over 500 puzzles is ~20 h of GPU per arm and the
-SLURM limit is 12 h:
+  root     trial 1 only: the memoryless baseline, shared by both arms.
+  arm      trials 2..N for one arm (--arm memory|control), resumable.
+  compare  no GPU: both arms' trial curves, the per-trial delta and a McNemar test.
 
-  root   trial 1 only: the memoryless baseline over the split. Written once and
-         shared by BOTH arms, so they start from the *identical* trial-1 episodes
-         rather than from two independent samples.
-  arm    trials 2..N for one arm, resumable. --arm memory is Reflexion proper;
-         --arm control is the same loop with no reflection injected and no
-         reflection generated -- the paper's own `use_memory=False` baseline.
-  compare  no GPU: prints the two arms' trial curves side by side and the per-trial
-         difference, which is the headline number.
-
-  # 1. shared trial 1
-  python scripts/run_reflexion.py --phase root --split test --limit 0
-  # 2. the two arms (separate jobs; run them in either order or in parallel)
-  python scripts/run_reflexion.py --phase arm --arm memory  --root results/json/reflexion_root_*.json --trials 10
-  python scripts/run_reflexion.py --phase arm --arm control --root results/json/reflexion_root_*.json --trials 10
-  # 3. hit the wall clock? continue the same file, no work repeated
-  python scripts/run_reflexion.py --phase arm --resume results/json/reflexion_memory_*.json --trials 10
-  # 4. the result
-  python scripts/run_reflexion.py --phase compare --memory results/json/reflexion_memory_*.json \
-                                                  --control results/json/reflexion_control_*.json
-
-Why the control arm mirrors the trial count: only *unsolved* puzzles are re-attempted
-and solved ones are carried forward, so cumulative accuracy can only rise with the
-trial index -- an upward curve is guaranteed even with no memory whatsoever. At
-temperature 0.6 a plain resample converts some failures on its own, and ten resamples
-convert more. So "accuracy went up over 10 trials" measures nothing on its own; the
-control arm, run for the same number of trials over the same puzzles at the same
-per-trial seeds, is what turns it into a claim about memory.
+  python scripts/run.py reflexion --phase root --split test --limit 0
+  python scripts/run.py reflexion --phase arm --arm memory  --root results/json/reflexion_root_*.json --trials 10
+  python scripts/run.py reflexion --phase arm --arm control --root results/json/reflexion_root_*.json --trials 10
+  python scripts/run.py reflexion --phase arm --resume results/json/reflexion_memory_*.json --trials 10
+  python scripts/run.py reflexion --phase compare --memory results/json/reflexion_memory_*.json --control results/json/reflexion_control_*.json
 """
 
-# Annotations must stay lazy: several signatures below name types from the optional
-# model stack (LLMClient, ...), and an eagerly-evaluated annotation would raise
-# NameError at import time on the login node, where that stack is deliberately absent.
+# Lazy annotations: signatures name model-stack types that may not be importable.
 from __future__ import annotations
 
 import argparse
@@ -56,17 +33,10 @@ import sys
 import time
 from datetime import datetime
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+from memory_agents.benchmarks import build_benchmark
+from memory_agents.methods.common import SAMPLING, add_run_args, typed_flags
 
-# Imported eagerly, unlike the model stack below: benchmarks.py pulls in nothing
-# heavier than pathlib at module scope, and --phase compare needs the flags too.
-from memory_agents.benchmarks import add_benchmark_args, build_benchmark  # noqa: E402
-
-# Only `root` and `arm` need the model stack; `compare` is pure JSON arithmetic and is
-# meant to run on the LOGIN node, which has neither numpy nor a working project venv
-# (the venv is built for the compute nodes and dies with an illegal instruction here).
-# Importing these eagerly made --phase compare unusable in the one place it was
-# designed for, so the failure is deferred to the phases that actually need them.
+# Deferred so --phase compare runs on the login node without the model stack.
 try:
     from memory_agents.config import resolve_server
     from memory_agents.envs.base import EpisodeResult
@@ -78,9 +48,7 @@ except ImportError as exc:      # noqa: BLE001 - re-raised per phase in main()
 
 SCHEMA = "reflexion-multitrial-v1"
 
-# Knobs that define what a run *is*. On --resume these come from the state file and
-# the CLI cannot override them: trials 6-10 silently running at a different
-# temperature (or against a different split) would corrupt the curve they extend.
+# Fixed per run: on --resume these come from the state file, never the CLI.
 FROZEN = ("benchmark", "split", "limit", "temperature", "top_p", "top_k",
           "max_tokens", "base_seed", "memory_cap")
 
@@ -89,23 +57,14 @@ FROZEN = ("benchmark", "split", "limit", "temperature", "top_p", "top_k",
 # state: one JSON file per arm, checkpointed after every trial
 # --------------------------------------------------------------------------- #
 def save_state(path, state) -> None:
-    """Write the state file atomically.
-
-    A checkpoint is written after each trial, i.e. after ~2 h of GPU. A partial
-    write (job killed mid-dump, wall clock hit) would leave unparseable JSON and
-    cost the whole run, so write to a sibling temp file and rename -- os.replace is
-    atomic within a filesystem.
-    """
+    """Write the state file atomically (temp file + os.replace)."""
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     try:
         blob = json.dumps(state, indent=2)
     except TypeError as exc:
-        # A value the env produced is not JSON-encodable (this cost a 2 h trial once,
-        # to a numpy ndarray). Losing hours of GPU to an encoder error is far worse
-        # than a lossily-encoded field, so degrade instead of raising -- but say so
-        # loudly, because it means something upstream needs make_json_safe.
+        # Degrade an unencodable value to str() rather than lose the checkpoint.
         print(f"[save_state] WARNING: {exc}; falling back to str() for unencodable "
               f"values. The run is preserved but some field is degraded.", flush=True)
         blob = json.dumps(state, indent=2, default=str)
@@ -139,8 +98,7 @@ def record_attempt(state: dict, trial: int, r) -> None:
         entry["solved_at_trial"] = trial
         entry["last_episode"] = None      # never reflected on again; drop the bulk
     else:
-        # Overwritten every trial: the next reflection is written from the most
-        # recent failure, as in the paper. None for crashes (see reflection_context).
+        # The next reflection is written from the latest failure; None for crashes.
         entry["last_episode"] = r.reflection_context()
 
 
@@ -150,10 +108,7 @@ def unsolved_ids(state: dict) -> list:
 
 
 def cumulative_block(state: dict) -> dict:
-    """Solved-by-now over the whole split -- the paper's per-trial curve.
-
-    Cumulative, not per-trial: a puzzle solved at trial 3 stays solved at trial 4.
-    """
+    """Cumulative solved-so-far accuracy over the whole split."""
     puzzles = state["puzzles"]
     n = len(puzzles)
     wins = sum(1 for e in puzzles.values() if e["solved"])
@@ -171,13 +126,9 @@ def cumulative_block(state: dict) -> dict:
 
 
 def trial_seed(base_seed: int, trial: int) -> int:
-    """Decoding seed for trial t. Distinct per trial, identical across arms.
+    """Decoding seed for trial t: identical across arms, distinct per trial.
 
-    Load-bearing in both directions. Across arms: the two arms must differ only in
-    the injected block, so trial t gets the same seed in each. Across trials: in the
-    control arm every trial sends a byte-identical prompt, so a fixed seed would make
-    vLLM replay trial 1's reply ten times and the control would measure nothing at
-    all rather than the resampling effect it exists to measure.
+    A fixed seed would make the control arm, whose prompts never change, replay trial 1.
     """
     return base_seed + trial - 1
 
@@ -207,9 +158,7 @@ def trial_block(trial: int, seed: int, results, state: dict, elapsed: float,
         "seed": seed,
         "attempted": attempted,
         "solved_this_trial": solved_now,
-        # Of the puzzles this trial actually re-attempted, how many it converted.
-        # Trial-1 accuracy on that set is 0 by construction from trial 2 on, so this
-        # is the per-trial conversion rate the arms are compared on.
+        # Conversion rate over the puzzles this trial re-attempted.
         "trial_accuracy": solved_now / attempted if attempted else 0.0,
         "cumulative_solved": cum["solved"],
         "cumulative_accuracy": cum["accuracy"],
@@ -220,7 +169,7 @@ def trial_block(trial: int, seed: int, results, state: dict, elapsed: float,
         "actor_prompt_tokens": sum(r.prompt_tokens() for r in results),
         "actor_completion_tokens": sum(r.completion_tokens() for r in results),
         "actor_retry_tokens": sum(r.retry_tokens() for r in results),
-        # Zero for the control arm, which never calls the reflection model at all.
+        # Stay zero for the control arm.
         "reflection_prompt_tokens": 0,
         "reflection_completion_tokens": 0,
         "reflections_written": 0,
@@ -278,8 +227,8 @@ async def run_root(args) -> None:
         print(f"[root] WARNING: {t1['errors']} episodes crashed; trial 1 is incomplete",
               flush=True)
     print(f"[root] wrote {out}\n[root] next:\n"
-          f"  python scripts/run_reflexion.py --phase arm --arm memory  --root {out} --trials {args.trials}\n"
-          f"  python scripts/run_reflexion.py --phase arm --arm control --root {out} --trials {args.trials}",
+          f"  python scripts/run.py reflexion --phase arm --arm memory  --root {out} --trials {args.trials}\n"
+          f"  python scripts/run.py reflexion --phase arm --arm control --root {out} --trials {args.trials}",
           flush=True)
 
 
@@ -287,16 +236,12 @@ async def run_root(args) -> None:
 # phase arm: trials 2..N, resumable
 # --------------------------------------------------------------------------- #
 async def reflect_pass(reflector, state, memory, todo, concurrency) -> dict:
-    """Write one fresh reflection per unsolved puzzle, from its latest failure.
+    """Write one reflection per unsolved puzzle from its latest failure.
 
-    Runs *before* the trial that consumes it, so a resumed job can always rebuild
-    the memory it needs from the state file alone. Reflection is per-puzzle: the
-    lesson from puzzle X is only ever shown when re-attempting X.
+    Runs before the trial that uses it, so a resumed job needs only the state file.
     """
     sem = asyncio.Semaphore(concurrency)
-    # A puzzle whose last attempt crashed has no trajectory to reflect on; it is
-    # still re-attempted, just without a new reflection. Reflecting on it would ask
-    # the model to diagnose a failure that never happened.
+    # A crashed last attempt has no trajectory: re-attempted without a new reflection.
     targets = [pid for pid in todo if state["puzzles"][pid]["last_episode"]]
     skipped = len(todo) - len(targets)
 
@@ -307,9 +252,7 @@ async def reflect_pass(reflector, state, memory, todo, concurrency) -> dict:
             text, resp = await reflector.reflect(episode, previous=memory.read(pid))
         return pid, text, resp
 
-    # return_exceptions: this runs after a completed trial that cost hours. One bad
-    # reflection call must not take the run down before the checkpoint is written --
-    # that puzzle just carries the memory it already had into the next trial.
+    # One failed reflection call must not abort the run; that puzzle keeps its memory.
     outcomes = await asyncio.gather(*(one(p) for p in targets), return_exceptions=True)
 
     tokens = collections.Counter()
@@ -323,10 +266,10 @@ async def reflect_pass(reflector, state, memory, todo, concurrency) -> dict:
         tokens["prompt"] += resp.prompt_tokens
         tokens["completion"] += resp.completion_tokens
         if text:
-            memory.write(pid, text)   # applies the cap (keeps the last `cap`)
+            memory.write(pid, text)   # applies the cap
             written += 1
         else:
-            # e.g. a reasoning model that spent its whole budget inside <think>.
+            # e.g. the whole budget spent inside <think>.
             empty += 1
     return {
         "reflections_written": written,
@@ -375,12 +318,9 @@ async def run_arm(args) -> None:
     cfg = state["config"]
     arm = cfg["arm"]
     with_memory = arm == "memory"
-    # From the STATE, not the CLI: a resumed arm must run the benchmark and split
-    # files its curve was started on. `benchmark` is in FROZEN for the same reason.
+    # From the state, not the CLI, so a resumed arm keeps its benchmark files.
     benchmark = build_benchmark(cfg)
 
-    # Frozen knobs come from the state, never the CLI: a resumed job must extend the
-    # curve it is continuing, not start a differently-configured one halfway through.
     overridden = [k for k in FROZEN
                   if getattr(args, k, None) is not None and args.explicit.get(k)
                   and getattr(args, k) != cfg.get(k)]
@@ -412,9 +352,7 @@ async def run_arm(args) -> None:
         if with_memory:
             print(f"[{arm}] trial {trial}: reflecting on {len(todo)} unsolved puzzles...",
                   flush=True)
-            # Seeded per trial like the actor: a puzzle that repeats a trajectory and
-            # whose reflection came back empty would otherwise re-send an identical
-            # prompt at an identical seed and get the same empty reply forever.
+            # Seeded per trial, else an empty reply would repeat on an identical prompt.
             reflector = Reflector(make_client(cfg, args.reflect_max_tokens, seed),
                                   benchmark=benchmark)
             try:
@@ -452,7 +390,7 @@ async def run_arm(args) -> None:
         block = trial_block(trial, seed, results, state, elapsed, reflection_stats)
         state["trials"].append(block)
         state["memory"] = memory.to_dict()
-        save_state(out, state)   # checkpoint: a killed job resumes from here
+        save_state(out, state)   # a killed job resumes from here
 
         print(f"[{arm}] trial {trial}: solved {block['solved_this_trial']}/"
               f"{block['attempted']} re-attempted ({block['trial_accuracy']:.3f}); "
@@ -462,14 +400,13 @@ async def run_arm(args) -> None:
             print(f"[{arm}] WARNING: {block['errors']} episodes crashed this trial",
                   flush=True)
 
-    # Also covers the case where the loop broke immediately (everything already
-    # solved): a fresh arm must still leave its file on disk, not just claim to.
+    # Also writes a fresh arm whose loop exited immediately.
     save_state(out, state)
     print_curve(state, arm)
     print(f"[{arm}] wrote {out}", flush=True)
     if len(state["trials"]) < args.trials:
         print(f"[{arm}] {len(state['trials'])}/{args.trials} trials done; continue with:\n"
-              f"  python scripts/run_reflexion.py --phase arm --resume {out} "
+              f"  python scripts/run.py reflexion --phase arm --resume {out} "
               f"--trials {args.trials}", flush=True)
 
 
@@ -486,15 +423,7 @@ def print_curve(state: dict, label: str) -> None:
 
 
 def mcnemar(memory_state: dict, control_state: dict) -> dict:
-    """Paired significance test on the final per-puzzle outcomes.
-
-    McNemar rather than a two-sample proportion test, because the arms are *paired*:
-    both attempt the same puzzles from the same trial 1, so the puzzles solved by
-    neither (the large majority here) carry no information about which arm is better.
-    Only the discordant pairs do -- solved by memory but not control, and vice versa.
-    Exact two-sided binomial rather than the chi-square approximation, since the
-    discordant count is small enough for the approximation to be unreliable.
-    """
+    """Exact two-sided McNemar test on the final per-puzzle outcomes (arms are paired)."""
     ids = sorted(set(memory_state["puzzles"]) & set(control_state["puzzles"]))
     both = mem_only = ctl_only = neither = 0
     for pid in ids:
@@ -520,7 +449,7 @@ def mcnemar(memory_state: dict, control_state: dict) -> dict:
 
 
 def run_compare(args) -> None:
-    """The headline table: both arms' curves and the memory-minus-control delta."""
+    """Print and save both arms' curves, the memory-minus-control delta and McNemar."""
     mem = json.loads(pathlib.Path(args.memory).read_text())
     ctl = json.loads(pathlib.Path(args.control).read_text())
     for name, st, want in (("--memory", mem, "memory"), ("--control", ctl, "control")):
@@ -606,9 +535,7 @@ def run_compare(args) -> None:
     report = "\n".join(lines)
     print(report)
     if args.out != "-":
-        # Name the report after the arm it came from. A fixed default would have each
-        # model's comparison silently overwrite the last one's, and the three runs
-        # differ only by model -- the fastest way to lose a finished 20 h result.
+        # Named after the memory file so runs for different models do not overwrite.
         default = pathlib.Path("results/txt") / (
             pathlib.Path(args.memory).stem.replace("memory", "vs_control") + ".txt")
         dest = pathlib.Path(args.out) if args.out else default
@@ -618,40 +545,28 @@ def run_compare(args) -> None:
 
 
 # --------------------------------------------------------------------------- #
-async def main() -> None:
+async def main(argv: list[str], prog: str) -> None:
     ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        prog=prog, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--phase", choices=["root", "arm", "compare"], required=True)
-    add_benchmark_args(ap)
     ap.add_argument("--arm", choices=["memory", "control"],
                     help="which arm to run (--phase arm)")
     ap.add_argument("--root", default=None, help="root JSON to start an arm from")
     ap.add_argument("--resume", default=None, help="arm JSON to continue in place")
     ap.add_argument("--trials", type=int, default=10,
                     help="total trials INCLUDING trial 1 (the paper runs ~10)")
-    ap.add_argument("--split", default="test")
-    ap.add_argument("--concurrency", type=int, default=32)
-    ap.add_argument("--limit", type=int, default=0, help="0 or less = whole split")
-    ap.add_argument("--max-tokens", type=int, default=12288, help="actor budget")
+    add_run_args(ap, **SAMPLING, seed_dest="base_seed",
+                 seed_help="seed for trial 1; trial t uses seed + t - 1")
     ap.add_argument("--reflect-max-tokens", type=int, default=12288,
                     help="self-reflection budget (memory arm only)")
-    # Qwen3 in thinking mode loops at temperature 0, and the control arm is only
-    # meaningful under sampling, so the thinking-mode defaults are the defaults here.
-    ap.add_argument("--temperature", type=float, default=0.6)
-    ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--top-k", type=int, default=20)
-    ap.add_argument("--seed", type=int, dest="base_seed", default=0,
-                    help="seed for trial 1; trial t uses seed + t - 1")
     ap.add_argument("--memory-cap", type=int, default=3,
                     help="reflections kept per puzzle (the paper's Omega, 1-3)")
     ap.add_argument("--memory", default=None, help="memory-arm JSON (--phase compare)")
     ap.add_argument("--control", default=None, help="control-arm JSON (--phase compare)")
-    ap.add_argument("--out", default=None, help="output path")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    # Which knobs the user actually typed, so a resume can tell "left at its default"
-    # from "explicitly asked for" when it reports what it is ignoring.
-    typed = {a.lstrip("-").replace("-", "_") for a in sys.argv[1:] if a.startswith("--")}
+    typed = typed_flags(argv)
     args.explicit = {k: k in typed or (k == "base_seed" and "seed" in typed)
                      for k in FROZEN}
     args.seed = args.base_seed
@@ -677,6 +592,3 @@ async def main() -> None:
             ap.error("--phase compare needs --memory <file> --control <file>")
         run_compare(args)
 
-
-if __name__ == "__main__":
-    asyncio.run(main())

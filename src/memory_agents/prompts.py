@@ -1,23 +1,18 @@
+"""SPaRC prompt builders and memory-block renderers for every method.
+
+All text is sent to the model as-is and must stay byte-identical (tests/regress_sparc.py).
+"""
+
 # Directions match the env's action ints (0=right, 1=up, 2=left, 3=down).
 _DIRECTIONS = {0: "right", 1: "up", 2: "left", 3: "down"}
 
-# Two few-shot self-reflections, in the style Reflexion uses to anchor the format:
-# "what I did wrong -> the concise, high-level plan for next time" (a strategy, not
-# a bug report). Adapted to SPaRC; kept short and forward-looking like the paper's.
+# Few-shot reflections anchoring Reflexion's format: the mistake, then a high-level plan.
 _REFLECTION_EXAMPLES = """- I rushed the path toward the end node and enclosed a blue and a green square in the same region, which breaks the square rule. Next time I should decide up front which region each color belongs to and route the path so differently colored squares end up separated before I head for the end.
 - I filled a column too early and painted the path into a corner around move 12 with no legal move left. I should keep more exits open and avoid committing to a wall until I have checked that every remaining dot can still be reached."""
 
 
 def format_trajectory(episode, max_steps=None) -> str:
-    """Render a failed episode as a move log for the reflection model.
-
-    One line per move: the direction taken and where the path head ended up. The
-    final grid (last_obs) already shows the drawn path; this adds the one thing the
-    grid does not spell out -- the *order* moves were made, and where a dead end was
-    hit. Reflexion reflects over the *whole* trajectory, so we show every move by
-    default. `max_steps` is only a guard for envs with a much larger step cap;
-    SPaRC's 100 short lines cost ~1.5k tokens, far under the context budget.
-    """
+    """Render an episode as an ordered move log; `max_steps` keeps only the last moves."""
     steps = episode.transitions
     lines = []
     if max_steps is not None and len(steps) > max_steps:
@@ -31,14 +26,7 @@ def format_trajectory(episode, max_steps=None) -> str:
 
 
 def format_previous_plans(previous) -> str:
-    """The 'plans you already tried' section of the reflection prompt.
-
-    Reflexion's own reflection step is prompted with the reflections already in
-    memory, not just the latest trajectory (noahshinn/reflexion builds its query
-    from the few-shot examples *plus* the prior trial plans). Without this, trial 4
-    reflects as if trial 3 never happened and the model happily re-proposes a plan
-    it has already watched fail. Empty on trial 2, where there is no prior plan.
-    """
+    """The 'plans you already tried' section of the reflection prompt; empty if none."""
     if not previous:
         return ""
     body = "\n".join(f"    - {p}" for p in previous)
@@ -50,19 +38,7 @@ def format_previous_plans(previous) -> str:
 
 
 def reflexion_reflection_prompt(episode, previous=()) -> str:
-    """Reflexion's self-reflection step, following the paper's own prompt shape.
-
-    Reflexion (Shinn et al., 2023) prompts an "advanced reasoning agent that can
-    improve based on self-reflection" with the full failed trajectory and asks it
-    to *diagnose a reason for failure and devise a new, concise, high-level plan*
-    -- in a few complete sentences, anchored by few-shot example reflections. The
-    plan (not a bug report) is what the actor reads before its next attempt at the
-    SAME puzzle. See memory/reflexion.py for how it is stored and injected.
-
-    `previous` is that puzzle's existing memory (the reflections from earlier failed
-    trials), which the paper's implementation also conditions on -- see
-    format_previous_plans.
-    """
+    """Reflexion self-reflection prompt; `previous` holds the puzzle's earlier reflections."""
     reasons = {
         "wrong-solution": "you submitted a path, but it broke one or more rules",
         "dead-end": "you painted the path into a corner with no legal move left",
@@ -105,9 +81,7 @@ def format_reflections(reflections) -> str:
     )
 
 
-# One few-shot script anchoring the distillation format, in the same role
-# _REFLECTION_EXAMPLES plays for reflections: a *procedure* for a class of
-# puzzles (rule-combination scoped, no coordinates), not a solution to one.
+# Few-shot Memp procedure: scoped to a rule combination, no coordinates.
 _PROCEDURE_EXAMPLE = """Applies to: squares of two colors + dots
 1. Before moving, group the squares by color and decide which side of the grid each color's region will occupy; the path must become the wall between them.
 2. Sketch a rough wall separating the color groups, then bend it to collect every dot cell, since dots must be on the path itself.
@@ -116,25 +90,10 @@ _PROCEDURE_EXAMPLE = """Applies to: squares of two colors + dots
 
 
 def distill_rules_preamble(polyshapes, artifact: str = "procedure") -> str:
-    """The rulebook plus the two clarifications a distiller cannot infer from it.
+    """Rulebook plus two clarifications, prepended to every prompt that writes a memory.
 
-    Goes at the TOP of every prompt that WRITES a procedure (both distill variants
-    and the revise/Adjustment step), so the constant part is a shared KV prefix
-    across the whole distill pass -- the same reason sparc_system_prompt keeps
-    {polyshapes} last. The prefix runs to the polyshape line; the notes after it are
-    constant text but sit past the per-puzzle part, which is a fair trade for
-    reading in the order a person would write it.
-
-    The two notes are not generic hedging -- they name the exact two errors the
-    first bank made, on ~86% gold-provenance entries and on agent entries alike:
-    treating region-rule cells as cells the path steps on, and reading the key
-    text's `rules: square x3` census (how many square CELLS exist) as "each square
-    must be entered three times". Both are unrecoverable from the cell labels alone,
-    which is all the old prompts showed.
-
-    `artifact` names what is being written. The default keeps every Memp prompt
-    byte-identical; MemoryBank's case-note prompts pass "memory note" so the
-    preamble does not itself nudge the writer toward procedural phrasing.
+    Keeps written memories from misstating the rules. `artifact` names what is being
+    written; the default keeps the Memp prompts unchanged.
     """
     return f"""
     The rules of the puzzle, reproduced verbatim from the solver's own instructions.
@@ -162,23 +121,9 @@ def distill_rules_preamble(polyshapes, artifact: str = "procedure") -> str:
 
 def memp_distill_trajectory_prompt(episode, key_text: str, polyshapes,
                                    succeeded: bool = True) -> str:
-    """Memp's Build step for a puzzle the agent itself ran.
+    """Memp Build prompt for an episode the agent ran.
 
-    `succeeded=False` is used only by the Vanilla update policy, which the paper
-    defines as consolidating *all* trajectories from a group -- failures included.
-    Every other caller distils a success.
-
-    The paper distills successful trajectories into "script-like abstractions":
-    reusable procedural knowledge for the *class* of task, not a replay of one
-    instance. So the prompt shows the solved episode (start grid, ordered moves,
-    final grid) but asks for a strategy scoped to the puzzle's rule combination,
-    and explicitly bans coordinates and move output -- a memory that says "go to
-    (4,2)" is useless on every other puzzle, and the concrete exemplar is
-    attached separately in code (see format_exemplar).
-
-    The rulebook is prepended (distill_rules_preamble): without it the model has to
-    guess the mechanics from cell labels, and a wrong guess becomes a confidently
-    worded procedure in the bank.
+    `succeeded=False` is used only by the Vanilla update policy, which also consolidates failures.
     """
     opening = (
         "You successfully solved the path-finding puzzle below. Distill the strategy\n"
@@ -219,21 +164,9 @@ def memp_distill_trajectory_prompt(episode, key_text: str, polyshapes,
 
 def memp_distill_gold_prompt(key_text: str, text_visualization: str,
                              gold_actions: list, polyshapes=None) -> str:
-    """Memp's Build step for a train puzzle the agent failed: hindsight distillation.
+    """Memp Build prompt from the gold path, for train puzzles the agent failed.
 
-    SPaRC ships gold solution paths, so a failed build episode still yields a
-    procedure -- from the known-correct path instead of the agent's own (absent)
-    success. Deliberately reads dataset fields only (key text, text_visualization,
-    the gold path converted to actions in code): no dependency on the failed
-    trajectory means crashed episodes distill exactly like failed ones, and the
-    resulting memory describes how to solve the puzzle class, not how the agent
-    once got lost in it. Same output contract as the trajectory variant so the
-    bank is homogeneous regardless of provenance.
-
-    This variant needs the prepended rulebook most: it is asked to explain why a
-    path it never watched being drawn is correct, with nothing but cell labels to
-    go on. It is also the majority of the bank (~86% of entries at SPaRC's
-    memoryless success rate), so an error mode here dominates every retrieval.
+    Reads dataset fields only, so a crashed episode distills the same as a failed one.
     """
     actions = " ".join(str(a) for a in gold_actions)
     return f"""{distill_rules_preamble(polyshapes)}
@@ -267,12 +200,7 @@ def memp_distill_gold_prompt(key_text: str, text_visualization: str,
 
 
 def format_exemplar(exemplar: dict) -> str:
-    """Render a bank entry's concrete solved example as one compact line pair.
-
-    Built from the exemplar dict the Distiller assembles in code (actions either
-    from the agent's winning Transitions or from the gold path) -- the LLM never
-    writes this part, so it cannot hallucinate a move sequence.
-    """
+    """Render a bank entry's solved example; built in code, never written by the LLM."""
     actions = " ".join(str(a) for a in exemplar.get("actions", []))
     start = tuple(exemplar.get("start", ()))
     end = tuple(exemplar.get("end", ()))
@@ -283,13 +211,7 @@ def format_exemplar(exemplar: dict) -> str:
 
 
 def format_stored_trajectory(traj: dict) -> str:
-    """Render a bank entry's stored round-by-round trace.
-
-    This is the paper's `Trajectory` granularity: the successful run kept
-    verbatim, round by round, rather than compressed to an action list. Shows the
-    starting grid, the ordered moves with the path head after each, and the final
-    grid with the solution drawn on it.
-    """
+    """Render a bank entry's stored move-by-move trace (Memp's `trajectory` granularity)."""
     lines = []
     for step, action, loc in traj.get("moves", []):
         direction = _DIRECTIONS.get(action, str(action))
@@ -303,21 +225,11 @@ def format_stored_trajectory(traj: dict) -> str:
 
 
 def format_procedures(entries, granularity: str = "script") -> str:
-    """The block injected into the actor's system prompt at Memp eval time.
+    """Memory block appended to the actor's system prompt at Memp eval time.
 
-    Same seam as format_reflections: MemoryAgent.reset appends this AFTER the full
-    system prompt, so the shared KV prefix (see sparc_system_prompt) survives.
-    Similarity scores are logged in the results but deliberately never rendered
-    here -- every retrieval arm must inject byte-identical *formats* so they differ
-    only in which entries were retrieved.
-
-    `granularity` reproduces the paper's Build-policy conditions (its Table 1):
-      script            -- the distilled abstraction only
-      trajectory        -- the stored round-by-round run only
-      proceduralization -- both, the paper's best-performing condition
-    The compact exemplar rides along with `script` because that is what the
-    original campaign injected; the trajectory conditions replace it with the real
-    trace rather than stacking both concrete forms.
+    `granularity`: script (procedure + compact exemplar), trajectory (stored trace),
+    or proceduralization (procedure + stored trace). Similarity scores are never
+    rendered, so retrieval arms differ only in which entries appear.
     """
     if granularity not in ("script", "trajectory", "proceduralization"):
         raise ValueError(f"unknown granularity {granularity!r}")
@@ -342,19 +254,7 @@ def format_procedures(entries, granularity: str = "script") -> str:
 
 
 def memp_revise_prompt(script: str, episode, key_text: str, polyshapes=None) -> str:
-    """Memp's `Adjustment` update: repair a procedure that led to a failure.
-
-    The paper's best update strategy -- "when a retrieved procedural memory
-    results in a failed execution, the erroneous trajectory is combined with the
-    original memory and then revised in place". The revision sees what actually
-    went wrong, which is the only mechanism in the framework capable of removing
-    a procedure that misstates a rule.
-
-    Which is precisely why it also gets the rulebook prepended: a reviser without
-    the rules can only tell that the attempt failed, not which of the procedure's
-    claims is false, so it is as free to invent a new wrong mechanic as the original
-    distiller was.
-    """
+    """Memp Adjustment prompt: revise a retrieved procedure after a failed attempt."""
     reasons = {
         "wrong-solution": "the agent reached the exit but broke one or more rules",
         "dead-end": "the agent painted the path into a corner with no legal move left",
@@ -397,12 +297,7 @@ def memp_revise_prompt(script: str, episode, key_text: str, polyshapes=None) -> 
 
 
 def memp_keywords_prompt(key_text: str) -> str:
-    """Memp's `AveFact` key construction: extract the task's key features.
-
-    The paper applies "a large model to extract keywords from the task's query",
-    then scores retrieval by the average similarity across matched keywords rather
-    than one whole-query vector.
-    """
+    """Memp AveFact prompt: extract keyword phrases used as retrieval keys."""
     return f"""
     Extract the key features of the path-finding puzzle below: the facts that
     determine HOW it must be solved. Think rule types present, their counts and
@@ -418,21 +313,8 @@ def memp_keywords_prompt(key_text: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# MemoryBank (Zhong et al., 2024): declarative memory -- specific past CASES.
-#
-# The paper's memory storage keeps two text layers per interaction: the in-depth
-# record (the conversation verbatim, turn by turn) and a "hierarchical event
-# summary" written by the LLM with the prompt "Summarize the events and key
-# information in the content [dialog]". Mapped onto SPaRC, one past puzzle is one
-# past interaction: its verbatim record is the replayed move-by-move trace
-# (attached in code by the distill phase, so it cannot be hallucinated), and its
-# event summary is the case note the two prompts below write.
-#
-# The contrast with Memp is the whole point of running both (docs/architecture.md
-# section 5.2): Memp abstracts a trajectory into a rule-scoped PROCEDURE, while
-# MemoryBank recounts one INSTANCE. Both are retrieved by the same key text, at
-# the same k, and rendered into the same injection point -- so the comparison
-# isolates the type of content, not the retrieval.
+# MemoryBank (Zhong et al., 2024): declarative memory of specific past cases.
+# The prompts below write the case note; the verbatim move record is attached in code.
 # --------------------------------------------------------------------------- #
 _CASE_INSTRUCTION = """You are recalling a specific past experience, not writing a strategy
     guide. Recount what this puzzle looked like and how it was solved, concretely, in
@@ -445,19 +327,7 @@ _CASE_INSTRUCTION = """You are recalling a specific past experience, not writing
 
 def memorybank_case_trajectory_prompt(episode, key_text: str, polyshapes,
                                       rules_preamble: bool = True) -> str:
-    """MemoryBank's event summary for a puzzle the agent itself solved.
-
-    The declarative sibling of memp_distill_trajectory_prompt: same inputs (the
-    episode's start grid, ordered moves and final grid), opposite output contract
-    -- a concrete recollection of THIS puzzle rather than a transferable procedure.
-
-    `rules_preamble` is an ablation knob, not a preference. Memp's v1 banks
-    misstated SPaRC's square/star rule in 33-51% of entries because no distillation
-    prompt contained the rulebook (docs/memp.md section 3.5); the preamble is what
-    fixed that. A case note describes an instance rather than asserting a rule, so
-    it is genuinely unclear whether it needs the same treatment -- hence both banks
-    get built and audited (see scripts/audit_bank.py).
-    """
+    """MemoryBank case note for a solved puzzle; `rules_preamble` is an ablation switch."""
     preamble = distill_rules_preamble(polyshapes, artifact="memory note") \
         if rules_preamble else ""
     return f"""{preamble}
@@ -485,17 +355,9 @@ def memorybank_case_trajectory_prompt(episode, key_text: str, polyshapes,
 def memorybank_case_gold_prompt(key_text: str, text_visualization: str,
                                 gold_actions: list, polyshapes=None,
                                 rules_preamble: bool = True) -> str:
-    """MemoryBank's event summary for a train puzzle the agent failed: hindsight.
+    """MemoryBank case note from the gold path, for train puzzles the agent failed.
 
-    Mirrors memp_distill_gold_prompt's role and its crash-safety property -- it
-    reads dataset fields only (key text, layout, the gold path converted to actions
-    in code), so an episode that crashed with no trajectory writes exactly like one
-    that merely failed. At SPaRC's memoryless train accuracy this variant produces
-    ~86-98% of the bank, so its phrasing matters more than the trajectory variant's.
-
-    Written in the same voice as the trajectory variant on purpose: the actor must
-    not be able to tell, from the note alone, whether a case came from its own run
-    or from hindsight -- provenance is recorded in the entry, not in the prose.
+    Same voice as the trajectory variant, so a note does not reveal its provenance.
     """
     actions = " ".join(str(a) for a in gold_actions)
     preamble = distill_rules_preamble(polyshapes, artifact="memory note") \
@@ -520,23 +382,9 @@ def memorybank_case_gold_prompt(key_text: str, text_visualization: str,
 
 
 def format_cases(entries, granularity: str = "case-record") -> str:
-    """The block injected into the actor's system prompt at MemoryBank eval time.
+    """Memory block appended to the actor's system prompt at MemoryBank eval time.
 
-    The declarative sibling of format_procedures, and deliberately the only place
-    the two methods' injected text differs in *framing*: the same seam
-    (MemoryAgent.reset appends it AFTER the full system prompt, preserving the
-    shared KV prefix), the same silence about similarity scores, the same per-entry
-    layout -- but introduced as past cases to reason by analogy from, not as
-    strategies to apply.
-
-    `granularity` selects which layer of the paper's two-layer storage rides along
-    with the case note:
-      case-record  -- the verbatim round-by-round record (the paper's in-depth
-                      storage); the default, and the analogue of Memp's
-                      `proceduralization`.
-      case         -- the compact action-list exemplar instead; the analogue of
-                      Memp's `script`, kept so the two methods can also be compared
-                      at the granularity where Memp's campaign found no effect.
+    `granularity`: case-record (note + stored trace) or case (note + compact exemplar).
     """
     if granularity not in ("case-record", "case"):
         raise ValueError(f"unknown granularity {granularity!r}")
@@ -558,20 +406,9 @@ def format_cases(entries, granularity: str = "case-record") -> str:
 
 
 def sparc_rules(polyshapes) -> str:
-    """The SPaRC rulebook alone -- what the game *is*, with no I/O contract attached.
+    """The SPaRC rulebook without the I/O contract, shared by the actor and distill prompts.
 
-    Split out of sparc_system_prompt so the distillation prompts can state the same
-    rules, verbatim, that the actor plays under. That is not cosmetic. A distiller
-    that never sees the rulebook has to reverse-engineer the mechanics from cell
-    labels, and it reliably invents the wrong ones: describing squares, stars, polys
-    and triangles as cells the path must "visit" some number of times, when the path
-    goes *around* them and their rules are about enclosed regions and touched edges.
-    Those inventions are written into the bank as confident procedural advice, which
-    is worse than an empty bank -- the actor is told, with authority, a rule that
-    does not exist.
-
-    Ends with the per-puzzle {polyshapes}, so every line before it is byte-identical
-    across puzzles -- see sparc_system_prompt for why that is worth preserving.
+    {polyshapes} stays last so everything before it is identical across puzzles.
     """
     return f"""
     You are an autonomous agent controlling a path-finding puzzle solver.
@@ -638,10 +475,7 @@ def sparc_rules(polyshapes) -> str:
 """
 
 
-# The actor's I/O contract. Deliberately NOT part of sparc_rules: it describes the
-# observation format and orders the model to end every reply with `Final: <digit>`.
-# A distiller handed that instruction would answer a "write a procedure" request
-# with a move.
+# The actor's I/O contract, kept out of sparc_rules so distill prompts do not ask for a move.
 _SPARC_IO_CONTRACT = """
     At each turn you'll receive current Information as JSON.
     Observation: The current state of the grid, including the path and any rule cells.
@@ -659,34 +493,18 @@ _SPARC_IO_CONTRACT = """
 def sparc_system_prompt(polyshapes) -> str:
     """The actor's system prompt, ported verbatim from Spatial-Gym's llm_testing host.
 
-    Kept verbatim on purpose, duplication included (rule cells and the no-revisit
-    rule are each stated twice): our numbers are meant to be comparable with the
-    established baseline, so the prompt is not ours to tidy. It is now assembled
-    from sparc_rules + the I/O contract, and the concatenation is byte-identical to
-    the single string this used to be -- baseline numbers already in results/ stay
-    comparable, and the shared KV prefix is unchanged.
-
-    One structural property worth preserving: the per-puzzle {polyshapes} is
-    interpolated near the END, so the ~145 lines before it are byte-identical for
-    every puzzle and every step. With vLLM's --enable-prefix-caching that is a
-    large shared KV prefix. Do not move the variable part earlier.
+    Do not tidy it (duplicated lines included): it must match the upstream baseline.
+    Keep {polyshapes} near the end so the rest is a shared KV prefix for prefix caching.
     """
     return sparc_rules(polyshapes) + _SPARC_IO_CONTRACT
 
 
 
 # --------------------------------------------------------------------------- #
-# Contrastive memory (docs/contrastive.md) -- SPaRC renderers.
-#
-# Appended rather than folded into format_procedures/format_cases on purpose:
-# scripts/regress_sparc.py proves the pre-existing SPaRC path renders byte-
-# identical text, and every accuracy in docs/memp.md and docs/memorybank.md rests
-# on that. Nothing above this line is touched by this method.
+# Contrastive memory: SPaRC renderers, kept separate so the Memp and MemoryBank
+# renderers above stay byte-identical (tests/regress_sparc.py).
 # --------------------------------------------------------------------------- #
-# The block mixes advice of two signs, so the framing has to make the sign of each
-# entry impossible to miss: an unlabelled "the path was sealed off along the top
-# edge" reads as an instruction to do exactly that. Each entry is therefore headed
-# DO or DO NOT, and the header says the bank contains both.
+# Entries mix DO and DO NOT advice, so each is labelled and the header says both occur.
 _CONTRASTIVE_HEADER = (
     "\n\nMemory from previous puzzles with similar rule combinations. Each item is "
     "either something that WORKED on a puzzle you solved, or something that FAILED "
@@ -706,15 +524,7 @@ _AVOID_ONLY_HEADER = (
 )
 
 def format_broken_rules(rules) -> str:
-    """The env's own verdict on a failed attempt, compactly, for the avoid prompt.
-
-    `rule_status` details are not uniform: some are counts a reader can act on
-    ("total=3, collected=1"), some are short flat lists naming which region
-    offended ("violations=[0]"), and some are nested tables that run to a whole
-    grid. Dumping the raw dict into the prompt would bury the first two under the
-    third, so this keeps the first two and drops nested values and empty containers
-    -- `mismatches=[]` on a rule that FAILED says nothing at all.
-    """
+    """Compact broken-rule verdict: keeps scalars and short flat lists, drops the rest."""
     if not rules:
         return "  Rules it broke: none recorded"
     parts = []
@@ -737,11 +547,8 @@ def format_broken_rules(rules) -> str:
     return "  Rules it broke: " + "; ".join(parts)
 
 
-# `hindsight` renders EVERY item as a DO, so the mixed-sign header above promises
-# failures its block never contains. The 12 jobs of 2026-09-14 ran with that mismatch
-# (--framing mixed); --framing matched gives each arm a header describing its own
-# content. Deliberately does not say "puzzles you solved": 429 of the entries are
-# distilled from the dataset's gold path, not from anything the actor solved.
+# Header for `hindsight` under --framing matched, where every item is a DO.
+# Avoids "puzzles you solved", since many entries come from gold paths.
 _ALL_DO_HEADER = (
     "\n\nMemory from previous puzzles with similar rule combinations: strategies for "
     "solving puzzles of this kind. They come from OTHER puzzles -- adapt the advice to "
@@ -750,21 +557,12 @@ _ALL_DO_HEADER = (
 
 _DO = "DO -- this worked on a puzzle like this one:"
 _DONT = "DO NOT -- this is how an attempt at a puzzle like this one failed:"
-# An entry whose side the arm does not render. Kept as one explicit line rather
-# than dropped, so bank size, retrieval and the number of Items in the block stay
-# identical across arms and only the CONTENT varies.
+# Placeholder for an entry the arm does not render, so item counts match across arms.
 _WITHHELD = "  (nothing recorded for this puzzle under this arm)"
 
 
 def format_failed_exemplar(exemplar: dict) -> str:
-    """The concrete artifact of a DON'T: the move sequence the attempt actually played.
-
-    The mirror of format_exemplar, and deliberately NOT that function: a failed
-    attempt never reached the end node, so rendering it as "start -> end, N moves"
-    would assert something untrue. It also must not carry the gold path -- a DON'T
-    that shows the correct solution is no longer learning from the failure, which is
-    the whole distinction between this and the `hindsight` arm.
-    """
+    """Render the moves a failed attempt played; claims no end node and shows no gold path."""
     actions = " ".join(str(a) for a in exemplar.get("actions", []))
     return (f"What that attempt played ({exemplar.get('n_moves')} moves on a "
             f"{exemplar.get('width')}x{exemplar.get('height')} grid, from "
@@ -775,25 +573,13 @@ def format_failed_exemplar(exemplar: dict) -> str:
 
 def format_contrastive(entries, granularity: str = "avoid", exemplars: bool = False,
                        framing: str = "mixed") -> str:
-    """The block injected into the actor's system prompt at contrastive eval time.
+    """Memory block appended to the actor's system prompt at contrastive eval time.
 
-    Same seam as format_procedures/format_cases: MemoryAgent.reset appends it AFTER
-    the full system prompt, so the shared KV prefix survives; similarity scores are
-    logged in the results and never rendered, so arms differ only in which entries
-    appear and what those entries are allowed to say.
-
-    The four arms (docs/contrastive.md section 3). Every one of them renders an
-    `agent` entry as its `strategy` -- the positive half is held fixed, and is
-    Memp's own distillation verbatim -- so the arms differ ONLY in what a `failed`
-    entry contributes:
-
+    `agent` entries render their `strategy`; the arms differ in what a `failed` entry shows:
       avoid          -- its `avoid` text (the method)
-      hindsight      -- its `hindsight` text: a procedure distilled from the gold
-                        path, i.e. exactly what Memp banks for this puzzle. THE
-                        CONTROL: same bank, same retriever, same positives.
-      positive-only  -- nothing; isolates what the failed entries contribute at all
-      avoid-only     -- its `avoid` text, and the `agent` entries contribute
-                        nothing; the pure-negative arm
+      hindsight      -- its gold-path procedure, labelled DO (the control)
+      positive-only  -- nothing
+      avoid-only     -- its `avoid` text, and `agent` entries render nothing
     """
     from .memory.contrastive import AGENT, GRANULARITIES
     if granularity not in GRANULARITIES:
@@ -818,20 +604,12 @@ def format_contrastive(entries, granularity: str = "avoid", exemplars: bool = Fa
         if not text.strip():
             body.append(_WITHHELD)
         else:
-            # `hindsight` is a procedure for solving the puzzle, not a mistake, so
-            # it is labelled DO even though the entry came from a failure. That is
-            # the point of the control: it is Memp's positive framing of the same
-            # 429 puzzles.
+            # `hindsight` is a solving procedure, so it is a DO despite coming from a failure.
             shown_as_do = positive or granularity == "hindsight"
             body.append(_DO if shown_as_do else _DONT)
             body.append(text.strip())
             if exemplars:
-                # The concrete artifact matching what was just said. A DO carries a
-                # winning line (the actor's own, or the gold path for an entry it
-                # failed -- which is exactly what Memp's `script` granularity
-                # attaches); a DON'T carries the losing line the warning came from.
-                # Keyed on how the item is RENDERED, not on its provenance, or the
-                # `hindsight` arm would show a failed attempt beside a procedure.
+                # Chosen by how the item is rendered, not by its provenance.
                 ex = entry.get("exemplar" if shown_as_do else "failed_exemplar")
                 if ex:
                     body.append(format_exemplar(ex) if shown_as_do
@@ -841,25 +619,10 @@ def format_contrastive(entries, granularity: str = "avoid", exemplars: bool = Fa
 
 
 def contrastive_avoid_prompt(episode, key_text: str, polyshapes, rules=()) -> str:
-    """Distil ONE reusable DON'T from one failed trajectory. The method's only new
-    model call -- the positive half of the bank is written by Memp's own
-    memp_distill_trajectory_prompt, unchanged, and the `hindsight` control arm by
-    memp_distill_gold_prompt, unchanged.
+    """Contrastive prompt distilling one reusable DON'T from a failed trajectory.
 
-    Two deliberate choices, both from docs/memp.md section 3.9:
-
-    * The rulebook is prepended. Without it the v1 banks misstated SPaRC's rules in
-      33-51% of entries, because the distiller had to guess the mechanics from cell
-      labels. A wrong DON'T is worse than a wrong procedure: it tells the actor to
-      avoid something legal.
-    * The env's own per-rule verdict is quoted in. `rules` is what
-      memory/contrastive.py broken_rules() read out of rule_status, so the prompt
-      can say which rule was ACTUALLY broken instead of letting the model infer it
-      from a grid. Empty for a dead-end, where nothing was submitted to judge.
-
-    The output is scoped to the rule combination, not the instance, for the same
-    reason Memp's is: a memory that says "do not go to (4,2)" is useless on every
-    other puzzle.
+    `rules` is the env's broken-rule verdict (empty for a dead end), quoted so the prompt
+    names the rule actually broken.
     """
     reasons = {
         "wrong-solution": "it reached the end node but broke one or more rules",
@@ -868,9 +631,6 @@ def contrastive_avoid_prompt(episode, key_text: str, polyshapes, rules=()) -> st
     }
     why = reasons.get(getattr(episode, "terminal_reason", ""),
                       "it did not solve the puzzle")
-    # The one part of a DON'T that cannot be wrong: not a claim about what the rule
-    # says, but the env's judgement on what this attempt did. Rendered through
-    # format_broken_rules so a nested region table cannot bury the counts.
     verdict = ("\n    The environment's own verdict on this attempt:\n"
                f"  {format_broken_rules(rules)}"
                if rules else

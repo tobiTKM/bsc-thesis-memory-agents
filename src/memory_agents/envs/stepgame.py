@@ -1,16 +1,7 @@
-"""StepGame: loading, rendering, answer parsing and retrieval keys.
+"""StepGame (Shi, Zhang & Lipani, AAAI-22): loading, rendering, answer parsing, retrieval keys.
 
-StepGame (Shi, Zhang & Lipani, AAAI-22) is single-turn: a story of k sentences
-describing spatial relations among k+1 entities, a question about the relative
-position of two of them, and one of nine labels as the answer. There is no
-environment to step and no state to track across turns, so -- unlike SPaRC --
-this module has no Env class. It supplies the pieces a single-turn benchmark
-needs: the corpus, the user message, the reply parser, and the retrieval key.
-
-We read the *rectified* corpus (see scripts/fetch_stepgame.py). Items are
-addressed by a stable id that encodes everything needed to find them again,
-`<variant>/<split>/k<k>/<index>`, with the index being the item's position in the
-rectified file at the pinned commit.
+Single-turn, so there is no Env class. Reads the rectified corpus (scripts/fetch_stepgame.py);
+ids are `<variant>/<split>/k<k>/<index>`, the index being the position in that file.
 """
 
 import json
@@ -32,12 +23,11 @@ class StepGameItem:
     id: str
     variant: str          # clean | noise
     split: str            # train | valid | test
-    k: int                # the file's hop count; on `noise` the story is longer
+    k: int                # corpus k (story length on clean); not the reasoning depth, see `hops`
     story: list[str]
     question: str
     gold: str             # one of LABELS, verbatim from the corpus
-    # Filled by build_stepgame_splits from the solver, so an eval never has to
-    # re-derive it and a bank entry can quote it without importing the solver.
+    # Filled from the solver by build_stepgame_splits.
     gold_chain: str = ""
     hops: int = -1
     extra: dict = field(default_factory=dict)
@@ -63,12 +53,9 @@ def corpus_path(variant: str, split: str, k: int) -> pathlib.Path:
 
 
 def read_babi(path, variant: str, split: str, k: int) -> list[StepGameItem]:
-    """Parse one bAbI-format StepGame file.
+    """Parse one bAbI-format StepGame file ("<n> <text>" lines; gold after a tab on the question).
 
-    Format: each line is "<n> <text>", numbering restarts at 1 for every item,
-    and the item's last line is the question with the gold label and the
-    supporting-fact index appended after tabs. Items are split on the line number
-    resetting to 1 rather than on blank lines, because the files have none.
+    Items are split where the line number resets to 1; the files have no blank lines.
     """
     items: list[StepGameItem] = []
     lines: list[str] = []
@@ -124,23 +111,14 @@ def read_split(path) -> list[StepGameItem]:
 # ---- rendering -----------------------------------------------------------
 
 def format_item(item: StepGameItem) -> str:
-    """The per-item payload the model sees.
-
-    Sentences are numbered so a reflection or a stored chain can refer to "hop 3"
-    and mean something the actor can look up. Not JSON, unlike SPaRC's per-step
-    message: SPaRC packs a grid plus env metadata, whereas this is prose, and
-    wrapping prose in JSON would only cost the model escaping noise.
-    """
+    """The per-item payload the model sees, with numbered story sentences."""
     story = "\n".join(f"{i}. {s}" for i, s in enumerate(item.story, start=1))
     return f"Story:\n{story}\n\nQuestion: {item.question}"
 
 
 # ---- answer parsing ------------------------------------------------------
 
-# Surface forms the actor might use for each label. Generous on purpose: a reply
-# that says "north-west" has reasoned correctly and grading it wrong would
-# measure instruction-following, not spatial reasoning. The I/O contract still
-# asks for the canonical spelling -- this is the safety net, not the interface.
+# Surface forms accepted for each label; the prompt still asks for the canonical spelling.
 _SYNONYMS: dict[str, str] = {}
 
 
@@ -171,9 +149,7 @@ _ALTERNATION = "|".join(re.escape(form) for form in
                         sorted(_SYNONYMS, key=len, reverse=True))
 _LABEL_RE = re.compile(rf"\b({_ALTERNATION})\b")
 
-# A "Final:" line anywhere in the reply, mirroring SPaRC's parser: markdown bold
-# and trailing punctuation tolerated, and the tail of the line is what gets
-# searched for a label so "Final: **the answer is upper-right**" still parses.
+# "Final:" anywhere in the reply (bold tolerated); the rest of the line is searched for a label.
 _FINAL_RE = re.compile(r"\bfinal\b\s*:?\s*\**\s*(.+)", re.IGNORECASE)
 
 
@@ -188,16 +164,9 @@ def _label_in(text: str) -> str | None:
 
 
 def parse_answer(reply: str) -> str | None:
-    """Parse a model reply into one of LABELS, or None on a format failure.
+    """Return the label from the last parseable "Final:" marker, or None on a format failure.
 
-    None means *malformed output*, not a wrong answer: the harness retries the
-    call rather than counting an attempt, exactly as it does for SPaRC. Keeping
-    the two apart matters more here than there -- with nine labels and a ~11%
-    chance floor, silently scoring an unparseable reply as wrong would fold
-    format failures into the accuracy number.
-
-    The LAST "Final:" marker wins, because a thinking model floats candidate
-    answers while reasoning and only the closing one is its conclusion.
+    None is retried by the harness, not scored as a wrong answer.
     """
     if not reply:
         return None
@@ -206,9 +175,7 @@ def parse_answer(reply: str) -> str | None:
         label = _label_in(tail)
         if label is not None:
             return label
-    # Fallback: the reply's last non-empty line is just the answer. Deliberately
-    # narrower than scanning the whole reply, which would happily pick up a
-    # direction the model mentioned mid-deduction and score it as the answer.
+    # Fallback: only the last line, so a direction mentioned mid-reasoning is not taken.
     lines = [ln for ln in reply.strip().splitlines() if ln.strip()]
     return _label_in(lines[-1]) if lines else None
 
@@ -218,9 +185,7 @@ def is_success(predicted: str | None, gold: str) -> bool:
 
 
 # ---- retrieval keys ------------------------------------------------------
-# Used verbatim for BOTH the train keys and the test queries; that symmetry is
-# what makes the cosine similarity meaningful. Frozen once a bank exists -- bump
-# the version and re-embed rather than editing.
+# Used for both train keys and test queries. Frozen: bump the version and re-embed instead.
 
 KEY_FN = "stepgame-key-v1"
 KEY_FN_LEXICAL = "stepgame-key-lex-v1"
@@ -229,18 +194,7 @@ _ENTITY_RE = re.compile(r"\b([A-Z])\b")
 
 
 def stepgame_key_text(item: StepGameItem, edges=None, hops: int | None = None) -> str:
-    """Structural key: what shape of problem this is, with the surface stripped.
-
-    Entity letters are excluded because they are sampled uniformly from 26
-    capitals and carry no information -- keying on them would make retrieval
-    match on noise. Template wording is excluded for the same reason at the
-    phrasing level; `stepgame_key_text_lexical` is the ablation that puts it back.
-
-    What remains is the reasoning structure: how many hops, how many distractor
-    sentences, the ordered relation chain, and a sorted census. The census is
-    order-invariant and the chain is not, so the two together let similarity see
-    both "same relations involved" and "same sequence of turns".
-    """
+    """Structural key: hops, sentence counts, relation chain and census; no entities or wording."""
     from .stepgame_solver import edges_of, hop_count      # local: avoids a cycle
     if edges is None:
         edges = edges_of(item.story)
@@ -251,11 +205,7 @@ def stepgame_key_text(item: StepGameItem, edges=None, hops: int | None = None) -
     for label in labels:
         census[label] = census.get(label, 0) + 1
     return "\n".join([
-        # "unused", not "distractors": on a noisy item the surplus sentences are
-        # injected distractors, but on a clean one they are ordinary chain
-        # sentences that simply do not lie between the two queried entities.
-        # Both are sentences the answer does not depend on, which is the thing
-        # retrieval should be able to see.
+        # "unused", not "distractors": on clean items these are chain sentences off the query path.
         f"hops {hops}; sentences {len(item.story)}; "
         f"unused {max(len(item.story) - hops, 0)}",
         "chain: " + (", ".join(labels) or "none"),
@@ -264,15 +214,7 @@ def stepgame_key_text(item: StepGameItem, edges=None, hops: int | None = None) -
 
 
 def stepgame_key_text_lexical(item: StepGameItem) -> str:
-    """Lexical key: the story with entities anonymised, wording kept.
-
-    The ablation against the structural key. It exists because StepGame's
-    difficulty is not purely structural -- Li et al. traced most residual parser
-    error to a handful of oblique phrasings ("if X is the centre of a clock face,
-    Y is between 4 and 5"), so which *templates* an item uses is plausibly the
-    more useful retrieval signal. Entities are renamed by order of first
-    appearance, so two items phrased identically key identically.
-    """
+    """Lexical key (ablation): story and question, entities renamed by first appearance."""
     mapping: dict[str, str] = {}
 
     def rename(match: re.Match) -> str:

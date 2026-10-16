@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
-"""Corpus gate: the symbolic solver must answer every StepGame item correctly.
+"""Gate: the symbolic solver must answer every StepGame item correctly, else exit 1.
 
-Everything downstream leans on this. The solver is the oracle we report as an
-upper bound, the verifier that our nine label strings mean what the corpus means
-by them, and -- most load-bearing -- the source of the gold reasoning chains MemP
-and MemoryBank distil bank entries from when the agent itself failed a train item.
-A solver that is 99% right would seed roughly one bank entry in a hundred with a
-confidently wrong derivation, and nothing downstream would ever flag it.
-
-So this is a gate, not a report: any wrong or undecodable item exits non-zero.
-
-It also re-derives Li, Hogg & Cohn's Table 2 removal percentages from the item
-counts on disk. That is the check that we are reading the *rectified* corpus:
-the unrectified files have the same names and parse identically, and the only
-cheap way to tell them apart is that the rectified ones are shorter by exactly
-the published amount.
+The solver is the oracle and the source of gold chains for bank entries, so it must be
+exact. Test-file item counts are also checked against Li, Hogg & Cohn's Table 2 removal
+percentages, the only cheap way to tell the rectified corpus from the original.
 
     python scripts/verify_stepgame_solver.py                 # everything on disk
     python scripts/verify_stepgame_solver.py --splits test --sample 500
@@ -30,9 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 from memory_agents.envs import stepgame          # noqa: E402
 from memory_agents.envs import stepgame_solver   # noqa: E402
 
-# Li et al. (AAAI-24), Table 2: percentage of test instances built from an
-# unfixable template, which `correct.py` removes. Used to confirm the corpus on
-# disk is the rectified one; tolerance is a percentage point of rounding.
+# Li et al. (AAAI-24) Table 2: % of test instances removed by rectification.
 TABLE_2_REMOVED = {
     "clean": {1: 7.64, 2: 15.03, 3: 20.87, 4: 26.39, 5: 32.54,
               6: 37.66, 7: 41.71, 8: 47.20, 9: 51.50, 10: 54.29},
@@ -105,8 +92,7 @@ def main() -> int:
     print(f"{'TOTAL':22s} {total:7d} {total_correct:8d} "
           f"({rate:.4f}% correct)\n")
 
-    # Round-trip the output contract: every label the solver can emit must survive
-    # being written the way the actor is told to write it and read back.
+    # Every solver label must round-trip through the actor's output format.
     for label in stepgame_solver.LABELS:
         parsed = stepgame.parse_answer(f"Some reasoning.\nFinal: {label}")
         if parsed != label:

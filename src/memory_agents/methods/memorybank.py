@@ -1,40 +1,18 @@
-#!/usr/bin/env python
-"""MemoryBank (Zhong et al., AAAI 2024) over SPaRC: build a declarative memory of
-past CASES on the train split, freeze it, retrieve it for the test split.
+"""MemoryBank (Zhong et al., 2024): a frozen declarative bank of past cases built on the
+train split and retrieved for the test split. Each entry holds an LLM-written case note,
+the verbatim record (its solution replayed through the env) and the compact exemplar.
+The train build pass and the embeddings are Memp's and are reused, not re-run; both
+methods key on the same puzzle_key_text, so retrieval is identical between them.
 
-The paper stores each past interaction twice -- verbatim, and as an LLM-written
-event summary -- and recalls the relevant ones by dense retrieval. Here one past
-*puzzle* is one past interaction, so a bank entry holds:
-
-  case_note   the event summary: 2-3 sentences recounting THAT puzzle and how it
-              was solved (LLM-written; the declarative counterpart of Memp's
-              rule-scoped `script`).
-  trajectory  the verbatim record: the winning line replayed move by move through
-              a real env, attached in code so it cannot misstate what happened.
-  exemplar    the compact action list, for the `case` granularity.
-
-Only three phases exist, because the two expensive inputs are shared with Memp and
-are NOT re-run (docs/architecture.md section 5.2):
-
-  distill  memp_build_train_*.json (the memoryless train pass, method-agnostic)
-           -> case notes + replayed trajectories -> memorybank_bank_*.json.
-           --rules-preamble on|off picks the prompt variant; both are built and
-           audited, since whether a case note needs the rulebook is the open
-           question docs/memp.md section 3.5 raises.
-  eval     (chat model job) cosine top-k (or seeded-random k) cases per test
-           puzzle -> injected case block -> one pass over the test split.
-  compare  no GPU: baseline vs retrieved vs random with McNemar exact tests, plus
-           an optional paired test against a Memp eval -- the thesis's
-           declarative-vs-procedural contrast.
-
-The embed phase is Memp's: both methods key on the identical puzzle_key_text
-(`puzzle-key-v1`), so memp_embeddings_*.npz is reused verbatim and retrieval is
-byte-identical between the two methods by construction.
+  distill  memp_build_train_*.json -> case notes + verbatim records -> memorybank_bank_*.json
+           (--rules-preamble on|off picks the prompt variant).
+  eval     cosine top-k (or seeded-random k) cases per test puzzle, one pass over the split.
+  compare  no GPU: baseline vs retrieved vs random (McNemar exact), optionally vs a Memp eval.
 
   sbatch -J mb-dist --export=ALL,DRIVER=memorybank,PHASE=distill,RULES_PREAMBLE=on,BUILD=results/json/memp_build_train_<tag>.json scripts/serve_and_run.sbatch
   sbatch -J mb-ret  --export=ALL,DRIVER=memorybank,PHASE=eval,ARM=retrieved,BANK=<bank.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
   sbatch -J mb-rnd  --export=ALL,DRIVER=memorybank,PHASE=eval,ARM=random,BANK=<bank.json>,EMBEDDINGS=<emb.npz> scripts/serve_and_run.sbatch
-  python scripts/run_memorybank.py --phase compare --baseline <root.json> --retrieved <ret.json> --random <rnd.json> [--memp <memp_eval_retrieved_*.json>]
+  python scripts/run.py memorybank --phase compare --baseline <root.json> --retrieved <ret.json> --random <rnd.json> [--memp <memp_eval_retrieved_*.json>]
 """
 
 import argparse
@@ -46,32 +24,24 @@ import sys
 import time
 from datetime import datetime
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-
-# The whole point of this driver is that MemoryBank differs from Memp in what a
-# memory SAYS, not in how the campaign is run -- so the plumbing is imported
-# rather than mirrored. Anything imported here is shared, verbatim, with Memp:
-# state checkpointing, client construction, the episode record shape, the
-# accuracy block, the exemplar builders, and the whole comparison stack.
-import run_memp as memp
-from run_memp import (accuracy_block, agent_exemplar, baseline_outcomes, bench,
+# Run plumbing is shared with Memp verbatim, so it is imported rather than mirrored.
+from memory_agents.methods import memp
+from memory_agents.methods.memp import (accuracy_block, agent_exemplar, baseline_outcomes, bench,
                       compare_row, episode_record, eval_outcomes, gold_exemplar,
                       load_embeddings, make_client, mcnemar_exact,
                       save_state, split_ids)
 
-from memory_agents.benchmarks import add_benchmark_args, build_benchmark
+from memory_agents.benchmarks import build_benchmark
 from memory_agents.envs.base import EpisodeResult
 from memory_agents.memory import CaseDistiller, MemoryBankMemory
+from memory_agents.methods.common import SAMPLING, add_run_args, typed_flags
 
 BANK_SCHEMA = "memorybank-bank-v1"      # == MemoryBankMemory.SCHEMA
 EVAL_SCHEMA = "memorybank-eval-v1"
 BUILD_SCHEMA = memp.BUILD_SCHEMA        # the build file is Memp's, reused as-is
 
-# Same discipline as Memp/Reflexion: on --resume these come from the state file
-# and the CLI cannot override them, so a resumed multi-hour pass cannot silently
-# continue under different settings than the numbers it is extending.
+# Fixed per run: on --resume these come from the state file, never the CLI.
 FROZEN = {
     "distill": ("build", "rules_preamble", "limit", "distill_max_tokens",
                 "temperature", "top_p", "top_k", "seed"),
@@ -88,11 +58,9 @@ def set_failure_log(tag: str) -> None:
 
 
 def report_frozen(args, cfg: dict, phase: str) -> None:
-    """On resume, say which typed CLI flags are being ignored (stored values win).
+    """On resume, report which typed CLI flags are ignored (stored values win).
 
-    A local copy of Memp's rather than an import: it reads its module's FROZEN
-    table, and the two methods' tables differ (rules_preamble here, granularity
-    values and the Update knobs there).
+    A local copy of Memp's, because it must read this module's FROZEN table.
     """
     overridden = [k for k in FROZEN[phase]
                   if args.explicit.get(k) and getattr(args, k, None) is not None
@@ -130,9 +98,7 @@ async def run_distill(args) -> None:
             "top_k": args.top_k, "seed": args.seed,
         }
         stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-        # The preamble variant is in the FILENAME, not just the config: two banks
-        # per model exist at once and an eval job names its bank on the submit
-        # line, where a wrong pick would be invisible until the results disagree.
+        # Variant in the filename: both banks coexist and eval jobs pick one by path.
         tag = "rp" if args.rules_preamble else "norp"
         bm = "" if bench().name == "sparc" else f"{bench().name}_"
         out = args.out or f"results/json/memorybank_bank_{bm}{tag}_{stamp}.json"
@@ -164,8 +130,7 @@ async def run_distill(args) -> None:
         rec = build["puzzles"][pid]
         row = bench().record("train", pid)
         key_text = bench().key_text(row)
-        # Route on provenance, exactly as Memp does. A crashed episode has no
-        # episode_context, which is why the gold prompt reads the record only.
+        # Route on provenance as Memp does; a crashed episode has no episode_context.
         from_agent = bool(rec["success"] and rec.get("episode_context"))
         async with sem:
             if from_agent:
@@ -208,8 +173,7 @@ async def run_distill(args) -> None:
                     row = bench().record("train", pid)
                     memory.write(pid, {
                         "provenance": "agent" if from_agent else "gold",
-                        # From the dataset, not the build record: a crashed
-                        # episode reports difficulty -1.
+                        # From the dataset: a crashed episode reports -1.
                         "difficulty": bench().difficulty(row),
                         "key_text": bench().key_text(row),
                         "case_note": text,
@@ -229,18 +193,14 @@ async def run_distill(args) -> None:
     if todo:
         empties = await distill_pass(todo, cfg["seed"])
         if empties:
-            # The same prompt at the same seed replays the same empty reply
-            # (usually a thinking budget exhausted inside <think>), so reseed once.
+            # The same prompt at the same seed replays the same empty reply.
             print(f"[distill] retrying {len(empties)} empty replies at seed+1",
                   flush=True)
             empties = await distill_pass(empties, cfg["seed"] + 1)
         stats["empty"] = len(empties)
         save_state(out, {**memory.to_dict(), "config": cfg})
 
-    # The verbatim record (the paper's in-depth storage). Folded into distill
-    # rather than living in a separate phase like Memp's `upgrade`, because for
-    # MemoryBank it is not an optional granularity -- it IS half of what the paper
-    # stores, so no entry may exist without one. Pure env replay: no model, no GPU.
+    # The verbatim record is half of every entry, so distill always attaches it.
     attach_records(memory, out, cfg)
 
     print(f"[distill] bank: {len(memory)} entries "
@@ -256,17 +216,10 @@ async def run_distill(args) -> None:
 
 
 def attach_records(memory, out, cfg) -> None:
-    """Replay each entry's own solution and store the round-by-round record.
+    """Attach each entry's verbatim record; idempotent, so a resume adds only missing ones.
 
-    Uniform across provenance, like Memp's upgrade phase: an agent entry replays
-    the moves the model actually made, a gold entry the dataset's solution path.
-    Idempotent, so a resumed distill only replays what is missing.
-
-    On a single-turn benchmark there is no env to replay through: the verbatim
-    record is the item's question plus its worked derivation, which the benchmark
-    builds directly. This is not an optional granularity for MemoryBank but half
-    of what the paper stores, so the eval refuses `case-record` without it either
-    way.
+    Interactive benchmarks replay the entry's exemplar (agent or gold moves) through
+    the env; single-turn ones use the item's question plus its worked derivation.
     """
     todo = [e for e in memory.entries if not e.get("trajectory")]
     if not todo:
@@ -306,8 +259,6 @@ def attach_records(memory, out, cfg) -> None:
     save_state(out, {**memory.to_dict(), "config": cfg})
     print(f"[records] {attached} attached ({solved} replays reached a solved "
           f"state), {failed} failed", flush=True)
-    # A replay that does not end solved means the stored exemplar is not a winning
-    # line -- that entry would show the actor a losing trace as if it were a case.
     if attached and solved < attached:
         print(f"[records] NOTE: {attached - solved} replays did not end solved; "
               f"those entries' exemplars were not winning paths", flush=True)
@@ -317,13 +268,9 @@ def attach_records(memory, out, cfg) -> None:
 # phase eval: one retrieval-augmented pass over the test split
 # --------------------------------------------------------------------------- #
 def build_blocks(memory, arrays, cfg, test_ids):
-    """Precompute the injected block + retrieval log for the test split.
+    """Precompute each test puzzle's injected block and retrieval log.
 
-    The frozen-bank twin of Memp's build_blocks (which additionally serves the
-    online Update policies MemoryBank has no analogue for). With a frozen bank
-    retrieval is a pure function of (bank, embeddings, arm, k, seed), so
-    precomputing makes block_for a dict lookup -- trivially safe under concurrency
-    -- and guarantees a resumed job injects byte-identical blocks.
+    Retrieval over a frozen bank is deterministic, so a resumed job injects identical blocks.
     """
     arm, k, seed = cfg["arm"], cfg["top_k_memories"], cfg["seed"]
     granularity = cfg.get("granularity", "case-record")
@@ -382,10 +329,9 @@ async def run_eval(args) -> None:
     try:
         memory = MemoryBankMemory.from_dict(bank_data)
     except ValueError as exc:
-        # Overwhelmingly this is a Memp bank passed on the submit line: the two
-        # methods' banks live side by side in results/json and differ by a prefix.
+        # Usually a Memp bank passed by mistake.
         raise SystemExit(f"{cfg['bank']}: {exc}. --phase eval needs a bank built "
-                         f"by run_memorybank.py --phase distill.") from None
+                         f"by `run.py memorybank --phase distill`.") from None
     arrays, meta = load_embeddings(cfg["embeddings"])
     memory.embed_model = cfg["embed_model"] = meta.get("embed_model", "")
     memory = memory.filtered(cfg.get("provenance", "all"))
@@ -395,8 +341,7 @@ async def run_eval(args) -> None:
     cfg["bank_entries"] = len(memory)
     bank_cfg = bank_data.get("config", {})
     cfg["bank_model"] = bank_cfg.get("model_id")
-    # Which of the two banks this is. Recorded in the eval file so a results table
-    # can never mix the ablation's arms up after the fact.
+    # Records which ablation bank the eval used.
     cfg["rules_preamble"] = bank_cfg.get("rules_preamble")
 
     if cfg.get("granularity", "case-record") == "case-record":
@@ -500,13 +445,10 @@ def run_compare(args) -> None:
         arms.insert(1, ("memorybank-rand", rnd_wins, list(rnd["puzzles"].values())))
     mp = None
     if args.memp:
-        # The cross-method contrast: same 500 puzzles, same retrieval, same k --
-        # the only difference is whether the injected memory is a case or a
-        # procedure. This is the thesis's sub-question 2 in one test.
+        # Same retrieval and k; only case vs procedure memory differs.
         mp_wins, mp = eval_outcomes(args.memp, schema=memp.EVAL_SCHEMA)
         arms.append(("memp-retrieved", mp_wins, list(mp["puzzles"].values())))
 
-    # The whole comparison rests on config matching; warn loudly when it doesn't.
     bs, rc = base.get("summary", {}), ret["config"]
     for key in ("split", "seed", "temperature", "max_tokens"):
         if bs.get(key) != rc.get(key):
@@ -561,9 +503,7 @@ def run_compare(args) -> None:
         lines.append(pair("memorybank", ret_wins, "memp", mp_wins))
     lines.append("")
 
-    # MemoryBank's price of admission. Reported separately from eval cost because
-    # it amortises over every eval against this bank -- and because the build pass
-    # it starts from was already paid for by Memp.
+    # Reported apart from eval cost: it amortises over every eval against this bank.
     bank_path = pathlib.Path(rc.get("bank", ""))
     if bank_path.exists():
         stats = json.loads(bank_path.read_text()).get("stats", {})
@@ -589,26 +529,19 @@ def run_compare(args) -> None:
 
 
 # --------------------------------------------------------------------------- #
-async def main() -> None:
+async def main(argv: list[str], prog: str) -> None:
     ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        prog=prog, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--phase", required=True, choices=["distill", "eval", "compare"])
-    ap.add_argument("--split", default="test",
-                    help="eval split (the bank always comes from train)")
-    ap.add_argument("--concurrency", type=int, default=32)
-    ap.add_argument("--limit", type=int, default=0, help="0 or less = whole split")
+    add_run_args(ap, **SAMPLING,
+                 split_help="eval split (the bank always comes from train)",
+                 seed_help="decoding seed; keep equal to the baseline's for eval")
     ap.add_argument("--chunk", type=int, default=100,
                     help="puzzles per checkpoint in eval, calls per checkpoint "
                          "in distill")
-    ap.add_argument("--max-tokens", type=int, default=12288, help="actor budget")
     ap.add_argument("--distill-max-tokens", type=int, default=12288,
                     help="case-note budget (distill phase)")
-    ap.add_argument("--temperature", type=float, default=0.6)
-    ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--top-k", type=int, default=20,
-                    help="sampling top-k (NOT the number of memories)")
-    ap.add_argument("--seed", type=int, default=0,
-                    help="decoding seed; keep equal to the baseline's for eval")
     ap.add_argument("--top-k-memories", type=int, default=3,
                     help="cases injected per test puzzle (eval); 3 matches Memp")
     ap.add_argument("--arm", choices=["retrieved", "random"],
@@ -638,23 +571,16 @@ async def main() -> None:
     ap.add_argument("--random", default=None, help="random-arm JSON (compare)")
     ap.add_argument("--memp", default=None,
                     help="a memp_eval_*.json to contrast against (compare)")
-    ap.add_argument("--out", default=None, help="output path")
-    add_benchmark_args(ap)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    # Which frozen knobs the user actually typed, so a resume can tell "left at
-    # its default" from "explicitly asked for" (run_reflexion's trick, and what
-    # the imported report_frozen reads).
-    typed = {a.lstrip("-").replace("-", "_").split("=")[0]
-             for a in sys.argv[1:] if a.startswith("--")}
+    # Typed flags, so a resume can tell a default from an explicit value.
+    typed = typed_flags(argv)
     args.explicit = {k: k in typed for keys in FROZEN.values() for k in keys}
     args.limit = args.limit if args.limit > 0 else None
     args.rules_preamble = args.rules_preamble == "on"
 
-    # One benchmark per process, shared with the run_memp plumbing this driver
-    # imports (they read the same module-level BENCH). On --resume it comes from
-    # the state file: a resumed distill must keep rendering the key-fn and the
-    # prompts its partial bank was written with.
+    # Set on the memp module, whose imported plumbing reads memp.BENCH; on --resume
+    # it comes from the state file so prompts match the partial bank.
     stored = memp._resumed_config(args)
     memp.BENCH = build_benchmark(stored if stored else args)
     if stored and stored.get("benchmark", "sparc") != getattr(args, "benchmark",
@@ -672,6 +598,3 @@ async def main() -> None:
                      "(--random is optional but recommended)")
         run_compare(args)
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
