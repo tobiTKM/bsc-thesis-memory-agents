@@ -19,3 +19,6 @@ dist/
 data/stepgame/raw/
 .claude/
 docs/
+# Thesis figure scripts: read docs/figdata (ignored above), kept local only.
+scripts/fig_*.py
+scripts/figstyle.py
