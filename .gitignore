@@ -1,0 +1,21 @@
+__pycache__/
+.vscode/
+.venv/
+.server/
+# logs/* rather than logs/: Slurm's slurmd opens --output/--error on the compute
+# node *before* it execs the job script, so the directory has to exist in a fresh
+# clone or the job dies with no log at all. A negation cannot re-include a file
+# whose parent directory is excluded, hence the contents pattern + .gitkeep.
+logs/*
+!logs/.gitkeep
+results/
+*.egg-info/
+build/
+dist/
+# StepGame corpus: fetched, not vendored (scripts/fetch_stepgame.py explains why
+# -- upstream publishes no LICENSE, so we do not redistribute it). ~160 MB.
+# The frozen splits under data/stepgame/splits/ ARE committed: they are 3 MB and
+# every arm must score the identical items for the paired tests to be paired.
+data/stepgame/raw/
+.claude/
+docs/

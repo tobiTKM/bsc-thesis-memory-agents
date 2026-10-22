@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-agents"
+version = "0.1.0"
+description = "Do memory-augmented LLM agents improve spatial and rule-based reasoning?"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+    "datasets>=2.19",
+    "pandas>=2.0",
+    "gymnasium>=0.29",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    # The SPaRC environment; not on PyPI. Pinned to the commit the results used.
+    "Spatial-Gym @ git+https://github.com/lkaesberg/Spatial-Gym.git@32034a0dacf34bad47b2c4b5ecafe998b4479578",
+]
+
+# vllm is not a dependency: serve_and_run.sbatch runs it from an Apptainer image.
+
+[tool.setuptools.packages.find]
+where = ["src"]
